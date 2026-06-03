@@ -413,3 +413,7 @@ doesn't have this problem (in particular, by ensuring you `detach()` before
 running operations that won't get fed into the autograd graph).  So we do NOT
 do this, and instead stick to the simplified model above which keeps our code
 simple.
+
+## License
+
+BSD 3-Clause License. See [LICENSE](LICENSE) for details.
