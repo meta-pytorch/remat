@@ -273,20 +273,33 @@ schema expected by the autograd engine.
 
 ### Decorator style API
 
-If you don't want to write the inside of your forward function, we offer a
-magical decorator that takes care of everything:
+If you don't want to rewrite the inside of your forward function, we offer a
+magical decorator that takes care of everything. Decorate the original forward
+with `remat.auto_forward`, passing the names (in `ctx.save_for_backward` order)
+of the tensors it saves. The forward keeps its original signature and its plain
+`ctx.save_for_backward(...)` body:
 
-```
+```python
 class MyOp(autograd.Function):
+    @staticmethod
     @remat.auto_forward("x", "y")
-    def forward(ctx, x, op_name, remat_policy):
-        ...
+    def forward(ctx, x):
+        y = my_op_fwd1(x)
+        z = my_op_fwd2(y)
+        ctx.save_for_backward(x, y)
+        return z
 ```
 
-This decorator assumes the last two arguments of the forward function are
-`op_name` and `remat_policy`, and takes care of constructing the `RematHandle`
-and calling its methods (including passing a special proxy `ctx` object to
-intercept the `ctx.save_for_backward` call).
+Instead of manually passing the name and policy, `remat.auto_forward` should
+instead be paired with a `remat.op` call at the call site, looking like this:
+
+```python
+return remat.op(MyOp.apply, "my.op", policy=remat.CheckpointPolicy.SAVE)(x)
+```
+
+The name and policy are implicitly passed to `auto_forward` using a
+`ContextVar` under the hood. You should keep your `remat.op` calls narrowly
+scoped since it is an error to use the same name on multiple custom ops.
 
 ## How to avoid recomputing native PyTorch APIs
 
