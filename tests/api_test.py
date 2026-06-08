@@ -209,6 +209,39 @@ class ApiTest(expecttest.TestCase):
 
         self.assertEqual(1, mode.sin_calls)
 
+    def test_collect_trace_records_original_forward_annotations(self) -> None:
+        def scope_body(x: torch.Tensor) -> torch.Tensor:
+            y = torch_remat.native_save_region(
+                "native.sin",
+                lambda: torch.sin(x),
+            )
+            return torch_remat.op(
+                torch.cos,
+                "custom.cos",
+                policy=torch_remat.CheckpointPolicy.RECOMPUTE,
+            )(y)
+
+        def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
+            return torch_remat.trace_scope(
+                scope_body,
+                "scope",
+                metadata="test_flag",
+            )(x)
+
+        x = torch.tensor([1.0, 2.0], requires_grad=True)
+        with torch_remat.collect_trace() as trace:
+            y = torch_remat.checkpoint()(checkpoint_body)(x)
+            y.sum().backward()
+
+        self.assertExpectedInline(
+            trace.format(),
+            """\
+torch_remat trace
+scope [test_flag]
+  native.sin: native
+  custom.cos: RECOMPUTE""",
+        )
+
     def test_checkpoint_forces_recompute_before_inner_custom_backward(self) -> None:
         events: list[str] = []
 

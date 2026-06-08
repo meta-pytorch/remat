@@ -26,6 +26,7 @@ from torch_remat._api import (
     _expect_record,
     _OpRecord,
     _Phase,
+    _record_trace_op,
     _release_record_after_recompute_if_needed,
     _state,
     _validate_name,
@@ -62,6 +63,7 @@ def native_save_region(op_name: str, function: Callable[[], _T]) -> _T:
     """
 
     _validate_name(op_name, what="op_name")
+    _record_trace_op(op_name, policy=None, source="native")
     state = _state.get()
     if state is None:
         return function()

@@ -10,10 +10,12 @@ from torch_remat._api import (  # noqa: F401
     auto_forward,
     checkpoint,
     CheckpointPolicy,
+    collect_trace,
     get_handle,
     is_recomputing,
     op,
     RematHandle,
+    trace_scope,
 )
 from torch_remat._native import native_save_region  # noqa: F401
 from torch_remat._reporting import (  # noqa: F401
