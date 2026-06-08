@@ -310,19 +310,40 @@ recomputed; an often reasonable assumption as extremely computationally
 expensive operations are frequently implemented from scratch and thus have
 custom autograd functions.
 
-**Important limitation:** a native PyTorch op cannot consume the output of a
-remat-aware autograd Function with policy `SAVE`.  Attempting this will raise
-a `RuntimeError`.  To fix, either:
+For the rare cases where you do want to annotate a native op, use
+`remat.native_op`.  It is the native-op analogue of `remat.op`: you pass the
+function, a unique name, and a `policy`, and call the result with the op's
+arguments.
 
-1. Wrap the native op with `remat.native_save_region` so it is also saved
-   (its output is replayed during recompute without reading the placeholder).
+```python
+y = remat.native_op(torch.mm, "native.mm", policy=remat.CheckpointPolicy.SAVE)(x, w)
+```
+
+The `policy` is the same `CheckpointPolicy` as for `remat.op` and behaves the
+same way; the two cases differ only in native-specific ways:
+
+- `SAVE` saves the op's outputs and does not rerun it during recompute.  Because
+  a native op has no custom backward to carry the handle protocol, this is done
+  with PyTorch SAC rather than the remat tape.  This is the way to avoid
+  recomputing some basic PyTorch compute (e.g., a matrix multiply).
+- `RECOMPUTE` reruns the op during recompute, applying the same
+  `save_or_load_inputs` handling described above.  So a `RECOMPUTE` native op
+  *can* consume an upstream `SAVE` op's output, where a bare native op would hit
+  a placeholder and raise (see the limitation below).
+
+Arguments are passed to the returned wrapper rather than captured in a closure
+so the wrapper can save and load them across recompute, exactly as `remat.op`
+does for a custom forward's positional tensor arguments.
+
+**Important limitation:** a *bare* native PyTorch op cannot consume the output
+of a remat-aware autograd Function with policy `SAVE`.  Attempting this will
+raise a `RuntimeError`.  To fix, either:
+
+1. Wrap the native op with `remat.native_op(...)`: `policy=SAVE` also saves its
+   output (replayed during recompute without reading the placeholder), or
+   `policy=RECOMPUTE` reruns it on the saved input.
 2. Move the native op into a custom autograd function with `auto_forward`.
 3. Change the upstream op's policy to `RECOMPUTE`.
-
-In the rare situation where you want to avoid recomputing some basic PyTorch
-compute (e.g., a matrix multiply), we support a `remat.native_save_region`
-function wrapper which you can use to specify that this region should not be
-recomputed in backwards.  To prevent recompute, this wrapper uses PyTorch SAC.
 
 ## Offloading (TODO)
 

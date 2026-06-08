@@ -175,7 +175,11 @@ class ApiTest(expecttest.TestCase):
 
         self.assertTrue(torch.equal(x.grad, torch.tensor([4.0])))
 
-    def test_native_save_region_does_not_rerun_native_op(self) -> None:
+    def test_native_op_save_does_not_rerun_native_op(self) -> None:
+        # This one needs dispatch-level counting, not an invocation counter:
+        # under SAC the wrapped callable is still re-invoked during recompute,
+        # but the cached output is served so aten.sin never actually re-runs.
+        # Only counting real dispatches shows it stayed at 1.
         class CountSinMode(TorchDispatchMode):
             def __init__(self) -> None:
                 self.sin_calls = 0
@@ -193,10 +197,11 @@ class ApiTest(expecttest.TestCase):
                 return func(*args, **({} if kwargs is None else kwargs))
 
         def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
-            y = torch_remat.native_save_region(
+            y = torch_remat.native_op(
+                torch.sin,
                 "native.sin",
-                lambda: torch.sin(x),
-            )
+                policy=torch_remat.CheckpointPolicy.SAVE,
+            )(x)
             return y * y
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
@@ -209,12 +214,42 @@ class ApiTest(expecttest.TestCase):
 
         self.assertEqual(1, mode.sin_calls)
 
+    def test_native_op_recompute_is_inert(self) -> None:
+        # A RECOMPUTE native op simply re-invokes the wrapped callable during
+        # recompute (no SAC short-circuit), so counting invocations is enough to
+        # show it reran -- no need to observe dispatch. (The trace cannot show
+        # this: it is only recorded during the original forward.)
+        sin_calls = 0
+
+        def counting_sin(x: torch.Tensor) -> torch.Tensor:
+            nonlocal sin_calls
+            sin_calls += 1
+            return torch.sin(x)
+
+        def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
+            y = torch_remat.native_op(
+                counting_sin,
+                "native.sin",
+                policy=torch_remat.CheckpointPolicy.RECOMPUTE,
+            )(x)
+            return y * y
+
+        x = torch.tensor([1.0, 2.0], requires_grad=True)
+        y = torch_remat.checkpoint()(checkpoint_body)(x)
+        self.assertEqual(1, sin_calls)
+        y.sum().backward()
+
+        # RECOMPUTE is inert: the native op is rerun during recompute, exactly
+        # as it would be without any native_op annotation.
+        self.assertEqual(2, sin_calls)
+
     def test_collect_trace_records_original_forward_annotations(self) -> None:
         def scope_body(x: torch.Tensor) -> torch.Tensor:
-            y = torch_remat.native_save_region(
+            y = torch_remat.native_op(
+                torch.sin,
                 "native.sin",
-                lambda: torch.sin(x),
-            )
+                policy=torch_remat.CheckpointPolicy.SAVE,
+            )(x)
             return torch_remat.op(
                 torch.cos,
                 "custom.cos",
@@ -238,7 +273,7 @@ class ApiTest(expecttest.TestCase):
             """\
 torch_remat trace
 scope [test_flag]
-  native.sin: native
+  native.sin: native SAVE
   custom.cos: RECOMPUTE""",
         )
 
@@ -850,7 +885,9 @@ layers.0::attn.softmax total=28 B
         x = torch.tensor([1.0, 2.0], requires_grad=True)
 
         with forward_context:
-            y = torch_remat.native_save_region("native.exp", lambda: torch.exp(x))
+            y = torch_remat.native_op(
+                torch.exp, "native.exp", policy=torch_remat.CheckpointPolicy.SAVE
+            )(x)
             self.assertEqual((2,), tuple(y.shape))
 
             report = torch_remat.format_current_memory_report()
@@ -1489,7 +1526,7 @@ early.stop::unused.recompute.consumer total=8 B
         """A bare native op consuming a SAVE op's placeholder must error.
 
         Also verifies the three proposed fixes from the error message:
-        (1) native_save_region, (2) custom autograd Function, (3) RECOMPUTE.
+        (1) native_op SAVE, (2) custom autograd Function, (3) RECOMPUTE.
         """
 
         class SavedMul(torch.autograd.Function):
@@ -1529,17 +1566,19 @@ early.stop::unused.recompute.consumer total=8 B
             return torch.relu(y)
 
         y = torch_remat.checkpoint()(body_bare)(x)
-        with self.assertRaisesRegex(RuntimeError, "native_save_region"):
+        with self.assertRaisesRegex(RuntimeError, "native_op"):
             y.sum().backward()
 
-        # Fix 1: wrap native op in native_save_region.
+        # Fix 1: wrap native op in native_op with SAVE policy.
         x.grad = None
 
         def body_native_save(x: torch.Tensor) -> torch.Tensor:
             y = torch_remat.op(
                 SavedMul.apply, "mul", policy=torch_remat.CheckpointPolicy.SAVE
             )(x)
-            return torch_remat.native_save_region("relu", lambda: torch.relu(y))
+            return torch_remat.native_op(
+                torch.relu, "relu", policy=torch_remat.CheckpointPolicy.SAVE
+            )(y)
 
         torch_remat.checkpoint()(body_native_save)(x).sum().backward()
         self.assertTrue(torch.equal(x.grad, expected_grad))
@@ -1569,3 +1608,266 @@ early.stop::unused.recompute.consumer total=8 B
 
         torch_remat.checkpoint()(body_recompute)(x).sum().backward()
         self.assertTrue(torch.equal(x.grad, expected_grad))
+
+    def test_native_op_recompute_loads_save_op_output(self) -> None:
+        """A RECOMPUTE native op can consume a SAVE op output and recompute.
+
+        The SAVE producer is skipped during recompute (its output replays as a
+        placeholder), but the native op's real input is saved in the original
+        forward and loaded back, so the native op reruns on real data with
+        gradients flowing to the producer.
+        """
+
+        # The native op is RECOMPUTE, so during recompute its wrapped callable is
+        # re-invoked -- counting invocations is enough (no dispatch mode needed).
+        # The SAVE op short-circuits before its body, so its counter stays at 1.
+        calls = {"mul": 0, "relu": 0}
+
+        def counting_relu(x: torch.Tensor) -> torch.Tensor:
+            calls["relu"] += 1
+            return torch.relu(x)
+
+        class SavedMul(torch.autograd.Function):
+            @staticmethod
+            @torch_remat.auto_forward("x")
+            def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
+                calls["mul"] += 1
+                y = x * 2
+                ctx.save_for_backward(x)
+                return y
+
+            @staticmethod
+            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+                (x,) = ctx.saved_tensors
+                return grad_output * 2
+
+        def body(x: torch.Tensor) -> torch.Tensor:
+            y = torch_remat.op(
+                SavedMul.apply, "mul", policy=torch_remat.CheckpointPolicy.SAVE
+            )(x)
+            return torch_remat.native_op(
+                counting_relu, "relu", policy=torch_remat.CheckpointPolicy.RECOMPUTE
+            )(y)
+
+        x = torch.tensor([1.0, -1.0], requires_grad=True)
+        out = torch_remat.checkpoint()(body)(x)
+        # Forward runs the SAVE op body and the native op once each.
+        self.assertEqual({"mul": 1, "relu": 1}, calls)
+        out.sum().backward()
+
+        # The SAVE op body is not rerun during recompute, but the RECOMPUTE
+        # native op is rerun on the loaded real input.
+        self.assertEqual({"mul": 1, "relu": 2}, calls)
+        self.assertTrue(torch.equal(out.detach(), torch.tensor([2.0, 0.0])))
+        self.assertTrue(torch.equal(x.grad, torch.tensor([2.0, 0.0])))
+
+    def test_native_op_recompute_loads_mixed_pytree_inputs(self) -> None:
+        """RECOMPUTE native op with a placeholder input, a real input, a kwarg.
+
+        Only the SAVE-produced input replays as a placeholder and is saved and
+        bridged back; the recomputed input flows through directly, and the
+        non-tensor ``alpha`` keyword survives the pytree round-trip.
+        """
+
+        class SavedDouble(torch.autograd.Function):
+            @staticmethod
+            @torch_remat.auto_forward("x")
+            def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
+                y = x * 2
+                ctx.save_for_backward(x)
+                return y
+
+            @staticmethod
+            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+                (x,) = ctx.saved_tensors
+                return grad_output * 2
+
+        def body(x: torch.Tensor) -> torch.Tensor:
+            saved = torch_remat.op(
+                SavedDouble.apply, "double", policy=torch_remat.CheckpointPolicy.SAVE
+            )(x)
+            recomputed = x * 3
+            # add(saved, recomputed, alpha=2) = 2x + 2 * 3x = 8x
+            return torch_remat.native_op(
+                torch.add, "add", policy=torch_remat.CheckpointPolicy.RECOMPUTE
+            )(saved, recomputed, alpha=2.0)
+
+        x = torch.tensor([1.0, 2.0], requires_grad=True)
+        out = torch_remat.checkpoint()(body)(x)
+        out.sum().backward()
+
+        self.assertTrue(torch.equal(out.detach(), torch.tensor([8.0, 16.0])))
+        self.assertTrue(torch.equal(x.grad, torch.tensor([8.0, 8.0])))
+
+    def test_native_op_save_multiple_outputs(self) -> None:
+        """A SAVE native op may return a tuple of tensors.
+
+        Backward triggers recompute, where SAC serves both cached outputs, so
+        correct output + gradient also exercises the tuple-output replay path.
+        """
+
+        def split(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            return x * 2, x * 3
+
+        def body(x: torch.Tensor) -> torch.Tensor:
+            a, b = torch_remat.native_op(
+                split, "native.split", policy=torch_remat.CheckpointPolicy.SAVE
+            )(x)
+            return a + b
+
+        x = torch.tensor([1.0, 2.0], requires_grad=True)
+        out = torch_remat.checkpoint()(body)(x)
+        out.sum().backward()
+
+        # a + b = 2x + 3x = 5x
+        self.assertTrue(torch.equal(out.detach(), torch.tensor([5.0, 10.0])))
+        self.assertTrue(torch.equal(x.grad, torch.tensor([5.0, 5.0])))
+
+    def test_native_op_recompute_multiple_outputs(self) -> None:
+        """A RECOMPUTE native op may return a tuple of tensors and is rerun."""
+
+        calls = 0
+
+        def split(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            nonlocal calls
+            calls += 1
+            return x * 2, x * 3
+
+        def body(x: torch.Tensor) -> torch.Tensor:
+            a, b = torch_remat.native_op(
+                split, "native.split", policy=torch_remat.CheckpointPolicy.RECOMPUTE
+            )(x)
+            return a + b
+
+        x = torch.tensor([1.0, 2.0], requires_grad=True)
+        out = torch_remat.checkpoint()(body)(x)
+        self.assertEqual(1, calls)
+        out.sum().backward()
+
+        # Rerun during recompute, and the tuple output is correct end to end.
+        self.assertEqual(2, calls)
+        self.assertTrue(torch.equal(out.detach(), torch.tensor([5.0, 10.0])))
+        self.assertTrue(torch.equal(x.grad, torch.tensor([5.0, 5.0])))
+
+    def test_native_op_recompute_retain_graph(self) -> None:
+        """A RECOMPUTE native op survives backward(retain_graph=True) + replay."""
+
+        class SavedMul(torch.autograd.Function):
+            @staticmethod
+            @torch_remat.auto_forward("x")
+            def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
+                y = x * 2
+                ctx.save_for_backward(x)
+                return y
+
+            @staticmethod
+            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+                (x,) = ctx.saved_tensors
+                return grad_output * 2
+
+        def body(x: torch.Tensor) -> torch.Tensor:
+            y = torch_remat.op(
+                SavedMul.apply, "mul", policy=torch_remat.CheckpointPolicy.SAVE
+            )(x)
+            return torch_remat.native_op(
+                torch.relu, "relu", policy=torch_remat.CheckpointPolicy.RECOMPUTE
+            )(y)
+
+        x = torch.tensor([1.0, -1.0], requires_grad=True)
+        out = torch_remat.checkpoint()(body)(x)
+
+        out.sum().backward(retain_graph=True)
+        self.assertTrue(torch.equal(x.grad, torch.tensor([2.0, 0.0])))
+
+        # The remat tape is preserved under retain_graph, so a second backward
+        # recomputes again and produces the same gradient.
+        x.grad = None
+        out.sum().backward()
+        self.assertTrue(torch.equal(x.grad, torch.tensor([2.0, 0.0])))
+
+    def test_native_op_recompute_loads_two_save_op_outputs(self) -> None:
+        """A RECOMPUTE native op can restore several placeholder inputs at once."""
+
+        class SaveScale(torch.autograd.Function):
+            @staticmethod
+            @torch_remat.auto_forward("x")
+            def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
+                y = x * 2
+                ctx.save_for_backward(x)
+                return y
+
+            @staticmethod
+            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+                (x,) = ctx.saved_tensors
+                return grad_output * 2
+
+        def body(x: torch.Tensor) -> torch.Tensor:
+            a = torch_remat.op(
+                SaveScale.apply, "a", policy=torch_remat.CheckpointPolicy.SAVE
+            )(x)
+            b = torch_remat.op(
+                SaveScale.apply, "b", policy=torch_remat.CheckpointPolicy.SAVE
+            )(x)
+            # Both inputs replay as placeholders; add must restore input.0 and
+            # input.1 from the tape.
+            return torch_remat.native_op(
+                torch.add, "add", policy=torch_remat.CheckpointPolicy.RECOMPUTE
+            )(a, b)
+
+        x = torch.tensor([1.0, 2.0], requires_grad=True)
+        out = torch_remat.checkpoint()(body)(x)
+        out.sum().backward()
+
+        # a + b = 2x + 2x = 4x; grad flows back through both producers.
+        self.assertTrue(torch.equal(out.detach(), torch.tensor([4.0, 8.0])))
+        self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 4.0])))
+
+    def test_native_op_outside_checkpoint_runs_plainly(self) -> None:
+        """Outside a checkpoint region, native_op just runs the function."""
+
+        x = torch.tensor([1.0, 2.0], requires_grad=True)
+        saved = torch_remat.native_op(
+            torch.sin, "s", policy=torch_remat.CheckpointPolicy.SAVE
+        )(x)
+        recomputed = torch_remat.native_op(
+            torch.cos, "r", policy=torch_remat.CheckpointPolicy.RECOMPUTE
+        )(x)
+
+        self.assertTrue(torch.allclose(saved, x.sin()))
+        self.assertTrue(torch.allclose(recomputed, x.cos()))
+
+        (saved.sum() + recomputed.sum()).backward()
+        self.assertTrue(torch.allclose(x.grad, x.cos() - x.sin()))
+
+    def test_native_op_rejects_bad_arguments(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "expects a function"):
+            torch_remat.native_op(
+                123,  # type: ignore[arg-type]
+                "native.bad",
+                policy=torch_remat.CheckpointPolicy.SAVE,
+            )
+        with self.assertRaisesRegex(RuntimeError, "expects an op_name"):
+            torch_remat.native_op(torch.sin, policy=torch_remat.CheckpointPolicy.SAVE)
+        with self.assertRaisesRegex(RuntimeError, "CheckpointPolicy"):
+            torch_remat.native_op(
+                torch.sin,
+                "native.bad",
+                policy="SAVE",  # type: ignore[arg-type]
+            )
+        with self.assertRaisesRegex(ValueError, "must be non-empty"):
+            torch_remat.native_op(
+                torch.sin, "", policy=torch_remat.CheckpointPolicy.SAVE
+            )
+
+    def test_native_op_duplicate_name_errors(self) -> None:
+        def body(x: torch.Tensor) -> torch.Tensor:
+            a = torch_remat.native_op(
+                torch.sin, "dup", policy=torch_remat.CheckpointPolicy.SAVE
+            )(x)
+            return torch_remat.native_op(
+                torch.cos, "dup", policy=torch_remat.CheckpointPolicy.SAVE
+            )(a)
+
+        x = torch.tensor([1.0, 2.0], requires_grad=True)
+        with self.assertRaisesRegex(RuntimeError, "Duplicate torch_remat op name"):
+            torch_remat.checkpoint()(body)(x)

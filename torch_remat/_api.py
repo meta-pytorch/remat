@@ -194,7 +194,7 @@ class _OpRecord:
     # Native-only per-op occurrence counts used to build unstable report labels.
     native_op_counts: dict[str, int] = field(default_factory=dict)
 
-    # Native-only SAC contexts. They are created for native_save_region records
+    # Native-only SAC contexts. They are created for native_op SAVE records
     # and entered only while that native function region is running.
     native_sac_contexts: (
         tuple[
@@ -325,10 +325,11 @@ class _OpRecord:
                     f"{source} was skipped during recompute. This is likely "
                     "because the output of a remat-aware autograd Function with "
                     "policy SAVE was consumed by a native PyTorch op not wrapped in "
-                    "remat.native_save_region. To fix, either: (1) wrap the "
-                    "native op with remat.native_save_region, (2) move it into "
-                    "a custom autograd Function with auto_forward, or "
-                    "(3) change the upstream op's policy to RECOMPUTE.",
+                    "remat.native_op. To fix, either: (1) wrap the native op with "
+                    "remat.native_op(...) (policy=SAVE to also save its output, or "
+                    "policy=RECOMPUTE to rerun it on the saved input), (2) move it "
+                    "into a custom autograd Function with auto_forward, or (3) change "
+                    "the upstream op's policy to RECOMPUTE.",
                 )
             )
 
@@ -817,7 +818,7 @@ def _append_trace_entry(
         return
 
     if entry.source == "native":
-        details = "native"
+        details = "native" if entry.policy is None else f"native {entry.policy.name}"
     elif entry.policy is not None:
         details = entry.policy.name
     else:
