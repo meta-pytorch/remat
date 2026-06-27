@@ -57,6 +57,65 @@ _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
 
+# Same contract as ``torch.autograd.graph.saved_tensors_hooks`` (pack returns an
+# opaque object stored in place of the tensor; unpack recovers it), but installed
+# at remat's tape instead of autograd's saved-tensors machinery. This gives the
+# "fire at the logical save, fire at the logical load, never on recompute"
+# semantics for free: the tape stores only in the original forward and loads only
+# during recompute/backward, and RECOMPUTE intermediates never reach the tape.
+PackHook: TypeAlias = Callable[[torch.Tensor], object]
+UnpackHook: TypeAlias = Callable[[object], torch.Tensor]
+
+# Thread-/task-local, like the other remat contextvars below, so concurrent
+# forwards don't clobber each other's hooks (mirrors PyTorch keeping its
+# saved-tensor hooks in autograd TLS). Only the store (forward) side reads this;
+# the load side uses the unpack hook bound to each slot at pack time, so we never
+# rely on this contextvar propagating into a separate backward/recompute thread.
+_active_saved_tensors_hooks: contextvars.ContextVar[
+    tuple[PackHook, UnpackHook] | None
+] = contextvars.ContextVar("torch_remat_saved_tensors_hooks", default=None)
+
+
+def set_saved_tensors_hooks(
+    pack_hook: PackHook | None,
+    unpack_hook: UnpackHook | None,
+) -> tuple[PackHook | None, UnpackHook | None]:
+    """Install (or clear) tape-level saved-tensor hooks; return the previous pair.
+
+    Mirrors ``torch.autograd.graph.saved_tensors_hooks`` but the hooks fire on
+    remat tape stores/loads (SAVE-policy saved tensors and retained RECOMPUTE
+    inputs), not on every autograd save. Pass ``(None, None)`` to clear. Prefer
+    the :func:`saved_tensors_hooks` context manager; this is the imperative
+    escape hatch. Thread-/task-local via a contextvar.
+    """
+
+    previous = _active_saved_tensors_hooks.get()
+    if pack_hook is None or unpack_hook is None:
+        _active_saved_tensors_hooks.set(None)
+    else:
+        _active_saved_tensors_hooks.set((pack_hook, unpack_hook))
+    return previous if previous is not None else (None, None)
+
+
+@contextlib.contextmanager
+def saved_tensors_hooks(
+    pack_hook: PackHook,
+    unpack_hook: UnpackHook,
+) -> Iterator[None]:
+    """Scope tape-level saved-tensor hooks across a forward and its backward.
+
+    The remat analogue of ``torch.autograd.graph.saved_tensors_hooks``:
+    ``pack_hook(tensor) -> packed`` runs at each tape store (original forward)
+    and ``unpack_hook(packed) -> tensor`` at each tape load (recompute/backward).
+    """
+
+    token = _active_saved_tensors_hooks.set((pack_hook, unpack_hook))
+    try:
+        yield
+    finally:
+        _active_saved_tensors_hooks.reset(token)
+
+
 class CheckpointPolicy(Enum):
     """Policy controlling how an activation record is handled under checkpointing."""
 
@@ -152,6 +211,19 @@ class _SavedTensorSlot:
     # Version counter observed when the tensor was saved.
     version: int | None
 
+    # When a tape-level saved-tensor pack hook is active, the slot stores the
+    # hook's packed result here (``tensor`` is None) and the real tensor is
+    # recovered via the unpack hook at load time. ``is_packed`` distinguishes a
+    # packed value of None from an unpacked slot.
+    packed: object | None = None
+    is_packed: bool = False
+
+    # The unpack hook bound to this slot at pack time. Mirrors PyTorch
+    # saved_tensors_hooks: each saved tensor is recovered by the pair that packed
+    # it, not by whatever hooks are active at load time (pack runs in the
+    # original forward, unpack during recompute — the active hooks may differ).
+    unpack_hook: UnpackHook | None = None
+
 
 @dataclass
 class _OpRecord:
@@ -224,6 +296,22 @@ class _OpRecord:
                 f"{_display_name(region_state, self.op_name)}"
             )
 
+        hooks = _active_saved_tensors_hooks.get()
+        if hooks is not None and isinstance(tensor, torch.Tensor):
+            # The hook now owns the tensor (it may move its storage to CPU). The
+            # in-place version check is skipped: the unpack hook returns a fresh
+            # object at load time. Bind the matching unpack hook to the slot so
+            # load uses the pair that packed it, not whatever is active later.
+            pack_hook, unpack_hook = hooks
+            self.tensor_slots[tensor_name] = _SavedTensorSlot(
+                tensor=None,
+                version=None,
+                packed=pack_hook(tensor),
+                is_packed=True,
+                unpack_hook=unpack_hook,
+            )
+            return
+
         version = tensor._version if isinstance(tensor, torch.Tensor) else None
         self.tensor_slots[tensor_name] = _SavedTensorSlot(
             tensor=tensor,
@@ -265,6 +353,16 @@ class _OpRecord:
             )
 
         slot = self.tensor_slots[tensor_name]
+        if slot.is_packed:
+            unpack_hook = slot.unpack_hook
+            if unpack_hook is None:
+                raise RuntimeError(
+                    f"saved tensor {tensor_name} for "
+                    f"{_display_name(region_state, self.op_name)} was packed by a "
+                    "saved-tensor pack hook, but no unpack hook was bound to the slot"
+                )
+            return unpack_hook(slot.packed)
+
         tensor = slot.tensor
         if tensor is None:
             return None

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import weakref
 from typing import Any, cast
@@ -33,6 +34,172 @@ def _numel(shape: tuple[int, ...]) -> int:
     for size in shape:
         numel *= size
     return numel
+
+
+# Shared execution trace for the wedge test below. The ops and the toy offloader
+# append human-readable events here; _run_wedge_model resets it per run and joins
+# it into the string the test asserts with assertExpectedInline. _WEDGE_LABEL /
+# _WEDGE_POLICY carry the current op's region label + policy into the op's forward
+# (auto_forward's forward(ctx, x) does not receive the op_name), set by each
+# _wedge_step right before the op runs -- safe because execution is synchronous.
+_WEDGE_TRACE: list[str] = []
+_WEDGE_LABEL: str = ""
+_WEDGE_POLICY: str = ""
+# Maps id(tensor) -> human label for tensors the ops save, so pack can name each
+# packed tensor in the trace. Keyed by id (not a tensor attribute) to avoid
+# B009/B010; safe because every saved tensor is still alive when it is packed.
+_WEDGE_TAGS: dict[int, str] = {}
+
+
+def _wedge_log(message: str) -> None:
+    _WEDGE_TRACE.append(message)
+
+
+class _WedgeOffloader:
+    """Minimal stand-in for an activation-offload engine on CPU, wired to the
+    remat tape via saved_tensors_hooks. pack records the live tensor (no copy)
+    and stashes a backup; a block's tensors are freed when the NEXT block commits
+    (the previous group's D2H is done by then); unpack reloads a fresh tensor.
+
+    Used by test_saved_tensors_hooks_offload_through_save_recompute_save_wedge.
+    """
+
+    def __init__(self) -> None:
+        self.backups: list[torch.Tensor] = []
+        self.originals: list[torch.Tensor] = []
+        self.labels: list[str] = []  # per-tag wedge_tag, for legible trace lines
+        self.pending: list[int] = []  # tags packed in the current block
+        self.committed: list[int] = []  # tags from the last committed block
+
+    def pack(self, tensor: torch.Tensor) -> object:
+        tag = len(self.backups)
+        label = _WEDGE_TAGS.get(id(tensor), "<untagged>")
+        self.labels.append(label)
+        self.backups.append(tensor.detach().clone())
+        self.originals.append(tensor)
+        self.pending.append(tag)
+        _wedge_log(f"  pack t{tag} = {label}")
+        return tag
+
+    def _free(self, tags: list[int]) -> None:
+        for tag in tags:
+            self.originals[tag].untyped_storage().resize_(0)
+
+    def commit_group(self, block: str) -> None:
+        freed = "[" + ", ".join(f"t{tag}" for tag in self.committed) + "]"
+        _wedge_log(f"  commit {block}: free {freed}")
+        self._free(self.committed)
+        self.committed, self.pending = self.pending, []
+
+    def flush(self) -> None:
+        freed = "[" + ", ".join(f"t{tag}" for tag in self.committed) + "]"
+        _wedge_log(f"  flush: free {freed}")
+        self._free(self.committed)
+        self.committed = []
+
+    def unpack(self, packed: object) -> torch.Tensor:
+        tag = cast(int, packed)
+        _wedge_log(f"  unpack t{tag} = {self.labels[tag]}")
+        return self.backups[tag].clone()
+
+
+def _wedge_compute_log() -> None:
+    suffix = " (recompute)" if torch_remat.is_recomputing() else ""
+    _wedge_log(f"compute {_WEDGE_LABEL} [{_WEDGE_POLICY}]{suffix}")
+
+
+class _WedgeSq(torch.autograd.Function):
+    @staticmethod
+    @torch_remat.auto_forward("x")
+    def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
+        _wedge_compute_log()
+        # Save a tape-owned intermediate (d(x*x)/dx), never the region input --
+        # the input is PyTorch's checkpoint recompute-input and must not be freed
+        # out from under it. Tag the saved tensors so the trace names each pack.
+        grad_factor = x * 2
+        _WEDGE_TAGS[id(grad_factor)] = f"{_WEDGE_LABEL}.gf"
+        y = x * x
+        _WEDGE_TAGS[id(y)] = f"{_WEDGE_LABEL}.y"
+        ctx.save_for_backward(grad_factor)
+        return y
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+        (grad_factor,) = ctx.saved_tensors
+        return grad_output * grad_factor
+
+
+class _WedgeRelu(torch.autograd.Function):
+    @staticmethod
+    @torch_remat.auto_forward("x")
+    def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
+        _wedge_compute_log()
+        # A RECOMPUTE op: its saved mask is regenerated in backward and never
+        # reaches the tape, so the trace shows no pack line for any *.mid tensor.
+        mask = (x > 0).to(x.dtype)
+        _WEDGE_TAGS[id(mask)] = f"{_WEDGE_LABEL}.mask"
+        ctx.save_for_backward(mask)
+        return torch.relu(x)
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+        (mask,) = ctx.saved_tensors
+        return grad_output * mask
+
+
+def _wedge_step(  # pyre-ignore[3]
+    t: torch.Tensor, label: str, op: Any, policy: torch_remat.CheckpointPolicy
+):
+    global _WEDGE_LABEL, _WEDGE_POLICY
+    _WEDGE_LABEL = label
+    _WEDGE_POLICY = policy.name
+    return torch_remat.op(op, label, policy=policy)(t)
+
+
+def _wedge_block_body(prefix: str):  # pyre-ignore[3]
+    """A SAVE -> RECOMPUTE -> SAVE wedge: Sq[SAVE] -> Relu[RECOMPUTE] -> Sq[SAVE]."""
+
+    def body(t: torch.Tensor) -> torch.Tensor:
+        save = torch_remat.CheckpointPolicy.SAVE
+        recompute = torch_remat.CheckpointPolicy.RECOMPUTE
+        t = _wedge_step(t, f"{prefix}.in", _WedgeSq.apply, save)
+        t = _wedge_step(t, f"{prefix}.mid", _WedgeRelu.apply, recompute)
+        t = _wedge_step(t, f"{prefix}.out", _WedgeSq.apply, save)
+        return t
+
+    return body
+
+
+def _run_wedge_model(
+    offloader: _WedgeOffloader | None,
+) -> tuple[torch.Tensor, torch.Tensor, str]:
+    """Run two SAVE->RECOMPUTE->SAVE blocks (each a checkpoint region == one
+    offload group). With an offloader installed, route tape saves through it and
+    free each block's activations a block late. Returns (loss, x.grad, trace)."""
+    global _WEDGE_TRACE
+    _WEDGE_TRACE = []
+    _WEDGE_TAGS.clear()
+    x = torch.tensor([1.0, 2.0], requires_grad=True)
+    hooks: contextlib.AbstractContextManager[object] = (
+        torch_remat.saved_tensors_hooks(offloader.pack, offloader.unpack)
+        if offloader is not None
+        else contextlib.nullcontext()
+    )
+    _wedge_log("== forward ==")
+    with hooks:
+        h = x
+        for block_id in range(2):
+            block = f"block.{block_id}"
+            h = torch_remat.checkpoint(region_name=block)(_wedge_block_body(block))(h)
+            if offloader is not None:
+                offloader.commit_group(block)  # deferred cleanup of the prior block
+    if offloader is not None:
+        offloader.flush()
+    _wedge_log("== backward ==")
+    loss = h.sum()
+    loss.backward()
+    assert x.grad is not None
+    return loss.detach().clone(), x.grad.detach().clone(), "\n".join(_WEDGE_TRACE)
 
 
 class ApiTest(expecttest.TestCase):
@@ -515,6 +682,217 @@ inner_backward_after_unpack""",
         self.assertEqual(1, ReadmeSquare.forward_runs)
         self.assertEqual(1, ReadmeSquare.load_runs)
         self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
+
+    def test_saved_tensors_hooks_fire_at_tape_save_and_load_not_recompute(
+        self,
+    ) -> None:
+        # A SAVE-policy op stores tensors on the remat tape. saved_tensors_hooks
+        # must fire pack once per saved tensor in the original forward, fire
+        # unpack once per saved tensor when recompute reads them back, and must
+        # NOT fire pack again during recompute. A custom pack/unpack pair that
+        # round-trips through a Python list must leave gradients unchanged.
+        pack_shapes: list[tuple[int, ...]] = []
+        unpack_tags: list[str] = []
+        stash: list[torch.Tensor] = []
+
+        def pack(tensor: torch.Tensor) -> object:
+            pack_shapes.append(tuple(tensor.shape))
+            index = len(stash)
+            stash.append(tensor.detach().clone())
+            return ("stashed", index)
+
+        def unpack(packed: object) -> torch.Tensor:
+            tag, index = cast(tuple[str, int], packed)
+            unpack_tags.append(tag)
+            return stash[index]
+
+        class Square(torch.autograd.Function):
+            @staticmethod
+            def forward(
+                ctx: Any,
+                x: torch.Tensor,
+                op_name: str,
+                policy: torch_remat.CheckpointPolicy,
+            ) -> torch.Tensor:
+                handle = torch_remat.get_handle(ctx, op_name, policy)
+                if (ret := handle.maybe_load_saved()) is not None:
+                    assert isinstance(ret, torch.Tensor)
+                    return ret
+                x = handle.save_or_load_inputs(x)
+                assert isinstance(x, torch.Tensor)
+                y = x * x
+                handle.save_for_backward({"x": x, "y": y})
+                return handle.record_outputs(y)
+
+            @staticmethod
+            def backward(
+                ctx: Any,
+                grad_output: torch.Tensor,
+            ) -> tuple[torch.Tensor, None, None]:
+                (x, y) = ctx.saved_tensors
+                del y
+                return grad_output * 2 * x, None, None
+
+        x = torch.tensor([2.0, 3.0], requires_grad=True)
+        with torch_remat.saved_tensors_hooks(pack, unpack):
+            y = torch_remat.checkpoint()(Square.apply)(
+                x,
+                "sq",
+                torch_remat.CheckpointPolicy.SAVE,
+            )
+            y.sum().backward()
+
+        # pack fires for x and y in the original forward only (not on recompute).
+        self.assertEqual(2, len(pack_shapes))
+        # unpack fires for x and y when recompute reads the tape back.
+        self.assertEqual(["stashed", "stashed"], unpack_tags)
+        # The custom pack/unpack round-trip leaves the gradient unchanged.
+        self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
+
+    def test_saved_tensors_hooks_unpack_is_bound_per_tensor(self) -> None:
+        # The unpack hook used at load time must be the one bound when the tensor
+        # was packed, even if a different pack/unpack pair is active later (here:
+        # no hooks at all during backward, because the with-block has exited).
+        unpack_calls: list[str] = []
+        stash: list[torch.Tensor] = []
+
+        def pack(tensor: torch.Tensor) -> object:
+            index = len(stash)
+            stash.append(tensor.detach().clone())
+            return index
+
+        def unpack(packed: object) -> torch.Tensor:
+            unpack_calls.append("bound")
+            return stash[cast(int, packed)]
+
+        class Square(torch.autograd.Function):
+            @staticmethod
+            def forward(
+                ctx: Any,
+                x: torch.Tensor,
+                op_name: str,
+                policy: torch_remat.CheckpointPolicy,
+            ) -> torch.Tensor:
+                handle = torch_remat.get_handle(ctx, op_name, policy)
+                if (ret := handle.maybe_load_saved()) is not None:
+                    assert isinstance(ret, torch.Tensor)
+                    return ret
+                x = handle.save_or_load_inputs(x)
+                assert isinstance(x, torch.Tensor)
+                y = x * x
+                handle.save_for_backward({"x": x, "y": y})
+                return handle.record_outputs(y)
+
+            @staticmethod
+            def backward(
+                ctx: Any,
+                grad_output: torch.Tensor,
+            ) -> tuple[torch.Tensor, None, None]:
+                (x, y) = ctx.saved_tensors
+                del y
+                return grad_output * 2 * x, None, None
+
+        x = torch.tensor([2.0, 3.0], requires_grad=True)
+        # Pack inside the hook scope; recompute/backward runs OUTSIDE it.
+        with torch_remat.saved_tensors_hooks(pack, unpack):
+            y = torch_remat.checkpoint()(Square.apply)(
+                x,
+                "sq",
+                torch_remat.CheckpointPolicy.SAVE,
+            )
+        y.sum().backward()
+
+        # unpack still ran (bound to the slot at pack time) despite no active hook.
+        self.assertEqual(["bound", "bound"], unpack_calls)
+        self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
+
+    def test_saved_tensors_hooks_offload_through_save_recompute_save_wedge(
+        self,
+    ) -> None:
+        # The shape that actually motivated tape-level hooks, in miniature for
+        # readers without access to a real offloader. The model is two "blocks"
+        # (each a checkpoint region == one offload group), and inside every block
+        # a SAVE -> RECOMPUTE -> SAVE wedge of ops on x = [1.0, 2.0]:
+        #
+        #   block.k:  in = Sq[SAVE]  ->  mid = Relu[RECOMPUTE]  ->  out = Sq[SAVE]
+        #
+        # where Sq(t) = t*t (saves the gradient factor 2*t) and Relu(t) = relu(t)
+        # (saves its 0/1 mask). A toy offload engine is wired to the remat tape
+        # via saved_tensors_hooks; we install ONE scope around the whole forward
+        # (the tape binds each unpack to its slot, so -- unlike autograd's blanket
+        # default hooks, which a real engine must install per-layer INSIDE the
+        # checkpoint -- a single install suffices). Each block's offloaded storage
+        # is freed a block late (the next block's commit frees the previous group)
+        # and reloaded in backward.
+        #
+        # Working the forward by hand (x = [1, 2], so relu is the identity here):
+        #   block.0.in  Sq[SAVE]:   y0 = x*x = [1, 4]   -> tape: 2*x = [2, 4] (gf),
+        #                           and y0 = [1, 4] (its output feeds the RECOMPUTE
+        #                           op, so the tape must keep it for recompute)
+        #   block.0.mid Relu[RECOMPUTE]: relu([1,4]) = [1, 4]; its mask is NOT
+        #                           taped (it is regenerated in backward)
+        #   block.0.out Sq[SAVE]:   y1 = [1, 16] -> tape: 2*[1,4] = [2, 8] (gf only;
+        #                           the block output is not taped)
+        #   block.1 repeats on [1, 16] -> ... -> [1, 256] -> [1, 65536]
+        #
+        # So exactly the SAVE ops reach the offloader (four grad_factors + the two
+        # *.in outputs); nothing named *.mid is ever packed. Rather than assert
+        # those facts piecemeal, we capture the engine's event trace and pin it
+        # whole: the absence of any "pack ... *.mid" line IS the proof that
+        # RECOMPUTE intermediates never reach the tape, and the compute lines show
+        # SAVE bodies are skipped on recompute while RECOMPUTE bodies rerun.
+        #
+        # Read the trace below as the worked execution. In the forward, every
+        # pack line names a SAVE tensor (*.gf or the *.in output) -- there is no
+        # "pack ... *.mid" line, which IS the proof that the RECOMPUTE op's saved
+        # tensors never reach the tape. Each block's tensors are freed a block
+        # late (commit block.1 frees block.0's t0..t2; flush frees block.1's).
+        # In the backward, only the *.mid (RECOMPUTE) compute lines reappear --
+        # the SAVE bodies are not rerun -- and every freed activation is restored
+        # through unpack before it is read, in the reverse, recompute-driven order.
+        base_loss, base_grad, _ = _run_wedge_model(None)
+
+        offloader = _WedgeOffloader()
+        off_loss, off_grad, trace = _run_wedge_model(offloader)
+
+        self.assertExpectedInline(
+            trace,
+            """\
+== forward ==
+compute block.0.in [SAVE]
+  pack t0 = block.0.in.gf
+  pack t1 = block.0.in.y
+compute block.0.mid [RECOMPUTE]
+compute block.0.out [SAVE]
+  pack t2 = block.0.out.gf
+  commit block.0: free []
+compute block.1.in [SAVE]
+  pack t3 = block.1.in.gf
+  pack t4 = block.1.in.y
+compute block.1.mid [RECOMPUTE]
+compute block.1.out [SAVE]
+  pack t5 = block.1.out.gf
+  commit block.1: free [t0, t1, t2]
+  flush: free [t3, t4, t5]
+== backward ==
+  unpack t3 = block.1.in.gf
+  unpack t4 = block.1.in.y
+compute block.1.mid [RECOMPUTE] (recompute)
+  unpack t5 = block.1.out.gf
+  unpack t0 = block.0.in.gf
+  unpack t1 = block.0.in.y
+compute block.0.mid [RECOMPUTE] (recompute)
+  unpack t2 = block.0.out.gf""",
+        )
+
+        # Every offloaded activation's storage was freed before backward ran, yet
+        # the recompute above reloaded each one through unpack, so the offloaded
+        # run is bitwise-identical to the no-offload baseline.
+        self.assertTrue(
+            all(t.untyped_storage().nbytes() == 0 for t in offloader.originals)
+        )
+        self.assertTrue(torch.equal(base_loss, off_loss))
+        self.assertTrue(torch.equal(base_grad, off_grad))
 
     def test_auto_forward_save_policy_restores_saved_output_view(self) -> None:
         class SavesOutputView(torch.autograd.Function):

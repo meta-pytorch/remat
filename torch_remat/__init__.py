@@ -15,6 +15,8 @@ from torch_remat._api import (  # noqa: F401
     is_recomputing,
     op,
     RematHandle,
+    saved_tensors_hooks,
+    set_saved_tensors_hooks,
     trace_scope,
 )
 from torch_remat._native import native_op  # noqa: F401
