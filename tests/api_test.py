@@ -6,6 +6,12 @@
 
 # pyre-strict
 
+"""Tests for torch_remat exercised exclusively through its high-level public
+surface: ``auto_forward``, ``op``, ``native_op``, and ``checkpoint``. The
+low-level handle API (``get_handle`` / ``maybe_load_saved`` /
+``save_or_load_inputs`` / ``record_outputs``) is intentionally not used here.
+"""
+
 from __future__ import annotations
 
 import contextlib
@@ -283,15 +289,9 @@ class ApiTest(expecttest.TestCase):
     def test_checkpoint_forward_exception_unwinds_remat_state(self) -> None:
         class FailingForward(torch.autograd.Function):
             @staticmethod
+            @torch_remat.auto_forward("x")
             def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
-                op_name = "failing.forward"
-                policy = torch_remat.CheckpointPolicy.SAVE
-                handle = torch_remat.get_handle(ctx, op_name, policy)
-                if (ret := handle.maybe_load_saved()) is not None:
-                    assert isinstance(ret, torch.Tensor)
-                    return ret
-
-                handle.save_for_backward({"x": x})
+                ctx.save_for_backward(x)
                 raise RuntimeError("intentional forward failure")
 
             @staticmethod
@@ -299,11 +299,18 @@ class ApiTest(expecttest.TestCase):
                 del ctx
                 return grad_output
 
+        def failing_body(x: torch.Tensor) -> torch.Tensor:
+            return torch_remat.op(
+                FailingForward.apply,
+                "failing.forward",
+                policy=torch_remat.CheckpointPolicy.SAVE,
+            )(x)
+
         caught_exception: RuntimeError | None = None
         try:
             torch_remat.checkpoint(
                 region_name="leak.check",
-            )(FailingForward.apply)(torch.ones(1, requires_grad=True))
+            )(failing_body)(torch.ones(1, requires_grad=True))
         except RuntimeError as exc:
             caught_exception = exc
 
@@ -317,27 +324,28 @@ class ApiTest(expecttest.TestCase):
 
         class FollowupSquare(torch.autograd.Function):
             @staticmethod
+            @torch_remat.auto_forward("x")
             def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
-                op_name = "followup.square"
-                policy = torch_remat.CheckpointPolicy.SAVE
-                handle = torch_remat.get_handle(ctx, op_name, policy)
-                if (ret := handle.maybe_load_saved()) is not None:
-                    assert isinstance(ret, torch.Tensor)
-                    return ret
-
                 y = x * x
-                handle.save_for_backward({"x": x})
-                return handle.record_outputs(y)
+                ctx.save_for_backward(x)
+                return y
 
             @staticmethod
             def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
                 (x,) = ctx.saved_tensors
                 return grad_output * 2 * x
 
+        def followup_body(x: torch.Tensor) -> torch.Tensor:
+            return torch_remat.op(
+                FollowupSquare.apply,
+                "followup.square",
+                policy=torch_remat.CheckpointPolicy.SAVE,
+            )(x)
+
         x = torch.tensor([2.0], requires_grad=True)
         y = torch_remat.checkpoint(
             region_name="followup.check",
-        )(FollowupSquare.apply)(x)
+        )(followup_body)(x)
         y.sum().backward()
 
         self.assertTrue(torch.equal(x.grad, torch.tensor([4.0])))
@@ -633,56 +641,6 @@ inner_backward_after_unpack""",
         self.assertEqual(1, FunctionStyleSquare.forward_runs)
         self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
 
-    def test_readme_style_save_policy_skips_recompute_body(self) -> None:
-        class ReadmeSquare(torch.autograd.Function):
-            forward_runs: int = 0
-            load_runs: int = 0
-
-            @staticmethod
-            def forward(
-                ctx: Any,
-                x: torch.Tensor,
-                op_name: str,
-                policy: torch_remat.CheckpointPolicy,
-            ) -> torch.Tensor:
-                handle = torch_remat.get_handle(ctx, op_name, policy)
-                if (ret := handle.maybe_load_saved()) is not None:
-                    ReadmeSquare.load_runs += 1
-                    assert isinstance(ret, torch.Tensor)
-                    self.assertTrue(torch_remat.is_recomputing())
-                    self.assert_placeholder(ret, (2,))
-                    return ret
-
-                self.assertFalse(torch_remat.is_recomputing())
-                x = handle.save_or_load_inputs(x)
-                assert isinstance(x, torch.Tensor)
-                ReadmeSquare.forward_runs += 1
-                y = x * x
-                handle.save_for_backward({"x": x, "y": y})
-                return handle.record_outputs(y)
-
-            @staticmethod
-            def backward(
-                ctx: Any,
-                grad_output: torch.Tensor,
-            ) -> tuple[torch.Tensor, None, None]:
-                (x, y) = ctx.saved_tensors
-                del y
-                return grad_output * 2 * x, None, None
-
-        x = torch.tensor([2.0, 3.0], requires_grad=True)
-
-        y = torch_remat.checkpoint()(ReadmeSquare.apply)(
-            x,
-            "readme.square",
-            torch_remat.CheckpointPolicy.SAVE,
-        )
-        y.sum().backward()
-
-        self.assertEqual(1, ReadmeSquare.forward_runs)
-        self.assertEqual(1, ReadmeSquare.load_runs)
-        self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
-
     def test_saved_tensors_hooks_fire_at_tape_save_and_load_not_recompute(
         self,
     ) -> None:
@@ -708,38 +666,28 @@ inner_backward_after_unpack""",
 
         class Square(torch.autograd.Function):
             @staticmethod
-            def forward(
-                ctx: Any,
-                x: torch.Tensor,
-                op_name: str,
-                policy: torch_remat.CheckpointPolicy,
-            ) -> torch.Tensor:
-                handle = torch_remat.get_handle(ctx, op_name, policy)
-                if (ret := handle.maybe_load_saved()) is not None:
-                    assert isinstance(ret, torch.Tensor)
-                    return ret
-                x = handle.save_or_load_inputs(x)
-                assert isinstance(x, torch.Tensor)
+            @torch_remat.auto_forward("x", "y")
+            def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
                 y = x * x
-                handle.save_for_backward({"x": x, "y": y})
-                return handle.record_outputs(y)
+                ctx.save_for_backward(x, y)
+                return y
 
             @staticmethod
-            def backward(
-                ctx: Any,
-                grad_output: torch.Tensor,
-            ) -> tuple[torch.Tensor, None, None]:
+            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
                 (x, y) = ctx.saved_tensors
                 del y
-                return grad_output * 2 * x, None, None
+                return grad_output * 2 * x
+
+        def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
+            return torch_remat.op(
+                Square.apply,
+                "sq",
+                policy=torch_remat.CheckpointPolicy.SAVE,
+            )(x)
 
         x = torch.tensor([2.0, 3.0], requires_grad=True)
         with torch_remat.saved_tensors_hooks(pack, unpack):
-            y = torch_remat.checkpoint()(Square.apply)(
-                x,
-                "sq",
-                torch_remat.CheckpointPolicy.SAVE,
-            )
+            y = torch_remat.checkpoint()(checkpoint_body)(x)
             y.sum().backward()
 
         # pack fires for x and y in the original forward only (not on recompute).
@@ -767,39 +715,29 @@ inner_backward_after_unpack""",
 
         class Square(torch.autograd.Function):
             @staticmethod
-            def forward(
-                ctx: Any,
-                x: torch.Tensor,
-                op_name: str,
-                policy: torch_remat.CheckpointPolicy,
-            ) -> torch.Tensor:
-                handle = torch_remat.get_handle(ctx, op_name, policy)
-                if (ret := handle.maybe_load_saved()) is not None:
-                    assert isinstance(ret, torch.Tensor)
-                    return ret
-                x = handle.save_or_load_inputs(x)
-                assert isinstance(x, torch.Tensor)
+            @torch_remat.auto_forward("x", "y")
+            def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
                 y = x * x
-                handle.save_for_backward({"x": x, "y": y})
-                return handle.record_outputs(y)
+                ctx.save_for_backward(x, y)
+                return y
 
             @staticmethod
-            def backward(
-                ctx: Any,
-                grad_output: torch.Tensor,
-            ) -> tuple[torch.Tensor, None, None]:
+            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
                 (x, y) = ctx.saved_tensors
                 del y
-                return grad_output * 2 * x, None, None
+                return grad_output * 2 * x
+
+        def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
+            return torch_remat.op(
+                Square.apply,
+                "sq",
+                policy=torch_remat.CheckpointPolicy.SAVE,
+            )(x)
 
         x = torch.tensor([2.0, 3.0], requires_grad=True)
         # Pack inside the hook scope; recompute/backward runs OUTSIDE it.
         with torch_remat.saved_tensors_hooks(pack, unpack):
-            y = torch_remat.checkpoint()(Square.apply)(
-                x,
-                "sq",
-                torch_remat.CheckpointPolicy.SAVE,
-            )
+            y = torch_remat.checkpoint()(checkpoint_body)(x)
         y.sum().backward()
 
         # unpack still ran (bound to the slot at pack time) despite no active hook.
@@ -965,54 +903,40 @@ compute block.0.mid [RECOMPUTE] (recompute)
             forward_runs: int = 0
 
             @staticmethod
-            def forward(
-                ctx: Any,
-                x: torch.Tensor,
-                op_name: str,
-                policy: torch_remat.CheckpointPolicy,
-            ) -> torch.Tensor:
-                handle = torch_remat.get_handle(ctx, op_name, policy)
-                if (ret := handle.maybe_load_saved()) is not None:
-                    assert isinstance(ret, torch.Tensor)
-                    return ret
-
-                x = handle.save_or_load_inputs(x)
-                assert isinstance(x, torch.Tensor)
+            @torch_remat.auto_forward("x")
+            def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
                 ReadmeSquare.forward_runs += 1
-                y = x * x
-                handle.save_for_backward({"x": x})
-                return handle.record_outputs(y)
+                ctx.save_for_backward(x)
+                return x * x
 
             @staticmethod
-            def backward(
-                ctx: Any,
-                grad_output: torch.Tensor,
-            ) -> tuple[torch.Tensor, None, None]:
+            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
                 (x,) = ctx.saved_tensors
-                return grad_output * 2 * x, None, None
+                return grad_output * 2 * x
+
+        def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
+            return torch_remat.op(
+                ReadmeSquare.apply,
+                "readme.square",
+                policy=torch_remat.CheckpointPolicy.RECOMPUTE,
+            )(x)
 
         x = torch.tensor([2.0, 3.0], requires_grad=True)
-
-        y = torch_remat.checkpoint()(ReadmeSquare.apply)(
-            x,
-            "readme.square",
-            torch_remat.CheckpointPolicy.RECOMPUTE,
-        )
+        y = torch_remat.checkpoint()(checkpoint_body)(x)
         y.sum().backward()
 
         self.assertEqual(2, ReadmeSquare.forward_runs)
         self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
 
     def test_handles_are_inert_when_no_inputs_need_grad(self) -> None:
-        auto_forward_record_counts: list[int] = []
-        manual_record_counts: list[int] = []
+        record_counts: list[int] = []
 
         class NoGradInputProbe(torch.autograd.Function):
             @staticmethod
             @torch_remat.auto_forward("x")
             def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
                 active_state = _state.get()
-                auto_forward_record_counts.append(
+                record_counts.append(
                     0
                     if active_state is None
                     else len(active_state.region_state.records)
@@ -1024,51 +948,18 @@ compute block.0.mid [RECOMPUTE] (recompute)
             def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
                 return grad_output * 2
 
-        class ManualNoGradInputProbe(torch.autograd.Function):
-            @staticmethod
-            def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
-                handle = torch_remat.get_handle(
-                    ctx,
-                    "manual.no.grad.input.probe",
-                    torch_remat.CheckpointPolicy.SAVE,
-                )
-                active_state = _state.get()
-                manual_record_counts.append(
-                    0
-                    if active_state is None
-                    else len(active_state.region_state.records)
-                )
-                if (ret := handle.maybe_load_saved()) is not None:
-                    return ret
-                handle.save_for_backward({"x": x})
-                return handle.record_outputs(x * 3)
-
-            @staticmethod
-            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
-                return grad_output * 3
-
-        def auto_forward_checkpoint_body(x: torch.Tensor) -> torch.Tensor:
+        def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
             return torch_remat.op(
                 NoGradInputProbe.apply,
                 "no.grad.input.probe",
                 policy=torch_remat.CheckpointPolicy.SAVE,
             )(x)
 
-        def manual_checkpoint_body(x: torch.Tensor) -> torch.Tensor:
-            return ManualNoGradInputProbe.apply(x)
-
         x = torch.tensor([1.0], requires_grad=False)
-        y = torch_remat.checkpoint(region_name="auto.no.grad.input")(
-            auto_forward_checkpoint_body
-        )(x)
-        z = torch_remat.checkpoint(region_name="manual.no.grad.input")(
-            manual_checkpoint_body
-        )(x)
+        y = torch_remat.checkpoint(region_name="auto.no.grad.input")(checkpoint_body)(x)
 
         self.assertFalse(y.requires_grad)
-        self.assertFalse(z.requires_grad)
-        self.assertEqual([0], auto_forward_record_counts)
-        self.assertEqual([0], manual_record_counts)
+        self.assertEqual([0], record_counts)
 
     def test_recompute_policy_does_not_retain_original_saved_tensors_after_forward(
         self,
@@ -1077,26 +968,15 @@ compute block.0.mid [RECOMPUTE] (recompute)
 
         class SavedTensorLifetimeProbe(torch.autograd.Function):
             @staticmethod
+            @torch_remat.auto_forward("saved_activation")
             def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
                 nonlocal original_saved_ref
-
-                handle = torch_remat.get_handle(
-                    ctx,
-                    "saved.tensor.lifetime",
-                    torch_remat.CheckpointPolicy.RECOMPUTE,
-                )
-                if (ret := handle.maybe_load_saved()) is not None:
-                    assert isinstance(ret, torch.Tensor)
-                    return ret
-
-                x = handle.save_or_load_inputs(x)
-                assert isinstance(x, torch.Tensor)
 
                 saved_activation = x + 1
                 if not torch_remat.is_recomputing():
                     original_saved_ref = weakref.ref(saved_activation)
-                handle.save_for_backward({"saved_activation": saved_activation})
-                return handle.record_outputs(x * 2)
+                ctx.save_for_backward(saved_activation)
+                return x * 2
 
             @staticmethod
             def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
@@ -1104,8 +984,15 @@ compute block.0.mid [RECOMPUTE] (recompute)
                 del saved_activation
                 return grad_output * 2
 
+        def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
+            return torch_remat.op(
+                SavedTensorLifetimeProbe.apply,
+                "saved.tensor.lifetime",
+                policy=torch_remat.CheckpointPolicy.RECOMPUTE,
+            )(x)
+
         x = torch.tensor([2.0, 3.0], requires_grad=True)
-        y = torch_remat.checkpoint()(SavedTensorLifetimeProbe.apply)(x)
+        y = torch_remat.checkpoint()(checkpoint_body)(x)
 
         saved_ref = original_saved_ref
         self.assertIsNotNone(saved_ref)
@@ -1123,51 +1010,35 @@ compute block.0.mid [RECOMPUTE] (recompute)
             runs: int = 0
 
             @staticmethod
+            @torch_remat.auto_forward("x")
             def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
-                op_name = "producer"
-                policy = torch_remat.CheckpointPolicy.RECOMPUTE
-                handle = torch_remat.get_handle(ctx, op_name, policy)
-                if (ret := handle.maybe_load_saved()) is not None:
-                    assert isinstance(ret, torch.Tensor)
-                    return ret
-
-                x = handle.save_or_load_inputs(x)
-                assert isinstance(x, torch.Tensor)
                 Producer.runs += 1
                 y = x * 3
-                handle.save_for_backward({"x": x})
-                return handle.record_outputs(y)
+                ctx.save_for_backward(x)
+                return y
 
             @staticmethod
             def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
                 del ctx
                 return grad_output * 3
 
+        test_case = self
+
         class Consumer(torch.autograd.Function):
             @staticmethod
+            @torch_remat.auto_forward("x")
             def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
-                op_name = "consumer"
-                policy = torch_remat.CheckpointPolicy.RECOMPUTE
-                handle = torch_remat.get_handle(ctx, op_name, policy)
-                if (ret := handle.maybe_load_saved()) is not None:
-                    assert isinstance(ret, torch.Tensor)
-                    return ret
-
-                self.assertEqual(2, x.numel())
-                self.assertGreater(x.untyped_storage().nbytes(), 0)
-                x = handle.save_or_load_inputs(x)
-                assert isinstance(x, torch.Tensor)
-                self.assertEqual(2, x.numel())
-                self.assertGreater(x.untyped_storage().nbytes(), 0)
-                handle.save_for_backward({"x": x})
+                test_case.assertEqual(2, x.numel())
+                test_case.assertGreater(x.untyped_storage().nbytes(), 0)
+                ctx.save_for_backward(x)
                 if not torch_remat.is_recomputing():
-                    self.assertExpectedInline(
+                    test_case.assertExpectedInline(
                         torch_remat.format_current_memory_report(),
                         """\
 torch_remat checkpoint region: inputs
 total: 0 B""",
                     )
-                return handle.record_outputs(x.sum())
+                return x.sum()
 
             @staticmethod
             def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
@@ -1175,7 +1046,16 @@ total: 0 B""",
                 return grad_output * torch.ones_like(x)
 
         def checkpointed_region(x: torch.Tensor) -> torch.Tensor:
-            return Consumer.apply(Producer.apply(x))
+            y = torch_remat.op(
+                Producer.apply,
+                "producer",
+                policy=torch_remat.CheckpointPolicy.RECOMPUTE,
+            )(x)
+            return torch_remat.op(
+                Consumer.apply,
+                "consumer",
+                policy=torch_remat.CheckpointPolicy.RECOMPUTE,
+            )(y)
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
 
@@ -1185,33 +1065,31 @@ total: 0 B""",
         y.backward()
 
         self.assertEqual(2, Producer.runs)
+        self.assertTrue(torch.equal(x.grad, torch.tensor([3.0, 3.0])))
 
     def test_recompute_policy_must_match_forward_policy(self) -> None:
         class PolicyDrift(torch.autograd.Function):
             @staticmethod
+            @torch_remat.auto_forward("x")
             def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
-                policy = (
-                    torch_remat.CheckpointPolicy.RECOMPUTE
-                    if torch_remat.is_recomputing()
-                    else torch_remat.CheckpointPolicy.SAVE
-                )
-                handle = torch_remat.get_handle(ctx, "policy.drift", policy)
-                if (ret := handle.maybe_load_saved()) is not None:
-                    assert isinstance(ret, torch.Tensor)
-                    return ret
-
                 y = x * x
-                handle.save_for_backward({"x": x})
-                return handle.record_outputs(y)
+                ctx.save_for_backward(x)
+                return y
 
             @staticmethod
             def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
                 (x,) = ctx.saved_tensors
                 return grad_output * 2 * x
 
-        y = torch_remat.checkpoint()(PolicyDrift.apply)(
-            torch.ones(1, requires_grad=True)
-        )
+        def run(x: torch.Tensor) -> torch.Tensor:
+            policy = (
+                torch_remat.CheckpointPolicy.RECOMPUTE
+                if torch_remat.is_recomputing()
+                else torch_remat.CheckpointPolicy.SAVE
+            )
+            return torch_remat.op(PolicyDrift.apply, "policy.drift", policy=policy)(x)
+
+        y = torch_remat.checkpoint()(run)(torch.ones(1, requires_grad=True))
 
         with self.assertRaisesRegex(RuntimeError, "Conflicting checkpoint policies"):
             y.sum().backward()
@@ -1219,28 +1097,11 @@ total: 0 B""",
     def test_memory_report_groups_by_region_op_and_tensor(self) -> None:
         class Probe(torch.autograd.Function):
             @staticmethod
+            @torch_remat.auto_forward("lse", "probs")
             def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
-                op_name = "attn.softmax"
-                policy = torch_remat.CheckpointPolicy.SAVE
-                handle = torch_remat.get_handle(ctx, op_name, policy)
-                if (ret := handle.maybe_load_saved()) is not None:
-                    assert isinstance(ret, torch.Tensor)
-                    return ret
-
-                out = torch.zeros(2, dtype=torch.float32)
                 lse = torch.zeros(3, dtype=torch.float32)
                 probs = torch.zeros(4, dtype=torch.float32)
-                handle.save_for_backward({"lse": lse, "probs": probs})
-                self.assertExpectedInline(
-                    torch_remat.format_current_memory_report(),
-                    """\
-torch_remat checkpoint region: layers.0
-total: 28 B
-layers.0::attn.softmax total=28 B
-  lse: 12 B shape=(3,) dtype=torch.float32 device=cpu policy=SAVE
-  probs: 16 B shape=(4,) dtype=torch.float32 device=cpu policy=SAVE""",
-                )
-                handle.record_outputs(out)
+                ctx.save_for_backward(lse, probs)
                 return x
 
             @staticmethod
@@ -1248,9 +1109,25 @@ layers.0::attn.softmax total=28 B
                 del ctx
                 return grad_output
 
-        torch_remat.checkpoint(
-            region_name="layers.0",
-        )(Probe.apply)(torch.tensor([1.0], requires_grad=True))
+        forward_context, _ = _checkpoint_context_fn("layers.0")
+        x = torch.tensor([1.0], requires_grad=True)
+
+        with forward_context:
+            torch_remat.op(
+                Probe.apply,
+                "attn.softmax",
+                policy=torch_remat.CheckpointPolicy.SAVE,
+            )(x)
+
+            self.assertExpectedInline(
+                torch_remat.format_current_memory_report(),
+                """\
+torch_remat checkpoint region: layers.0
+total: 28 B
+layers.0::attn.softmax total=28 B
+  lse: 12 B shape=(3,) dtype=torch.float32 device=cpu policy=SAVE
+  probs: 16 B shape=(4,) dtype=torch.float32 device=cpu policy=SAVE""",
+            )
 
     def test_native_memory_report_observes_live_sac_outputs(self) -> None:
         from torch.utils.checkpoint import SelectiveCheckpointContext
@@ -1282,88 +1159,41 @@ native.report::native.exp total=8 B
     def test_save_preserves_none_saved_tensor_slots(self) -> None:
         class OptionalSavedTensor(torch.autograd.Function):
             @staticmethod
-            def forward(
-                ctx: Any,
-                x: torch.Tensor,
-                op_name: str,
-                policy: torch_remat.CheckpointPolicy,
-            ) -> torch.Tensor:
-                handle = torch_remat.get_handle(ctx, op_name, policy)
-                if (ret := handle.maybe_load_saved()) is not None:
-                    assert isinstance(ret, torch.Tensor)
-                    self.assertTrue(torch_remat.is_recomputing())
-                    self.assert_placeholder(ret, (2,))
-                    return ret
+            @torch_remat.auto_forward("left", "missing", "right")
+            def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
+                if torch_remat.is_recomputing():
+                    raise AssertionError("SAVE replay must skip the forward body")
 
-                self.assertFalse(torch_remat.is_recomputing())
                 right = x + 1
-                handle.save_for_backward(
-                    {"left": x, "missing": None, "right": right},
-                )
-                return handle.record_outputs(right)
+                ctx.save_for_backward(x, None, right)
+                return right
 
             @staticmethod
-            def backward(
-                ctx: Any,
-                grad_output: torch.Tensor,
-            ) -> tuple[torch.Tensor, None, None]:
-                saved_tensors = ctx.saved_tensors
-                left, missing, right = saved_tensors
-                self.assertTrue(torch.equal(left, x.detach()))
+            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+                left, missing, right = ctx.saved_tensors
                 self.assertIsNone(missing)
-                self.assertTrue(torch.equal(right, x.detach() + 1))
-                return grad_output * (right - left + 1), None, None
+                return grad_output * (right - left + 1)
+
+        def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
+            return torch_remat.op(
+                OptionalSavedTensor.apply,
+                "optional.save",
+                policy=torch_remat.CheckpointPolicy.SAVE,
+            )(x)
 
         x = torch.tensor([3.0, 4.0], requires_grad=True)
-        y = torch_remat.checkpoint()(OptionalSavedTensor.apply)(
-            x,
-            "optional.save",
-            torch_remat.CheckpointPolicy.SAVE,
-        )
+        y = torch_remat.checkpoint()(checkpoint_body)(x)
         y.sum().backward()
 
         self.assertTrue(torch.equal(x.grad, torch.full_like(x, 2.0)))
 
-    def test_save_policy_requires_maybe_load_saved_during_recompute(self) -> None:
-        class MissingMaybeLoad(torch.autograd.Function):
-            @staticmethod
-            def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
-                handle = torch_remat.get_handle(
-                    ctx,
-                    "missing.maybe_load",
-                    torch_remat.CheckpointPolicy.SAVE,
-                )
-                y = x * x
-                handle.save_for_backward({"x": x})
-                return handle.record_outputs(y)
-
-            @staticmethod
-            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
-                (x,) = ctx.saved_tensors
-                return grad_output * 2 * x
-
-        y = torch_remat.checkpoint()(MissingMaybeLoad.apply)(
-            torch.ones(1, requires_grad=True)
-        )
-
-        with self.assertRaisesRegex(RuntimeError, "must call maybe_load_saved"):
-            y.sum().backward()
-
     def test_checkpoint_recompute_errors_on_unreleased_tape_entries(self) -> None:
         class UnusedSaveProducer(torch.autograd.Function):
             @staticmethod
+            @torch_remat.auto_forward()
             def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
-                handle = torch_remat.get_handle(
-                    ctx,
-                    "unused.save.producer",
-                    torch_remat.CheckpointPolicy.SAVE,
-                )
-                if (ret := handle.maybe_load_saved()) is not None:
-                    assert isinstance(ret, torch.Tensor)
-                    return ret
-
-                handle.save_for_backward({})
-                return handle.record_outputs(x + 1)
+                ctx.save_for_backward()
+                return x + 1
 
             @staticmethod
             def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
@@ -1372,20 +1202,10 @@ native.report::native.exp total=8 B
 
         class UnusedRecomputeConsumer(torch.autograd.Function):
             @staticmethod
+            @torch_remat.auto_forward()
             def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
-                handle = torch_remat.get_handle(
-                    ctx,
-                    "unused.recompute.consumer",
-                    torch_remat.CheckpointPolicy.RECOMPUTE,
-                )
-                if (ret := handle.maybe_load_saved()) is not None:
-                    assert isinstance(ret, torch.Tensor)
-                    return ret
-
-                x = handle.save_or_load_inputs(x)
-                assert isinstance(x, torch.Tensor)
-                handle.save_for_backward({})
-                return handle.record_outputs(x * 2)
+                ctx.save_for_backward()
+                return x * 2
 
             @staticmethod
             def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
@@ -1394,7 +1214,16 @@ native.report::native.exp total=8 B
 
         def checkpointed_region(x: torch.Tensor) -> torch.Tensor:
             y = torch.sin(x)
-            UnusedRecomputeConsumer.apply(UnusedSaveProducer.apply(x))
+            producer = torch_remat.op(
+                UnusedSaveProducer.apply,
+                "unused.save.producer",
+                policy=torch_remat.CheckpointPolicy.SAVE,
+            )(x)
+            torch_remat.op(
+                UnusedRecomputeConsumer.apply,
+                "unused.recompute.consumer",
+                policy=torch_remat.CheckpointPolicy.RECOMPUTE,
+            )(producer)
             return y
 
         y = torch.utils.checkpoint.checkpoint(
@@ -1422,154 +1251,62 @@ early.stop::unused.recompute.consumer total=8 B
   input.0: 8 B shape=(2,) dtype=torch.float32 device=cpu policy=RECOMPUTE aliases=observed_output.out""",
         )
 
-    def test_skipped_outputs_preserve_tuple_schema(self) -> None:
-        class SchemaProbe(torch.autograd.Function):
-            @staticmethod
-            def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
-                policy = torch_remat.CheckpointPolicy.SAVE
-                pair_op = torch_remat.get_handle(ctx, "pair.output", policy)
-                triple_op = torch_remat.get_handle(ctx, "triple.output", policy)
-                if (pair_output := pair_op.maybe_load_saved()) is not None:
-                    triple_output = triple_op.maybe_load_saved()
-                    assert isinstance(pair_output, tuple)
-                    assert isinstance(triple_output, tuple)
-                    self.assertTrue(torch_remat.is_recomputing())
-                    self.assertEqual(2, len(pair_output))
-                    self.assert_placeholder(pair_output[0], (2,))
-                    self.assert_placeholder(pair_output[1], (3,))
-                    self.assertEqual(3, len(triple_output))
-                    self.assert_placeholder(triple_output[0], (4,))
-                    self.assert_placeholder(triple_output[1], (5,))
-                    self.assert_placeholder(triple_output[2], (6,))
-                    return x
-
-                self.assertFalse(torch_remat.is_recomputing())
-                pair_op.save_for_backward({})
-                pair_op.record_outputs(
-                    torch.ones(2),
-                    torch.ones(3),
-                )
-                triple_op.save_for_backward({})
-                triple_op.record_outputs(
-                    torch.ones(4),
-                    torch.ones(5),
-                    torch.ones(6),
-                )
-                return x
-
-            @staticmethod
-            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
-                del ctx
-                return grad_output
-
-        y = torch_remat.checkpoint()(SchemaProbe.apply)(
-            torch.ones(2, requires_grad=True)
-        )
-        y.sum().backward()
-
     def test_record_outputs_tuple_can_be_returned_from_forward(self) -> None:
         class TupleReturn(torch.autograd.Function):
             forward_runs: int = 0
-            load_runs: int = 0
 
             @staticmethod
+            @torch_remat.auto_forward("x", "left", "right")
             def forward(
                 ctx: Any,
                 x: torch.Tensor,
-                op_name: str,
-                policy: torch_remat.CheckpointPolicy,
             ) -> tuple[torch.Tensor, torch.Tensor]:
-                handle = torch_remat.get_handle(ctx, op_name, policy)
-                if (ret := handle.maybe_load_saved()) is not None:
-                    TupleReturn.load_runs += 1
-                    assert isinstance(ret, tuple)
-                    self.assertTrue(torch_remat.is_recomputing())
-                    self.assert_placeholder(ret[0], (2,))
-                    self.assert_placeholder(ret[1], (2,))
-                    return ret
+                if torch_remat.is_recomputing():
+                    raise AssertionError("SAVE replay must skip the forward body")
 
-                self.assertFalse(torch_remat.is_recomputing())
                 TupleReturn.forward_runs += 1
                 left = x * x
                 right = x + 1
-                handle.save_for_backward({"x": x, "left": left, "right": right})
-                output = handle.record_outputs(left, right)
-                assert isinstance(output, tuple)
-                left_out, right_out = output
-                return left_out, right_out
+                ctx.save_for_backward(x, left, right)
+                return left, right
 
             @staticmethod
             def backward(
                 ctx: Any,
                 grad_left: torch.Tensor,
                 grad_right: torch.Tensor,
-            ) -> tuple[torch.Tensor, None, None]:
+            ) -> torch.Tensor:
                 x, left, right = ctx.saved_tensors
                 del left, right
-                return grad_left * 2 * x + grad_right, None, None
+                return grad_left * 2 * x + grad_right
 
         x = torch.tensor([2.0, 3.0], requires_grad=True)
-        left, right = torch_remat.checkpoint()(TupleReturn.apply)(
-            x,
-            "tuple.return",
-            torch_remat.CheckpointPolicy.SAVE,
-        )
+
+        def checkpoint_body(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            return torch_remat.op(
+                TupleReturn.apply,
+                "tuple.return",
+                policy=torch_remat.CheckpointPolicy.SAVE,
+            )(value)
+
+        left, right = torch_remat.checkpoint()(checkpoint_body)(x)
         (left + right).sum().backward()
 
         self.assertEqual(1, TupleReturn.forward_runs)
-        self.assertEqual(1, TupleReturn.load_runs)
         self.assertTrue(torch.equal(left.detach(), torch.tensor([4.0, 9.0])))
         self.assertTrue(torch.equal(right.detach(), torch.tensor([3.0, 4.0])))
         self.assertTrue(torch.equal(x.grad, torch.tensor([5.0, 7.0])))
-
-    def test_skipped_output_view_replays_as_fresh_zero_storage(self) -> None:
-        base = torch.arange(8, dtype=torch.float32)
-
-        class ViewProbe(torch.autograd.Function):
-            @staticmethod
-            def forward(ctx: Any, base: torch.Tensor) -> torch.Tensor:
-                op_name = "view.output"
-                policy = torch_remat.CheckpointPolicy.SAVE
-                handle = torch_remat.get_handle(ctx, op_name, policy)
-                if (ret := handle.maybe_load_saved()) is not None:
-                    assert isinstance(ret, torch.Tensor)
-                    self.assertTrue(torch_remat.is_recomputing())
-                    self.assert_placeholder(ret, (4,))
-                    return base.sum()
-
-                self.assertFalse(torch_remat.is_recomputing())
-                handle.save_for_backward({"saved": base[:2]})
-                handle.record_outputs(base[2:6])
-                return base.sum()
-
-            @staticmethod
-            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
-                (saved,) = ctx.saved_tensors
-                self.assertGreater(saved.untyped_storage().nbytes(), 0)
-                return torch.ones(8, dtype=grad_output.dtype) * grad_output
-
-        y = torch_remat.checkpoint()(ViewProbe.apply)(
-            base.detach().clone().requires_grad_()
-        )
-        y.backward()
 
     def test_skipped_output_view_of_recomputed_tensor_replays_as_zero_storage(
         self,
     ) -> None:
         class Producer(torch.autograd.Function):
             @staticmethod
+            @torch_remat.auto_forward("x")
             def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
-                op_name = "producer"
-                policy = torch_remat.CheckpointPolicy.RECOMPUTE
-                handle = torch_remat.get_handle(ctx, op_name, policy)
-                if (ret := handle.maybe_load_saved()) is not None:
-                    assert isinstance(ret, torch.Tensor)
-                    self.assert_placeholder(ret, (2,))
-                    return x.sum()
-
                 y = x * 3
-                handle.save_for_backward({"x": x})
-                return handle.record_outputs(y)
+                ctx.save_for_backward(x)
+                return y
 
             @staticmethod
             def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
@@ -1578,16 +1315,10 @@ early.stop::unused.recompute.consumer total=8 B
 
         class ViewConsumer(torch.autograd.Function):
             @staticmethod
+            @torch_remat.auto_forward()
             def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
-                op_name = "view.consumer"
-                policy = torch_remat.CheckpointPolicy.SAVE
-                handle = torch_remat.get_handle(ctx, op_name, policy)
-                if (ret := handle.maybe_load_saved()) is not None:
-                    assert isinstance(ret, torch.Tensor)
-                    return ret
-
-                handle.save_for_backward({})
-                return handle.record_outputs(x[:1])
+                ctx.save_for_backward()
+                return x[:1]
 
             @staticmethod
             def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
@@ -1595,7 +1326,16 @@ early.stop::unused.recompute.consumer total=8 B
                 return torch.cat([grad_output, torch.zeros_like(grad_output)])
 
         def checkpointed_region(x: torch.Tensor) -> torch.Tensor:
-            return ViewConsumer.apply(Producer.apply(x))
+            produced = torch_remat.op(
+                Producer.apply,
+                "producer",
+                policy=torch_remat.CheckpointPolicy.RECOMPUTE,
+            )(x)
+            return torch_remat.op(
+                ViewConsumer.apply,
+                "view.consumer",
+                policy=torch_remat.CheckpointPolicy.SAVE,
+            )(produced)
 
         y = torch_remat.checkpoint()(checkpointed_region)(
             torch.ones(2, requires_grad=True)
@@ -1615,20 +1355,12 @@ early.stop::unused.recompute.consumer total=8 B
 
         class UncheckpointedSquare(torch.autograd.Function):
             @staticmethod
+            @torch_remat.auto_forward("x")
             def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
-                handle = torch_remat.get_handle(
-                    ctx,
-                    "uncheckpointed.square",
-                    torch_remat.CheckpointPolicy.SAVE,
-                )
-                if (ret := handle.maybe_load_saved()) is not None:
-                    assert isinstance(ret, torch.Tensor)
-                    return ret
-
                 ctx.scale = 2
                 y = x * x
-                handle.save_for_backward({"x": x})
-                return handle.record_outputs(y)
+                ctx.save_for_backward(x)
+                return y
 
             @staticmethod
             def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
@@ -1645,58 +1377,47 @@ early.stop::unused.recompute.consumer total=8 B
         self.assertEqual([(2,)], packed_shapes)
 
     def test_duplicate_handle_name_errors_in_forward(self) -> None:
-        class DuplicateForwardHandle(torch.autograd.Function):
+        class FirstDuplicate(torch.autograd.Function):
             @staticmethod
+            @torch_remat.auto_forward("x")
             def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
-                policy = torch_remat.CheckpointPolicy.SAVE
-                torch_remat.get_handle(ctx, "duplicate.forward", policy)
-                torch_remat.get_handle(ctx, "duplicate.forward", policy)
-                return x
-
-            @staticmethod
-            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
-                del ctx
-                return grad_output
-
-        with self.assertRaisesRegex(
-            RuntimeError,
-            "Duplicate torch_remat handle retrieval.*during forward",
-        ):
-            torch_remat.checkpoint()(DuplicateForwardHandle.apply)(
-                torch.ones(1, requires_grad=True)
-            )
-
-    def test_duplicate_handle_name_errors_in_recompute(self) -> None:
-        class DuplicateRecomputeHandle(torch.autograd.Function):
-            @staticmethod
-            def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
-                policy = torch_remat.CheckpointPolicy.RECOMPUTE
-                handle = torch_remat.get_handle(ctx, "duplicate.recompute", policy)
-                if torch_remat.is_recomputing():
-                    torch_remat.get_handle(ctx, "duplicate.recompute", policy)
-
-                if (ret := handle.maybe_load_saved()) is not None:
-                    assert isinstance(ret, torch.Tensor)
-                    return ret
-
-                y = x * x
-                handle.save_for_backward({"x": x})
-                return handle.record_outputs(y)
+                ctx.save_for_backward(x)
+                return x * x
 
             @staticmethod
             def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
                 (x,) = ctx.saved_tensors
                 return grad_output * 2 * x
 
-        y = torch_remat.checkpoint()(DuplicateRecomputeHandle.apply)(
-            torch.ones(1, requires_grad=True)
-        )
+        class SecondDuplicate(torch.autograd.Function):
+            @staticmethod
+            @torch_remat.auto_forward("x")
+            def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
+                ctx.save_for_backward(x)
+                return x * x
+
+            @staticmethod
+            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+                (x,) = ctx.saved_tensors
+                return grad_output * 2 * x
+
+        def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
+            y = torch_remat.op(
+                FirstDuplicate.apply,
+                "duplicate.forward",
+                policy=torch_remat.CheckpointPolicy.SAVE,
+            )(x)
+            return torch_remat.op(
+                SecondDuplicate.apply,
+                "duplicate.forward",
+                policy=torch_remat.CheckpointPolicy.SAVE,
+            )(y)
 
         with self.assertRaisesRegex(
             RuntimeError,
-            "Duplicate torch_remat handle retrieval.*during recompute",
+            "Duplicate torch_remat handle retrieval.*during forward",
         ):
-            y.sum().backward()
+            torch_remat.checkpoint()(checkpoint_body)(torch.ones(1, requires_grad=True))
 
     def test_auto_forward_saves_named_tensors_and_validates_names(self) -> None:
         class AutoSquare(torch.autograd.Function):
@@ -1816,40 +1537,36 @@ early.stop::unused.recompute.consumer total=8 B
 
         class SavedTensorProbe(torch.autograd.Function):
             @staticmethod
-            def forward(
-                ctx: Any,
-                x: torch.Tensor,
-                op_name: str,
-                policy: torch_remat.CheckpointPolicy,
-            ) -> torch.Tensor:
-                handle = torch_remat.get_handle(ctx, op_name, policy)
-                if (ret := handle.maybe_load_saved()) is not None:
-                    assert isinstance(ret, torch.Tensor)
-                    return ret
+            @torch_remat.auto_forward("x", "saved_activation")
+            def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
+                if torch_remat.is_recomputing():
+                    raise AssertionError("SAVE replay must skip the forward body")
 
                 y = x * x
                 saved_activation = x + 1
                 nonlocal saved_activation_ref
-                if not torch_remat.is_recomputing():
-                    saved_activation_ref = weakref.ref(saved_activation)
-                handle.save_for_backward({"x": x, "saved_activation": saved_activation})
-                return handle.record_outputs(y)
+                saved_activation_ref = weakref.ref(saved_activation)
+                ctx.save_for_backward(x, saved_activation)
+                return y
 
             @staticmethod
             def backward(
                 ctx: Any,
                 grad_output: torch.Tensor,
-            ) -> tuple[torch.Tensor, None, None]:
+            ) -> torch.Tensor:
                 x, saved_activation = ctx.saved_tensors
                 del saved_activation
-                return grad_output * 2 * x, None, None
+                return grad_output * 2 * x
+
+        def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
+            return torch_remat.op(
+                SavedTensorProbe.apply,
+                "saved.probe",
+                policy=torch_remat.CheckpointPolicy.SAVE,
+            )(x)
 
         x = torch.tensor([2.0, 3.0], requires_grad=True)
-        y = torch_remat.checkpoint()(SavedTensorProbe.apply)(
-            x,
-            "saved.probe",
-            torch_remat.CheckpointPolicy.SAVE,
-        )
+        y = torch_remat.checkpoint()(checkpoint_body)(x)
         y.sum().backward()
         self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
 
@@ -1862,36 +1579,30 @@ early.stop::unused.recompute.consumer total=8 B
     def test_save_policy_checkpoint_retain_graph(self) -> None:
         class RetainGraphSquare(torch.autograd.Function):
             @staticmethod
-            def forward(
-                ctx: Any,
-                x: torch.Tensor,
-                op_name: str,
-                policy: torch_remat.CheckpointPolicy,
-            ) -> torch.Tensor:
-                handle = torch_remat.get_handle(ctx, op_name, policy)
-                if (ret := handle.maybe_load_saved()) is not None:
-                    assert isinstance(ret, torch.Tensor)
-                    return ret
-
+            @torch_remat.auto_forward("x", "y")
+            def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
                 y = x * x
-                handle.save_for_backward({"x": x, "y": y})
-                return handle.record_outputs(y)
+                ctx.save_for_backward(x, y)
+                return y
 
             @staticmethod
             def backward(
                 ctx: Any,
                 grad_output: torch.Tensor,
-            ) -> tuple[torch.Tensor, None, None]:
+            ) -> torch.Tensor:
                 x, y = ctx.saved_tensors
                 del y
-                return grad_output * 2 * x, None, None
+                return grad_output * 2 * x
+
+        def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
+            return torch_remat.op(
+                RetainGraphSquare.apply,
+                "retain.square",
+                policy=torch_remat.CheckpointPolicy.SAVE,
+            )(x)
 
         x = torch.tensor([2.0, 3.0], requires_grad=True)
-        y = torch_remat.checkpoint()(RetainGraphSquare.apply)(
-            x,
-            "retain.square",
-            torch_remat.CheckpointPolicy.SAVE,
-        )
+        y = torch_remat.checkpoint()(checkpoint_body)(x)
         y.sum().backward(retain_graph=True)
         self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
 
