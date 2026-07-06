@@ -1,452 +1,341 @@
 # torch_remat
 
-`torch_remat` is a small library of helper functions for writing activation
-checkpointing in a style where all tensors are recomputed by default, and
-users explicitly specify what tensors that they want to save for backwards.
-This is good for users who wish to have fine-grained control over saved
-activations, and want the specification of what is saved for backwards to be
-explicit (at the cost of having what to recompute determined implicitly.)
-In LLM training, it would be typical for the entire transformer block to be
-the unit of recompute.
+`torch_remat` is a small library for activation checkpointing in a style where
+all tensors are recomputed by default, and you explicitly mark the specific
+ops whose activations you want to **save** for backward instead. This style of
+API gives fine-grained, explicit control over what is kept in memory, as what
+is saved for backwards is precisely (1) everything *internally* saved for
+backwards in `SAVE` regions (a tensor a `SAVE` op saves that is merely one of
+its own inputs is recomputed or ferried instead, not kept), and (2) the tensors
+that pass from a `SAVE` to a `RECOMPUTE` region (since they ordinarily aren't
+available during recompute, since you skipped running the code that produces
+them).
+
+Broadly speaking, here is how you use `torch_remat`:
+
+- Use `remat.checkpoint(...)` to wrap the full region you want to recompute
+  (usually a transformer block).  This will cause everything in the region to
+  `RECOMPUTE`.
+
+- Wrap operations that you want to instead save values for backward with
+  `remat.op(fn, name)`.  (You can also explicitly pass in `policy` argument
+  with `remat.SAVE` or `remat.RECOMPUTE` to conveniently have configs to
+  toggle between save or not.)
+
+By default, `torch_remat` detects that an output of a `SAVE` region has passed
+to a `RECOMPUTE` region by wrapping all outputs from `SAVE` regions into a
+tensor subclass that acts like a normal tensor, except it helps us tell if
+the tensor is used in a subsequent `RECOMPUTE` region.  If your code is
+not compatible with tensor subclasses, you can turn this off via
+`detect_bare_ops=False` (you must then explicitly annotate all downstream
+consumers with an explicit `remat.op`), or try another `detect_bare_ops`
+strategy (described in the [Detect bare ops](#detect-bare-ops) section.)
 
 How does this compare to existing PyTorch checkpointing APIs?
 
-* Compared to non-reentrant AC: in fact, this API is built on top of
-  non-reentrant AC!  We do provide our own top-level `checkpoint` API to
-  enforce that the forward recompute is triggered immediately at the beginning
-  of the recompute block backwards, rather than lazily upon the first load
-  tensor hook, as is the default for non-reentrant checkpointing.  But one
-  good way of thinking about this API is that, non-reentrant AC forces you to
-  recompute everything, and this API maintains a tape that lets you recompute
-  less than everything for some subregions of the AC region.
+* Compared to non-reentrant activation checkpointing (AC): this is essentially
+  the same API, but with an extra `remat.op` API!  (Unfortunately, we did have
+  to provide our own `remat.checkpoint` entry because we make some slightly
+  different choices compared to AC; for example, we immediately run the
+  recompute at the beginning of backwards for the entire region.)  Whereas the
+  classic AC recomputes everything, this API gives you the ability to
+  selectively save tensors in regions of code so you can skip recomputing
+  them, and we automatically take care of saving input tensors that cross from
+  recompute to save regions so that recompute can continue (these tensors are
+  maintained on a dedicated, remat-specific tape).
 
-* Compared to SAC: there are two big differences.  First, SAC requires use
-  of a TorchDispatchMode to give it the ability to skip operations during
-  recompute; idiomatic use of `torch_remat` instead asks you to manually
-  modify your autograd functions to add the capability of skipping recompute.
-  You can optionally make use of a TorchDispatchMode to have native PyTorch
-  operations save for backwards, but this is not recommended because what
-  exactly is saved for backwards is not explicit when you do this.  Second,
-  SAC currently operates via a policy function which makes a determination by
-  classifying an operation as cheap to recompute or not.  `torch_remat` allows
-  for fine-grained choices on a tensor-by-tensor basis if you want to save
-  them for backwards.  In principle, SAC could support this mode of operation
-  too, but this style of API hasn't made it to upstream yet.
+* Compared to selective activation checkpointing (SAC): SAC decides what to save
+  with a policy function that classifies each *aten op* as cheap-or-expensive to
+  recompute, via a `TorchDispatchMode`. `torch_remat` instead lets you mark
+  specific *regions* of code, so you can easily ask to save one matmul but
+  recompute another.  Additionally, this API does not require the use of
+  a `TorchDispatchMode` and works with custom kernels that weren't registered
+  to the dispatcher.
 
 ## API
 
-At the top level unit of recompute (e.g., a transformer block), write this:
+At the top-level unit of recompute (e.g. a transformer block), write:
 
 ```python
 import torch_remat as remat
 
-y = remat.checkpoint()(block)(x)
+y = remat.checkpoint(region_name="layers.0")(block)(x)
 ```
 
-The first call binds checkpoint options, the second call binds the function,
-and the third call passes user arguments to `block`. This avoids collisions
-between checkpoint option names, function attributes, and keyword arguments
-that the user function wants to receive. `remat.checkpoint(block)(x)` is
-intentionally not supported: requiring the empty `checkpoint()` call avoids
-making this look interchangeable with `torch.utils.checkpoint.checkpoint`,
-which cannot accept this calling convention for backward-compatibility
-reasons.
+The first call binds checkpoint options, the second binds the function, and
+The third passes user arguments to `block`.  (Although seemingly natural,
+`remat.checkpoint(block)` is intentionally not supported for better
+compatibility with `torch.utils.checkpoint`, which would interpret this as
+invoking `block` with no arguments!)
 
-The behavior is otherwise similar to `torch.utils.checkpoint`, except that the
-recompute will happen immediately upon the backwards of `block` (and we also
-reserve the right to make internal implementation strategy changes in the
-future.) `remat.checkpoint` intentionally exposes only the PyTorch checkpoint
-options that are expected to matter for remat users, and always uses
-non-reentrant checkpointing internally. By default, all contents transformer
-block will now get recomputed immediately before backwards.  The same
-correctness requirements of `torch.utils.checkpoint` apply here: it must be
-safe to run the forwards again (no side effects that run twice), RNG must be
-synchronized, you shouldn't compute metrics in the recompute, the recompute
-must run the same series of operations as the original.
+Like `torch.utils.checkpoint`, everything in the region recomputes (by
+default) on backward: thus, it must be safe to run the forward again (no
+double side effects), RNG must be synchronized, you shouldn't compute metrics
+in the recompute, and recompute must run the same series of operations as the
+original forward.
 
-The checkpointed function must return a `Tensor`, or an exact builtin `tuple`,
-`list`, or `dict` whose values recursively satisfy the same rule. Subclasses
-such as namedtuples, custom mappings/sequences, and non-tensor leaves are
-rejected instead of being passed through silently.
+See "pytree semantics" for requirements on inputs/outputs to checkpoint
+region.
 
-By default, `torch_remat` releases remat-owned saved tensors as the remat tape
-is consumed during recompute. This keeps memory lifetime tied to the backward
-pass. `backward(retain_graph=True)` is detected automatically via
-`torch._C._autograd._get_current_graph_task_keep_graph()`, so no manual
-opt-in is needed — the remat tape is preserved when `retain_graph=True`.
+### Saving specific activations with `remat.op`
 
-`torch_remat` maintains its own autograd tape, analogous to the classic
-PyTorch autograd graph.  This tape is responsible for ferrying saved
-activations and tensors needed from recompute from the forward to the
-recompute phases.  Unlike the classic autograd tape, all saved activations are
-explicitly named.  We then use the classic PyTorch autograd graph to ferry
-saved activations from recompute to backwards.
-
-We can think of the inside of the checkpoint as a series of `SAVE` and
-`RECOMPUTE` blocks.  During recompute, the calling convention across these
-blocks is that `RECOMPUTE` blocks are specifically responsible for
-saving/loading their inputs, if they were not already available (because they
-were recomputed or already saved for backwards.)  In practice, `SAVE` region
-outputs are the interesting unavailable case: during replay they are represented
-by placeholder tensors, and a downstream `RECOMPUTE` region that needs the real
-value is responsible for saving that input during the original forward and
-loading it back at its own boundary.  This means `SAVE` blocks are
-compositional: you can chain as many `SAVE` blocks as you like together, and
-we will not unnecessarily save their outputs for recompute.
-
-### Forward and Recompute Flow
-
-Each remat-aware autograd function participates in two executions of the
-checkpointed region: the original forward, and the recompute forward that runs
-during backward.  A policy specifies whether or not the op is `RECOMPUTE`d
-during recompute, or skipped because we `SAVE`d everything we need for
-backwards.  While the policy of an op specifies if we save things it needs for
-backwards, the *outputs* of an op are saved by later consumer ops.
-
-During the original forward:
-
-- A `SAVE` op runs normally, saves its named backward tensors to the remat
-  tape, records output metadata, and marks its outputs as coming from a skipped
-  producer.
-- A `RECOMPUTE` op runs normally and does not save its backward tensors to the
-  remat tape. However, `save_or_load_inputs()` may save any input whose
-  producer is a `SAVE` op, because that producer will not recreate the real
-  value during recompute.
-
-During recompute:
-
-- A `SAVE` op does not run its real forward. `maybe_load_saved()` restores its
-  saved backward tensors into the recompute autograd context and returns
-  metadata-only output placeholders.
-- A `RECOMPUTE` op runs its real forward. `save_or_load_inputs()` loads any
-  inputs that were saved during the original forward because their producer was
-  skipped.
-
-For any given intermediate tensor, this is how it is made available during
-recompute:
-
-* Inputs to the overall checkpointed region: unconditionally saved
-* Output of a RECOMPUTE op: recomputed
-* Saved for backward of a RECOMPUTE op: recomputed
-* Output of a SAVE op: saved to the remat tape, but only if a RECOMPUTE op consumes it
-* Saved for backwards of a SAVE op: saved to the remat tape
-
-## How to avoid recomputing autograd.Function
-
-Everything inside a `remat.checkpoint` gets recomputed.  To avoid recomputing
-an expensive autograd function, you need to write your autograd function in
-a particular stylized way.  The idea is the autograd function forwards will get called
-twice: once in the initial forwards, and then again in the recompute.  We need
-to appropriately save/load tensors depending on whether or not we wish to
-recompute or save the activations of this operation.
-
-Let's suppose you had an autograd function that previously looked like this:
+Inside the region, wrap any call you want to control with `remat.op`:
 
 ```python
-class MyOp(autograd.Function):
-    def forward(ctx, x):
-        y = my_op_fwd1(x)
-        z = my_op_fwd2(y)
-        ctx.save_for_backward(x, y)
-        return z
-
-    def backward(ctx, grad_z):
-        x, y = ctx.saved_tensors
-        return my_op_bwd(x, y, grad_z)
+y = remat.op(my_op, "my_op", policy=remat.CheckpointPolicy.SAVE)(x)
 ```
 
-We need to make two public facing API changes for the function:
+- `fn` (here `my_op`) is any operator you want to control checkpoint policy on.
+  We suggest wrapping a single custom autograd function per `remat.op`, as
+  this is the finest granularity save/recompute decisions can be made in.
+  See "pytree semantics" for requirements on inputs/outputs to `fn`.
 
-1. We need a way to tell if the activations needed for backwards should be
-   saved or recomputed.  This can be done in any way you want, although the
-   most straightforward way is to add an extra `remat_policy` argument to
-   forwards so you can control this from the call site.  We give a stock
-   policy enum `CheckpointPolicy` which can be `RECOMPUTE` or `SAVE`.
+- `name` must be unique within the checkpoint region. Unique names give desync
+  protection and make it easier to read memory reports.
 
-2. We need a way to name the specific operator call, such that it is unique
-   in the transformer block.  This is because `torch_remat` takes the opinion
-   that you should have a unique, stable name for every saved activation,
-   and enforces uniqueness of names in its tape representation.  Unique names
-   give stronger desync protection between forward and recompute, let memory
-   reports localize usage to exact call sites, and lay the groundwork for a
-   future API where users specify what to save by name.  If an autograd
-   function is called only once in a transformer block, you can hardcode a
-   name for it inside the function; otherwise, consider making the string
-   name an argument that can be passed in.
+- `policy` is `SAVE` or `RECOMPUTE`:
+  - **`SAVE`**: the tensors `fn`'s autograd nodes save for backward are kept by
+    PyTorch autograd (on the original forward graph), and `fn` is **not** rerun
+    during recompute.
+  - **`RECOMPUTE`**: `fn` is rerun during recompute (default).
 
-With these new arguments, we can then restructure the inside of the autograd
-forward function as so:
+Optionally, inside a custom `autograd.Function`'s `forward` you may call
+`remat.save_for_backward(ctx, {"name": tensor, ...})` in place of
+`ctx.save_for_backward(...)` to give the saved activations names. The names label
+the saved tensors, so they appear in `remat.format_current_memory_report()` instead
+of positional `saved.0` / `saved.1` keys.  This works best if the `remat.op`
+was scoped immediately around the custom autograd function.
 
-```python
-class MyOp(autograd.Function):
-    def forward(ctx, x, op_name, remat_policy):
-        handle = remat.get_handle(ctx, op_name, remat_policy)
-        if (ret := handle.maybe_load_saved()) is not None:
-            return ret
-        x = handle.save_or_load_inputs(x)
-        y = my_op_fwd1(x)
-        z = my_op_fwd2(y)
-        handle.save_for_backward(
-            {"x": x, "y": y},  # order matters!
-        )
-        return handle.record_outputs(z)
+`remat.op` is not allowed to be nested; holler if you want this to work.
 
-    # Unchanged!
-    def backward(ctx, grad_z):
-        x, y = ctx.saved_tensors
-        return my_op_bwd(x, y, grad_z)
-```
+### pytree semantics
 
-Let's walk through what each API does.  They do different things depending on
-if you are doing forward or recompute, and what the rematerialization policy
-is for the function.
+To work, `torch_remat` needs to be able to identify Tensor inputs/outputs into
+`remat.checkpoint` and `remat.op`.  We match `autograd.Function` / ATen op allowed
+inputs/outputs: Tensor and a (one-hop) tuple/list of Tensor are supported for
+input/output.  Keyword arguments are supported.  We chose not to support full
+pytree (nor `dict`) for efficiency and predictability reasons.
 
-### `remat.get_handle(ctx, op_name, remat_policy)`
+Nesting a recognized container inside another (e.g. a list of lists of Tensor)
+is *not* supported and raises `TypeError` early — we traverse exactly one hop of
+`tuple`/`list`, no deeper.
 
-We always construct a `RematHandle` at the beginning of forwards.  This records
-the policy for the named autograd Function call and gives the rest of the
-forward a handle for interacting with that call's tape record.  The `op_name`
-must be unique within the checkpoint region.
+Similar to `autograd.Function`, it is permissible to pass Tensor via structures
+that are *opaque* to these semantics — a `dict`, or a custom object we don't
+recognize as a container (not a `tuple`/`list`), which we treat as a single leaf
+and hand to your `fn` untouched. As long as such a Tensor is not differentiable and always
+recomputed, this will work fine. If it is instead a `SAVE` output later used in a
+`RECOMPUTE` region, we can't ferry a value we never saw, so you get a placeholder
+error — but only surfaced at a later time (during recompute), not at the call.
 
-### `handle.maybe_load_saved()`
+If you think we should support full pytree, give us a holler.
 
-After constructing the `RematHandle`, call this method to see if you can
-short-circuit performing actual compute.
+## How SAVE and RECOMPUTE work
 
-In forwards, this always returns None (since we cannot have saved anything).
+The way classic PyTorch non-reentrant checkpointing works is that in the
+initial forwards, all tensors saved for backwards are discarded (via saved
+tensor hooks); when we run the recompute, we recompute all of these saved
+for backwards tensors so that the eventual backwards can access all of them.
+By default, everything is a `RECOMPUTE` region and just executes in this way.
+(NB: the autograd graph that eventually gets run for backwards is the
+*original* forward autograd graph, not the recompute one.)
 
-In recompute, this will short circuit the execution of this function when
-the policy is `SAVE`, since we have saved the necessary activations for
-backwards.  We'll load them straight into `ctx` and then short circuit
-execution.
+`torch_remat` works in the same way, except we now want to undo the recompute
+policy and go back to *saving* some tensors for backwards in the `SAVE`
+regions.  Additionally, we also might need to save some outputs of a `SAVE`
+region, in case we transition back into a `RECOMPUTE` region (since we need
+the inputs to the recompute region to actually recompute it.)  So we just
+introduce two new mechanisms to make this work:
 
-Note that `ret` is NOT guaranteed to have real data: we can generate
-data-inaccessible placeholder tensors, if the output wasn't saved for
-backwards. These placeholders preserve size, stride, dtype, and device
-metadata, but throw if data pointer access or real computation is attempted.
-This is because the output may not actually be needed at all to finish the rest
-of the recompute, so we want to wait until the first usage
-(`save_or_load_inputs`) to save/load it.  For simplicity, these placeholder
-tensors do not have accurate aliasing relationships until they are loaded.
+1. Inside a `SAVE` region, we install a nested identity saved-tensor hook. This
+   suspends checkpoint's own saved-tensor hooks, so the region just saves for
+   backwards normally and PyTorch autograd owns those tensors on the original
+   forward graph (present at backward with zero recompute, freed by autograd
+   after backward — no tape bookkeeping). You can override this hook with
+   `remat.saved_tensors_hooks(...)` — e.g. to offload `SAVE` activations — since
+   the identity hook would otherwise shadow PyTorch's own `saved_tensors_hooks`.
 
-### `handle.save_or_load_inputs(*args)`
+2. We register each output of a `SAVE` region in a per-region **save-output index**
+   that marks it as needing to be saved if it flows into a `RECOMPUTE` region. A
+   `RECOMPUTE` `remat.op` looks the value up in the index and ferries it onto a
+   special remat-specific tape (by the way, this is why you need to apply `remat.op`
+   to both `SAVE` and `RECOMPUTE` regions, not just `RECOMPUTE`.) A *bare* op that
+   touches a SAVE output instead makes the **producer** save the value on the tape
+   (producer responsibility), via one of the `torch_remat._bare_op` strategies (by
+   default the `_SaveTensor` subclass, unless disabled with `detect_bare_ops=False`).
+   See "SAVE outputs: forward vs recompute".
 
-When the policy is `RECOMPUTE`, in the initial forwards, we check if any input
-would be unavailable during recompute because it is the output of a `SAVE`
-region.  Those inputs would replay as data-inaccessible placeholder tensors, so
-we save the real tensors here and load them back during recompute.  Inputs
-produced by `RECOMPUTE` regions are recomputed as real tensors and do not need
-extra tape storage here.
+For any intermediate tensor, this is how it is made available during recompute:
 
-Note that we order this after `maybe_load_saved`, so this is a no-op when the
-policy is `SAVE`.
+* Input to the overall region: provided by checkpoint (always available)
+* Output of a `RECOMPUTE` op: recomputed
+* Saved-for-backward of a `RECOMPUTE` op: recomputed
+* Saved-for-backward of a `SAVE` op, when it is an *internally produced* tensor:
+  kept by autograd on the original forward graph
+* Saved-for-backward of a `SAVE` op, when it is one of the op's own *inputs*: not
+  kept — recomputed if it came from a `RECOMPUTE` region (captured during replay),
+  or ferried on the remat tape if it came from another `SAVE` region. This avoids
+  retaining a `RECOMPUTE` region's output merely because a downstream `SAVE` op
+  saved it for backward.
+* Output of a `SAVE` op: identified via the region's save-output index (by tensor
+  identity, not type). A `RECOMPUTE` op consumer ferries the real value through the
+  remat tape. A *bare* (unwrapped) op consumer is intercepted by default (the
+  **producer** then persists the value the first time it is touched); under
+  `checkpoint(..., detect_bare_ops=False)` it is not intercepted and instead meets a
+  placeholder during recompute and raises. In recompute the output is the real
+  persisted value, or a storage-free placeholder when none was saved (see "SAVE
+  outputs: forward vs recompute").
 
-### `handle.save_for_backward(saved_tensors)`
+## SAVE outputs: forward vs recompute
 
-This intuitively does the same thing as `ctx.save_for_backward` but it gives
-names to all the saved activations (we require a dict of string names to saved tensors,
-with the convention that the order of keys in the dict corresponds to the
-original order on `ctx`) and knows how to save activations on the
-`torch_remat` tape, so that `handle.maybe_load_saved` can load the activations
-back into `ctx` (as a reminder: in classic non-reentrant activation checkpoint, we
-construct PyTorch's autograd graph twice; once in forwards, and once in
-recompute, but it's the recompute autograd graph that actually gets executed
-in backwards.)
+Every `SAVE` output is registered in a per-region **save-output index** keyed by tensor
+identity (not type), recording how to persist and unwrap it. The ferry (a
+`remat.op` consumer), the SAVE-input snapshot, and the region boundary all consult the
+index, so none of them depends on the output's representation — which is chosen per
+region:
 
-Note that when the policy is `RECOMPUTE`, the original forward activations are
-not saved into the `torch_remat` tape. The recompute forward still calls
-`ctx.save_for_backward` for the ordinary PyTorch autograd graph that will run
-backward.
+- **Opt out** (`detect_bare_ops=False`): a `SAVE` op returns its outputs as **plain
+  tensors**. A `remat.op` consumer is ferried via the index; a *bare* (unwrapped)
+  consumer is not intercepted, so during recompute it meets a storage-free placeholder
+  and raises an actionable error telling you to wrap it in `remat.op` (or re-enable
+  bare-op detection). This is the tight prod path — no tensor subclass, and it works
+  uniformly for any tensor type (`DTensor`, etc.).
 
-### `handle.record_outputs(*outs)`
+- **Default** (`detect_bare_ops=True`, i.e. `"subclass"`): outputs are wrapped in
+  `_SaveTensor` (a *wrapper* subclass in `torch_remat._bare_op._subclass`, holding the
+  real output as `_inner` and grad-connected to the producer). A bare op consuming it
+  trips `__torch_dispatch__`, which fires the **producer's** persist-output (recording the
+  value so recompute can reproduce it) and runs the op on the unwrapped inner — one hop,
+  every output plain. `data_ptr()` is overridden to persist then return the inner's
+  real pointer, so raw Triton/cutedsl kernels on a `SAVE` output also work. It is the
+  default because it costs only O(SAVE outputs) rather than intercepting every op (as the
+  modes do), sees `data_ptr()`, and is a real tensor so all torch/Python protocols work;
+  opt out with `detect_bare_ops=False` if your tensors aren't subclass-compatible.
 
-This gives names to all outputs (`save_for_backward` isn't guaranteed to have
-done so, as not all outputs are necessarily saved for backwards) and, if
-the policy is `SAVE`, records metadata for them so that `handle.maybe_load_saved`
-can generate data-inaccessible placeholder tensors to return.
+- **`checkpoint(..., detect_bare_ops="proxy")`**: outputs are wrapped in
+  `_SaveProxy` (a `__torch_function__` object in `torch_remat._bare_op._proxy`,
+  `fx.Proxy`-style), an alternative to the subclass. Because it is **not** a tensor it
+  never enters the autograd graph — the moment an op touches it, it unwraps to the
+  grad-connected `_inner` and the op runs on that, so gradient flows
+  producer → `_inner` → consumer with no `_WrapSave` bridge needed. A *view* op (its
+  result aliases the producer output's storage — `reshape`, slice, `transpose`) returns a
+  **new proxy** and *defers* the save, so a bare view later ferried by a `remat.op` never
+  forces the producer to keep a slot; any other op ("poked hard" — a real compute, an
+  operator, `data_ptr()`, `item()`) fires the persist-output once and returns the plain
+  result. The cost of not being a tensor is that operator dunders (`+`, `@`, `[]` …) and
+  method access are installed manually and routed through one dispatcher.
 
-A singular output of a custom autograd Function call is conventionally known as
-`out` in memory reports. If there are multiple outputs, they are named by
-position: `0`, `1`, etc.
-The return value of this function preserves the single-tensor versus tuple
-schema expected by the autograd engine.
+- **`checkpoint(..., detect_bare_ops="dispatch_mode" | "function_mode")`**: the *mode*
+  analogues of the subclass and proxy. SAVE outputs stay **plain tensors** (indexed exactly
+  like the opt-out path); instead of a per-output wrapper, a `TorchDispatchMode` /
+  `TorchFunctionMode` is installed for the duration of the original forward and fires the
+  producer's persist-output when an op touches a SAVE output. Because there is no subclass on
+  the graph, there is nothing to unwrap — the op just runs on its already-plain arguments
+  (redispatch is trivial), which is the main appeal. The trade-off is that a mode intercepts
+  **every** op in the region, so remat's own per-op processing (ferry, snapshot, boundary)
+  runs under a suppression flag so it is not mistaken for a bare consumer. `dispatch_mode`
+  mirrors the subclass (fires on every touch, views included) but **cannot see
+  `data_ptr()`** — a raw-pointer kernel bypasses `__torch_dispatch__`; `function_mode`
+  mirrors the proxy (defers on views, registering them back into the save-output index) and
+  **does** see `data_ptr()` through `__torch_function__`.
 
-### Decorator style API
+  For the common case — a *bare* op consuming a SAVE output passed to it as an argument — all
+  four intercepting strategies produce identical observable behavior (gradients, tape slots);
+  they differ only in overhead and in the `data_ptr` reach noted above. They are **not**
+  identical for a SAVE output consumed *inside* a `remat.op` body via **closure capture**
+  (read from the enclosing scope rather than passed as an argument). remat runs the entire
+  `remat.op` body — user code included — under `_suppress_bare_op_detection` on the theory that
+  everything inside an `op` is explicitly handled; but only the op's *arguments* are handled by
+  the consume/snapshot path, not values it reaches through a closure. The wrapper strategies
+  (`subclass`, `proxy`) still catch such a value because a wrapped output trips interception on
+  *any* touch, regardless of the suppression flag (which they never read), so the producer
+  persists it and recompute succeeds. The mode strategies (`dispatch_mode`,
+  `function_mode`) honor the suppression flag, so the closure-captured touch is invisible, the
+  producer never saves, and the value meets a placeholder during recompute and **raises**. Pass
+  such a value as an argument to the `remat.op` (so the consume path handles it) rather than
+  capturing it, or use a wrapper strategy.
 
-If you don't want to rewrite the inside of your forward function, we offer a
-magical decorator that takes care of everything. Decorate the original forward
-with `remat.auto_forward`, passing the names (in `ctx.save_for_backward` order)
-of the tensors it saves. The forward keeps its original signature and its plain
-`ctx.save_for_backward(...)` body:
+In **recompute** a skipped `SAVE` op returns each output from its persisted value,
+or a storage-free `_PlaceholderTensor` when none was saved — it was dead, or consumed
+only by a ferrying `remat.op` (which substitutes its value by argument position before
+any op runs). A placeholder supports metadata/view ops (a view of a placeholder is
+another placeholder) but raises if its data is actually read.
 
-```python
-class MyOp(autograd.Function):
-    @staticmethod
-    @remat.auto_forward("x", "y")
-    def forward(ctx, x):
-        y = my_op_fwd1(x)
-        z = my_op_fwd2(y)
-        ctx.save_for_backward(x, y)
-        return z
-```
+This is **producer responsibility**: the consumer does no bookkeeping; it just uses the
+tensor, and the producer decides what to keep. A `remat.op` consumer unwraps via the
+index up front (grad-connected — the wrapper's `_inner`, or the plain tensor itself) and
+ferries the value on its own record, so it does *not* trigger the producer's
+persist-output thunk.
 
-Instead of manually passing the name and policy, `remat.auto_forward` should
-instead be paired with a `remat.op` call at the call site, looking like this:
+Consequences:
 
-```python
-return remat.op(MyOp.apply, "my.op", policy=remat.CheckpointPolicy.SAVE)(x)
-```
+- Only `SAVE` outputs actually touched by a bare op are kept resident (they show up as
+  `output.<i>` rows in `remat.format_current_memory_report()`, attributed to the
+  producing op). An output consumed only by `remat.op`s is ferried and does **not**
+  create an `output.<i>` row; an output consumed by nothing costs nothing.
 
-The name and policy are implicitly passed to `auto_forward` using a
-`ContextVar` under the hood. You should keep your `remat.op` calls narrowly
-scoped since it is an error to use the same name on multiple custom ops.
+One thing remains an **error** (even with `detect_bare_ops`):
 
-## How to avoid recomputing native PyTorch APIs
+- **In-place / mutating ops** on a `SAVE` output — mutating it would corrupt both the
+  persisted value and the copy autograd kept for the op's backward. Wrap the
+  mutation in a `remat.op` (or apply it before the value leaves the producing op).
 
-The above APIs only work if you can put them inside a custom autograd
-function.  For calls to native PyTorch APIs (e.g., `torch.mm`), they do not
-work.  We will simply assume by default that all of these calls should be
-recomputed; an often reasonable assumption as extremely computationally
-expensive operations are frequently implemented from scratch and thus have
-custom autograd functions.
+## Developer notes
 
-For the rare cases where you do want to annotate a native op, use
-`remat.native_op`.  It is the native-op analogue of `remat.op`: you pass the
-function, a unique name, and a `policy`, and call the result with the op's
-arguments.
+* Version counters: Claude says that when you use a saved-tensor hook,
+  autograd's own version-counter guard against in-place mutation does **not**
+  fire for them. `torch_remat` therefore records each tensor's version at save
+  time and re-checks it at backward, raising if the tensor was mutated in
+  between.
 
-```python
-y = remat.native_op(torch.mm, "native.mm", policy=remat.CheckpointPolicy.SAVE)(x, w)
-```
+## torch.compile support
 
-The `policy` is the same `CheckpointPolicy` as for `remat.op` and behaves the
-same way; the two cases differ only in native-specific ways:
+Not supported yet. This is the eager implementation; `torch.compile` support
+(translating remat policies into min-cut-partitioner annotations) is a separate
+change.
 
-- `SAVE` saves the op's outputs and does not rerun it during recompute.  Because
-  a native op has no custom backward to carry the handle protocol, this is done
-  with PyTorch SAC rather than the remat tape.  This is the way to avoid
-  recomputing some basic PyTorch compute (e.g., a matrix multiply).
-- `RECOMPUTE` reruns the op during recompute, applying the same
-  `save_or_load_inputs` handling described above.  So a `RECOMPUTE` native op
-  *can* consume an upstream `SAVE` op's output, where a bare native op would hit
-  a placeholder and raise (see the limitation below).
+## Detect bare ops
 
-Arguments are passed to the returned wrapper rather than captured in a closure
-so the wrapper can save and load them across recompute, exactly as `remat.op`
-does for a custom forward's positional tensor arguments.
+`detect_bare_ops` selects the bare-op detection strategy. For a bare op consuming a SAVE
+output passed to it as an argument, the four intercepting strategies produce identical
+observable behavior (gradients, tape slots) and differ only in overhead and `data_ptr`
+reach; `False` disables interception:
 
-**Important limitation:** a *bare* native PyTorch op cannot consume the output
-of a remat-aware autograd Function with policy `SAVE`.  Attempting this will
-raise a `RuntimeError`.  To fix, either:
+| value | mechanism | `data_ptr()` kernels | notes |
+|---|---|---|---|
+| `False` | none — plain tensors | n/a | tightest prod path; bare consumers raise |
+| `True` / `"subclass"` (default) | `_SaveTensor` wrapper subclass | ✅ seen | fires on every touch, views included |
+| `"proxy"` | `_SaveProxy` `__torch_function__` object | ✅ seen | defers on views (a bare view forces no save) |
+| `"dispatch_mode"` | `TorchDispatchMode` (plain tensors) | ❌ bypassed | mode-based analogue of the subclass |
+| `"function_mode"` | `TorchFunctionMode` (plain tensors) | ✅ seen | mode-based analogue of the proxy; defers on views |
 
-1. Wrap the native op with `remat.native_op(...)`: `policy=SAVE` also saves its
-   output (replayed during recompute without reading the placeholder), or
-   `policy=RECOMPUTE` reruns it on the saved input.
-2. Move the native op into a custom autograd function with `auto_forward`.
-3. Change the upstream op's policy to `RECOMPUTE`.
+The wrapper strategies (`subclass`, `proxy`) and the mode strategies (`dispatch_mode`,
+`function_mode`) diverge on one corner: a SAVE output consumed *inside* a `remat.op` body via
+**closure capture** (rather than passed as an argument) is caught by the wrappers but missed by
+the modes — the modes are suppressed for the whole `remat.op` body, and only the op's arguments
+are otherwise handled, so under a mode the value hits a placeholder during recompute and raises.
+See "SAVE outputs: forward vs recompute" for the full mechanics of each strategy.
 
-## Offloading (TODO)
 
-This API should support offloading.  The idea is that instead of saving to the
-tape, we offload the activations, and then onload them when we would have
-loaded them.  `CheckpointPolicy.OFFLOAD` would let us indicate we want this.
+## Diagnostics
 
-The actual offload implementation isn't in this package.  So we should have
-hooks so you can put in your own offload implementation.
+TODO: we should describe this more
 
-There is still some softness in our offloading plan.  In particular, it's
-not obvious how to prevent blocking on offloading until backwards actually
-needs to use it.  We will need to work this in more detail and refine this
-API.  Currently, offloading is not implemented.
+- `remat.is_recomputing()` returns whether execution is in the recompute pass.
+- `remat.collect_trace()` / `remat.trace_scope(...)` collect a reporting-only
+  tree of the `op` annotations seen during the original forward.
+- `remat.format_current_memory_report()` /
+  `remat.print_current_memory_report()` summarize the activations retained for the
+  active region (autograd-owned `SAVE` saves and tape-owned ferried inputs),
+  grouped by op and tensor, with storage-sharing (aliasing) accounting.
 
-## Tape runtime details
+## Offloading
 
-`torch_remat` maintains its own tape which it uses to transfer tensor from
-forward to recompute, before passing them off to the traditional autograd
-tape.  We take some care to make sure that we handle a number of PyTorch edge
-cases around aliasing and mutation correctly, as well as to ensure prompt
-deallocation, so we describe the design here.
-
-The crux of the matter is that we need to save tensors for recompute/backward
-for a variety of reasons:
-
-* Our policy is `SAVE` and a tensor is needed for backwards
-* Our policy is `SAVE`, and an output tensor (not saved for backwards) is needed
-  for a subsequent `RECOMPUTE` region
-
-Aliasing can also be quite complicated.  In general, the same tensor can be
-saved for backwards multiple times.  We can also save aliases into the same
-underlying storage.  We can also return an alias into the input tensor from
-an autograd function.
-
-Finally, inplace mutation can invalidate a saved tensor.  Traditional autograd
-tape uses version counters to detect if this situation has occurred; we need
-to replicate this logic for recomputation.
-
-Here is our general strategy:
-
-* It harmless to save multiple views of the same underlying storage.  Internal
-  refcounting will ensure we deallocate the storage after the last tensor
-  referencing is deallocated.  Understanding the aliasing structure is useful
-  when we are printing the memory usage of saved activations, but otherwise
-  tensors saved on the tape are plain tensors.
-
-* The tape is composed of a sequence of internal records, one per autograd
-  Function call which executes during forward.  By default, remat-owned slots
-  are released as each record is consumed during recompute, after the saved
-  tensors have been transferred to the recompute autograd graph.  When
-  `retain_graph=True` is active, slots are preserved automatically so the
-  tape remains available for later traversals.
-  Tensors can still live beyond recompute due to graph retention, aliasing, or
-  being needed for backwards.
-
-* Any time there is an output of a `SAVE` region in forwards, during recompute
-  phase we will always generate a fresh data-inaccessible placeholder tensor
-  for that output.  We intentionally do not preserve output aliasing
-  relationships here: if the original output was a view of an input or saved
-  tensor, the replayed output is still a fresh placeholder.  Downstream
-  torch_remat-aware custom autograd functions must save and directly use the
-  real tensors they need during the original forward instead of relying on
-  replayed output storage or aliasing.
-
-## Ownership and memory lifetime
-
-First, let's describe the easy situation.  In the easy case:
-
-- The remat tape's is owned by the output tensors of the checkpointed
-  region (via their autograd graph, which is responsible for triggering
-  recompute when backwards is executed.)
-- We run forward, recompute, backward, in exactly this sequence.  No double
-  backwards. `retain_graph=False`. Every allocated autograd node gets run in
-  backward, we don't have to worry about the user not calling backward.
-- We expect saved for backwards tensors to get deallocated after the
-  backward node that needs them has executed.
-- We expect inputs saved for recompute to get deallocated after (all)
-  the recompute that needs them has executed.
-
-Intuitively, all we need to do is make sure we free saved for backwards
-tensors and input tensors right after we use them.  Conventional autograd
-works in the same way: we free the graph as we execute it, to provide
-guarantees about when saved for backward tensors get deallocated.
-
-We might worry about these two situatiosn:
-
-- What if `backward()` is never called, and instead the autograd saved state
-  goes out of scope and becomes dead?  We would hope saved tensors can be
-  deallocated in this case.
-- What if `retain_graph=True` is called?  This is detected automatically via
-  `torch._C._autograd._get_current_graph_task_keep_graph()`, so the remat
-  tape is preserved without any manual opt-in.
-
-A refined memory model prefers us to associate lifetimes with the autograd
-saved state itself.  If the autograd saved state dies (because the `grad_fn`
-because dead, or because we ran `backward` with `retain_graph=False`), this
-naturally ensures things get deallocated.  However, this is a bit complicated
-to implement, and there is always a "clean" version of the user code that
-doesn't have this problem (in particular, by ensuring you `detach()` before
-running operations that won't get fed into the autograd graph).  So we do NOT
-do this, and instead stick to the simplified model above which keeps our code
-simple.
+* Saved tensor hooks extension point
+* Wedge as a worked example
+* Subtlety: we save outputs for recompute; timing is different
+* Subtlety: when to trigger onload (do it on is recompute, not as an autograd
+  function)
 
 ## License
 
