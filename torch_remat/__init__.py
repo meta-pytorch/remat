@@ -7,20 +7,22 @@
 from __future__ import annotations
 
 from torch_remat._api import (  # noqa: F401
-    auto_forward,
+    _pop_saved_tensors_hooks,
+    _push_saved_tensors_hooks,
     checkpoint,
     CheckpointPolicy,
-    collect_trace,
-    get_handle,
-    is_recomputing,
     op,
-    RematHandle,
+    save_for_backward,
     saved_tensors_hooks,
-    set_saved_tensors_hooks,
-    trace_scope,
 )
-from torch_remat._native import native_op  # noqa: F401
+from torch_remat._region import is_recomputing  # noqa: F401
 from torch_remat._reporting import (  # noqa: F401
     format_current_memory_report,
     print_current_memory_report,
 )
+from torch_remat._trace import collect_trace, trace_scope  # noqa: F401
+
+# Convenience aliases for the two checkpoint policies, so callers can write
+# ``remat.SAVE`` / ``remat.RECOMPUTE`` instead of ``remat.CheckpointPolicy.SAVE``.
+SAVE = CheckpointPolicy.SAVE
+RECOMPUTE = CheckpointPolicy.RECOMPUTE

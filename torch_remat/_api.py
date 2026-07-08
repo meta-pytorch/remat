@@ -6,689 +6,105 @@
 
 # pyre-strict
 
-"""Explicit activation rematerialization helpers for custom autograd functions."""
+"""Explicit activation rematerialization for checkpoint regions.
+
+:func:`checkpoint` wraps a region that recomputes by default; :func:`op`
+annotates one call inside it with a :class:`CheckpointPolicy` (``SAVE`` or
+``RECOMPUTE``). The wrapped callable is used unmodified.
+
+The region runs under PyTorch non-reentrant checkpointing: backward executes
+the *original* forward grad_fns, recompute only refills their saved tensors.
+A ``SAVE`` op installs a nested ``saved_tensors_hooks`` that shadows
+checkpoint's hooks, so its saved tensors stay ordinary autograd saved tensors
+on the original graph; the op is skipped during recompute (returning
+placeholder outputs). A ``RECOMPUTE`` op runs normally in both passes; its one
+extra duty is at the boundary: an input that is an upstream ``SAVE`` op's
+output is made the *producer's* responsibility to persist, so replay can
+reproduce it into the dataflow.
+"""
 
 from __future__ import annotations
 
 import contextlib
 import contextvars
 import weakref
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass, field
-from enum import Enum
 from functools import wraps
-from types import TracebackType
 from typing import (
     Any,
     Callable,
     cast,
     Iterator,
     ParamSpec,
-    Protocol,
     TypeAlias,
     TypeVar,
 )
 
 import torch
-from torch.utils import _pytree as pytree
+from torch.multiprocessing.reductions import StorageWeakRef
+from torch.utils.weak import WeakTensorKeyDictionary
+from torch_remat._bare_op._common import (
+    _merge_save_output_handles,
+    _SaveOutputHandle,
+    _suppress_bare_op_detection,
+)
+from torch_remat._compat import _torch_checkpoint_with_forward_exception_cleanup
+from torch_remat._placeholder import (
+    _is_placeholder,
+    _make_placeholder_tensor,
+    _placeholder_message_text,
+    _TensorMetadata,
+)
+from torch_remat._pytree import (
+    iter_arg_leaves,
+    map_arg_leaves,
+    PathToken,
+    value_leaves,
+)
+from torch_remat._recompute_boundary import _checkpoint_recompute_boundary
+from torch_remat._region import (
+    _active_save_op,
+    _ActiveCheckpointRegion,
+    _assert_phase,
+    _checkpoint_context_fn,
+    _CheckpointRegionState,
+    _display_name,
+    _Phase,
+    _save_output_handle,
+    _state,
+)
+from torch_remat._trace import _record_trace_op
+from torch_remat._types import (
+    _InputInfo,
+    _OutputSchema,
+    _OutputSlot,
+    _OutputSpec,
+    _SavedHookData,
+    _SavedInputRecipe,
+    _SavedInputRef,
+    _SavedTensor,
+    CheckpointPolicy,
+    PackHook,
+    UnpackHook,
+)
+from torch_remat._view import (
+    _classify_saved_input,
+    _rebuild_saved_view,
+)
 
-# Custom autograd Function outputs handled by RematHandle. The top-level
-# checkpoint wrapper supports richer containers, but one remat-aware Function
-# boundary is intentionally limited to the schemas PyTorch autograd.Function
-# forwards commonly return and that record_outputs can replay precisely.
-Output: TypeAlias = torch.Tensor | tuple[torch.Tensor, ...]
-
-# PyTorch's save_for_backward path preserves None entries in saved_tensors. We
-# model that explicitly because optional saved activations need stable names and
-# positions just like tensor activations.
-SavedTensor: TypeAlias = torch.Tensor | None
-
-# PyTorch non-reentrant checkpoint expects a callable returning one context for
-# original forward and one context for recompute.
-CheckpointContextFn: TypeAlias = Callable[
-    [],
-    tuple[
-        contextlib.AbstractContextManager[None],
-        contextlib.AbstractContextManager[None],
-    ],
-]
+# A remat-aware op call returns a tensor, or a flat tuple or list of tensors --
+# the shapes autograd.Function.apply and native ops commonly produce. We only need
+# to locate the tensors; the container type is preserved for the caller.
+Output: TypeAlias = torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor]
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
 
-# Same contract as ``torch.autograd.graph.saved_tensors_hooks`` (pack returns an
-# opaque object stored in place of the tensor; unpack recovers it), but installed
-# at remat's tape instead of autograd's saved-tensors machinery. This gives the
-# "fire at the logical save, fire at the logical load, never on recompute"
-# semantics for free: the tape stores only in the original forward and loads only
-# during recompute/backward, and RECOMPUTE intermediates never reach the tape.
-PackHook: TypeAlias = Callable[[torch.Tensor], object]
-UnpackHook: TypeAlias = Callable[[object], torch.Tensor]
-
-# Thread-/task-local, like the other remat contextvars below, so concurrent
-# forwards don't clobber each other's hooks (mirrors PyTorch keeping its
-# saved-tensor hooks in autograd TLS). Only the store (forward) side reads this;
-# the load side uses the unpack hook bound to each slot at pack time, so we never
-# rely on this contextvar propagating into a separate backward/recompute thread.
-_active_saved_tensors_hooks: contextvars.ContextVar[
-    tuple[PackHook, UnpackHook] | None
-] = contextvars.ContextVar("torch_remat_saved_tensors_hooks", default=None)
-
-
-def set_saved_tensors_hooks(
-    pack_hook: PackHook | None,
-    unpack_hook: UnpackHook | None,
-) -> tuple[PackHook | None, UnpackHook | None]:
-    """Install (or clear) tape-level saved-tensor hooks; return the previous pair.
-
-    Mirrors ``torch.autograd.graph.saved_tensors_hooks`` but the hooks fire on
-    remat tape stores/loads (SAVE-policy saved tensors and retained RECOMPUTE
-    inputs), not on every autograd save. Pass ``(None, None)`` to clear. Prefer
-    the :func:`saved_tensors_hooks` context manager; this is the imperative
-    escape hatch. Thread-/task-local via a contextvar.
-    """
-
-    previous = _active_saved_tensors_hooks.get()
-    if pack_hook is None or unpack_hook is None:
-        _active_saved_tensors_hooks.set(None)
-    else:
-        _active_saved_tensors_hooks.set((pack_hook, unpack_hook))
-    return previous if previous is not None else (None, None)
-
-
-@contextlib.contextmanager
-def saved_tensors_hooks(
-    pack_hook: PackHook,
-    unpack_hook: UnpackHook,
-) -> Iterator[None]:
-    """Scope tape-level saved-tensor hooks across a forward and its backward.
-
-    The remat analogue of ``torch.autograd.graph.saved_tensors_hooks``:
-    ``pack_hook(tensor) -> packed`` runs at each tape store (original forward)
-    and ``unpack_hook(packed) -> tensor`` at each tape load (recompute/backward).
-    """
-
-    token = _active_saved_tensors_hooks.set((pack_hook, unpack_hook))
-    try:
-        yield
-    finally:
-        _active_saved_tensors_hooks.reset(token)
-
-
-class CheckpointPolicy(Enum):
-    """Policy controlling how an activation record is handled under checkpointing."""
-
-    # Rerun this custom autograd forward during checkpoint recompute.
-    RECOMPUTE = 0
-
-    # Skip this custom autograd forward during checkpoint recompute and replay
-    # the saved backward inputs plus placeholder outputs from the remat tape.
-    SAVE = 1
-
-
-@dataclass
-class OpTrace:
-    """One remat op observed by diagnostic tracing."""
-
-    name: str
-    policy: CheckpointPolicy | None
-    source: str
-
-
-@dataclass
-class ScopeTrace:
-    """One reporting-only diagnostic scope in a remat trace."""
-
-    name: str
-    metadata: str | None
-    entries: list[OpTrace | ScopeTrace] = field(default_factory=list)
-
-
-@dataclass
-class RematTrace:
-    """Diagnostic trace collected around one user region."""
-
-    entries: list[OpTrace | ScopeTrace] = field(default_factory=list)
-    _scope_stack: list[ScopeTrace] = field(default_factory=list)
-
-    def format(self) -> str:
-        lines = ["torch_remat trace"]
-        for entry in self.entries:
-            _append_trace_entry(lines, entry, indent=0)
-        return "\n".join(lines)
-
-    def _current_entries(self) -> list[OpTrace | ScopeTrace]:
-        if self._scope_stack:
-            return self._scope_stack[-1].entries
-        return self.entries
-
-
-class AutogradCtx(Protocol):
-    """Minimal protocol for the context object passed to autograd.Function.forward."""
-
-    needs_input_grad: tuple[bool, ...]
-
-    def save_for_backward(self, *tensors: SavedTensor) -> None:
-        """Save tensors for the custom autograd backward."""
-        ...
-
-
-class _Phase(Enum):
-    """Execution phase for the active checkpoint region.
-
-    Backward is intentionally absent: torch_remat's private tape only mediates
-    transfer from original forward to checkpoint recompute. After recompute
-    calls ctx.save_for_backward, ordinary PyTorch autograd owns backward.
-    """
-
-    FORWARD = 0
-    RECOMPUTE = 1
-
-
-@dataclass(frozen=True)
-class _TensorMetadata:
-    """Tensor metadata used for data-inaccessible replay outputs.
-
-    Requires-grad is not stored here because autograd.Function.forward runs
-    under no-grad semantics; the autograd engine attaches grad_fn information to
-    returned tensors after forward returns.
-    """
-
-    shape: tuple[int, ...]
-    stride: tuple[int, ...]
-    dtype: torch.dtype
-    device: torch.device
-
-
-@dataclass
-class _SavedTensorSlot:
-    """One tensor slot owned by an op record."""
-
-    # Tensor passed to ctx.save_for_backward. None is a valid saved slot value.
-    tensor: SavedTensor
-
-    # Version counter observed when the tensor was saved.
-    version: int | None
-
-    # When a tape-level saved-tensor pack hook is active, the slot stores the
-    # hook's packed result here (``tensor`` is None) and the real tensor is
-    # recovered via the unpack hook at load time. ``is_packed`` distinguishes a
-    # packed value of None from an unpacked slot.
-    packed: object | None = None
-    is_packed: bool = False
-
-    # The unpack hook bound to this slot at pack time. Mirrors PyTorch
-    # saved_tensors_hooks: each saved tensor is recovered by the pair that packed
-    # it, not by whatever hooks are active at load time (pack runs in the
-    # original forward, unpack during recompute — the active hooks may differ).
-    unpack_hook: UnpackHook | None = None
-
-
-@dataclass
-class _OpRecord:
-    """One custom autograd op record in the forward tape."""
-
-    # Region-relative name for this activation record.
-    op_name: str
-
-    # Checkpoint policy established for this custom autograd call. Native
-    # regions and low-level records do not use the high-level policy flow.
-    policy: CheckpointPolicy | None = None
-
-    # Unified namespace of named tensor slots. User-saved tensors use their
-    # provided names; retained recompute inputs use input.<arg_index>. A
-    # single namespace ensures name collisions are caught across both types.
-    tensor_slots: dict[str, _SavedTensorSlot] = field(default_factory=dict)
-
-    # Ordered names of slots that ctx.save_for_backward should receive during
-    # recompute. Only populated by save_for_backward (not save_or_load_inputs).
-    saved_for_backward_names: list[str] = field(default_factory=list)
-
-    # Whether the observed output schema was a tuple rather than a single tensor.
-    output_is_tuple: bool = False
-
-    # Ordered output metadata used to build fresh data-inaccessible outputs during
-    # recompute. We intentionally do not preserve output aliasing relationships
-    # for simplicity.
-    output_metadata: tuple[_TensorMetadata, ...] = ()
-
-    # The fields below only apply native saved regions, and are empty for
-    # conventional custom autograd calls.
-
-    # Weak refs to SAC-cached tensor outputs in native function regions, keyed
-    # by unstable report labels such as aten.mm.default#0. These are report-only
-    # and only appear while the tensors are live.
-    native_sac_tensors: dict[str, weakref.ReferenceType[torch.Tensor]] = field(
-        default_factory=dict
-    )
-
-    # Native-only per-op occurrence counts used to build unstable report labels.
-    native_op_counts: dict[str, int] = field(default_factory=dict)
-
-    # Native-only SAC contexts. They are created for native_op SAVE records
-    # and entered only while that native function region is running.
-    native_sac_contexts: (
-        tuple[
-            contextlib.AbstractContextManager[None],
-            contextlib.AbstractContextManager[None],
-        ]
-        | None
-    ) = None
-
-    # Whether this record has released remat-owned state after recompute.
-    released: bool = False
-
-    def store_saved_tensor_slot(
-        self,
-        region_state: _CheckpointRegionState,
-        tensor_name: str,
-        tensor: SavedTensor,
-    ) -> None:
-        """Store one named tensor slot on this record.
-
-        ``None`` is a valid tensor value.
-        """
-
-        if tensor_name in self.tensor_slots:
-            raise RuntimeError(
-                f"Duplicate saved tensor {tensor_name} for "
-                f"{_display_name(region_state, self.op_name)}"
-            )
-
-        hooks = _active_saved_tensors_hooks.get()
-        if hooks is not None and isinstance(tensor, torch.Tensor):
-            # The hook now owns the tensor (it may move its storage to CPU). The
-            # in-place version check is skipped: the unpack hook returns a fresh
-            # object at load time. Bind the matching unpack hook to the slot so
-            # load uses the pair that packed it, not whatever is active later.
-            pack_hook, unpack_hook = hooks
-            self.tensor_slots[tensor_name] = _SavedTensorSlot(
-                tensor=None,
-                version=None,
-                packed=pack_hook(tensor),
-                is_packed=True,
-                unpack_hook=unpack_hook,
-            )
-            return
-
-        version = tensor._version if isinstance(tensor, torch.Tensor) else None
-        self.tensor_slots[tensor_name] = _SavedTensorSlot(
-            tensor=tensor,
-            version=version,
-        )
-
-    def load_saved_tensor(
-        self,
-        region_state: _CheckpointRegionState,
-        tensor_name: str,
-    ) -> SavedTensor:
-        """Load one named saved tensor from this record.
-
-        Called during recompute by maybe_load_saved (for user-saved tensors
-        to pass to ctx.save_for_backward) and by save_or_load_inputs (for
-        retained input tensors). The slot keeps its reference until
-        _release_record_after_recompute_if_needed clears the record at the
-        end of the op's recompute.
-        """
-
-        if self.released:
-            raise RuntimeError(
-                f"No saved tensor {tensor_name} for "
-                f"{_display_name(region_state, self.op_name)}; "
-                "the remat tape was already released"
-            )
-
-        if tensor_name not in self.tensor_slots:
-            saved_names = (
-                ", ".join(self.tensor_slots) if self.tensor_slots else "(none)"
-            )
-            raise RuntimeError(
-                f"No saved tensor {tensor_name} for "
-                f"{_display_name(region_state, self.op_name)} "
-                f"(saved tensors: {saved_names}). "
-                "This usually means forward and recompute followed different code paths, "
-                "or save_for_backward was not called with this tensor name during the "
-                "original forward."
-            )
-
-        slot = self.tensor_slots[tensor_name]
-        if slot.is_packed:
-            unpack_hook = slot.unpack_hook
-            if unpack_hook is None:
-                raise RuntimeError(
-                    f"saved tensor {tensor_name} for "
-                    f"{_display_name(region_state, self.op_name)} was packed by a "
-                    "saved-tensor pack hook, but no unpack hook was bound to the slot"
-                )
-            return unpack_hook(slot.packed)
-
-        tensor = slot.tensor
-        if tensor is None:
-            return None
-
-        if slot.version is not None and tensor._version != slot.version:
-            raise RuntimeError(
-                f"Saved tensor {tensor_name} for "
-                f"{_display_name(region_state, self.op_name)} was modified in-place "
-                "after it was saved"
-            )
-        return tensor
-
-    def record_output_schema(self, output: Output) -> None:
-        """Record boundary output metadata and report labels."""
-
-        tensors = _output_tensors(output)
-        self.output_is_tuple = isinstance(output, tuple)
-        self.output_metadata = tuple(
-            _TensorMetadata(
-                shape=tuple(tensor.shape),
-                stride=tuple(tensor.stride()),
-                dtype=tensor.dtype,
-                device=tensor.device,
-            )
-            for tensor in tensors
-        )
-        for index, tensor in enumerate(tensors):
-            setattr(
-                tensor,
-                _REPORT_OUTPUT_NAME_ATTR,
-                f"observed_output.{_output_name(index, output_is_tuple=self.output_is_tuple)}",
-            )
-
-    def placeholder_output(self, region_state: _CheckpointRegionState) -> Output:
-        """Return placeholder output for a skipped non-recompute call."""
-
-        if self.released:
-            raise RuntimeError(
-                f"The remat tape for {_display_name(region_state, self.op_name)} "
-                "was already released"
-            )
-
-        if not self.output_metadata:
-            raise RuntimeError(
-                f"No output metadata available for "
-                f"{_display_name(region_state, self.op_name)}"
-            )
-
-        placeholders: list[torch.Tensor] = []
-        for index, metadata in enumerate(self.output_metadata):
-            source = (
-                f"{_display_name(region_state, self.op_name)}."
-                f"{_output_name(index, output_is_tuple=self.output_is_tuple)}"
-            )
-            placeholders.append(
-                _make_placeholder_tensor(
-                    metadata,
-                    f"{source} was skipped during recompute. This is likely "
-                    "because the output of a remat-aware autograd Function with "
-                    "policy SAVE was consumed by a native PyTorch op not wrapped in "
-                    "remat.native_op. To fix, either: (1) wrap the native op with "
-                    "remat.native_op(...) (policy=SAVE to also save its output, or "
-                    "policy=RECOMPUTE to rerun it on the saved input), (2) move it "
-                    "into a custom autograd Function with auto_forward, or (3) change "
-                    "the upstream op's policy to RECOMPUTE.",
-                )
-            )
-
-        if not self.output_is_tuple:
-            return placeholders[0]
-        return tuple(placeholders)
-
-
-@dataclass
-class _CheckpointRegionState:
-    """State for one checkpointed region shared by forward and recomputation."""
-
-    # Optional diagnostic name for the checkpoint region.
-    region_name: str | None = None
-
-    # Forward tape of op records keyed by region-relative name. Dict insertion
-    # order is the tape execution order.
-    records: dict[str, _OpRecord] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class _ActiveCheckpointRegion:
-    """Context-local pointer to the active checkpoint region and phase."""
-
-    # Shared state for the active checkpoint region.
-    region_state: _CheckpointRegionState
-
-    # Whether execution is original forward or recomputation.
-    phase: _Phase
-
-    # Op names that have called get_handle in this phase, for duplicate detection.
-    # The dataclass is frozen so the context pointer is immutable, but the set
-    # itself is phase-local mutable state accumulated while the context is active.
-    handle_names: set[str] = field(default_factory=set)
-
-
-_state: contextvars.ContextVar[_ActiveCheckpointRegion | None] = contextvars.ContextVar(
-    "torch_remat_state",
-    default=None,
-)
-_active_op: contextvars.ContextVar[tuple[str, CheckpointPolicy] | None] = (
-    contextvars.ContextVar(
-        "torch_remat_op",
-        default=None,
-    )
-)
-_active_trace: contextvars.ContextVar[RematTrace | None] = contextvars.ContextVar(
-    "torch_remat_trace",
-    default=None,
-)
-# These tensor attrs are deliberately lightweight projections of the producing
-# OpRecord plus output index, not references back to the record. A direct
-# tensor -> record pointer would create cycles through record.tensor_slots when
-# a saved tensor is also a remat output.
-#
-# Outputs from a producer with SAVE policy replay as placeholders. A downstream
-# RECOMPUTE consumer that receives one during replay needs a real tensor instead,
-# so forward marks these outputs and save_or_load_inputs retains only the inputs
-# whose producer policy is SAVE. This is deliberately narrower than saving every
-# input to every RECOMPUTE op; outputs from RECOMPUTE producers will be real
-# during replay and do not need extra tape storage.
-_STUB_ON_RECOMPUTE_ATTR = "_torch_remat_stub_on_recompute"
-_REPORT_PLACEHOLDER_MESSAGE_ATTR = "_torch_remat_placeholder"
-_REPORT_OUTPUT_NAME_ATTR = "_torch_remat_report_output_name"
-
-
-def _is_stub_on_recompute(tensor: torch.Tensor) -> bool:
-    """Return whether recompute should replace this tensor with a placeholder."""
-
-    try:
-        value = object.__getattribute__(tensor, _STUB_ON_RECOMPUTE_ATTR)
-    except AttributeError:
-        return False
-    return bool(value)
-
-
-class _PlaceholderTensor(torch.Tensor):
-    """Storage-free placeholder for skipped recompute outputs.
-
-    Placeholder outputs exist so a skipped SAVE op can satisfy the autograd
-    Function output schema without retaining its output data. Framework code may
-    still apply metadata-only aliasing operations such as detach, view, or slice
-    before a later RECOMPUTE op has a chance to replace the placeholder with a
-    saved real input. Those operations should keep working. Operations that
-    would create fresh data, such as sin or clone, must fail with the remat
-    diagnostic because consuming placeholder values is a user-code bug.
-
-    This is a Tensor subclass because ordinary Python tensor construction APIs
-    cannot represent a non-empty CPU/CUDA tensor with arbitrary size/stride and
-    no backing allocation. ``empty_strided`` allocates the implied storage, and
-    ``set_``/``as_strided`` either resize storage to fit or reject undersized
-    non-resizable storage. ``_make_wrapper_subclass`` is the Python-level PyTorch
-    mechanism for a tensor-shaped object whose metadata is real but whose data
-    is intentionally absent.
-
-    Mutating ops are rejected from schema alias metadata. To avoid maintaining
-    a hard-coded list of view ops, non-mutating dispatch runs the same op on
-    meta mirrors. Outputs that share meta storage with a placeholder input are
-    treated as metadata-only aliases and wrapped back into placeholders; outputs
-    with fresh meta storage are data-producing and rejected.
-    """
-
-    @staticmethod
-    def __new__(
-        cls,
-        metadata: _TensorMetadata,
-        message: str,
-        *,
-        requires_grad: bool = False,
-    ) -> _PlaceholderTensor:
-        placeholder = torch.Tensor._make_wrapper_subclass(
-            cls,
-            metadata.shape,
-            strides=metadata.stride,
-            dtype=metadata.dtype,
-            device=metadata.device,
-            requires_grad=requires_grad,
-        )
-        setattr(placeholder, _REPORT_PLACEHOLDER_MESSAGE_ATTR, message)
-        return placeholder
-
-    @classmethod
-    def __torch_dispatch__(
-        cls,
-        func: Callable[..., Any],
-        types: tuple[type[Any], ...],
-        args: tuple[Any, ...] = (),
-        kwargs: dict[str, Any] | None = None,
-    ) -> Any:
-        del types
-        kwargs = {} if kwargs is None else kwargs
-        try:
-            schema = object.__getattribute__(func, "_schema")
-        except AttributeError:
-            schema = None
-        if schema is not None and schema.is_mutable:
-            raise RuntimeError(_placeholder_message_from_args(args, kwargs))
-
-        sources_by_meta_storage: dict[int, _PlaceholderTensor] = {}
-
-        def unwrap_placeholder(value: Any) -> Any:
-            if not isinstance(value, _PlaceholderTensor):
-                return value
-
-            meta_value = torch.empty_strided(
-                tuple(value.shape),
-                tuple(value.stride()),
-                dtype=value.dtype,
-                device="meta",
-                requires_grad=value.requires_grad,
-            )
-            # Meta tensors preserve storage identity across aliasing/view ops.
-            # This gives us a generic "metadata-only" test without naming every
-            # view-like aten operator in this dispatch handler.
-            sources_by_meta_storage[meta_value.untyped_storage()._cdata] = value
-            return meta_value
-
-        try:
-            meta_output = func(
-                *pytree.tree_map(unwrap_placeholder, args),
-                **pytree.tree_map(unwrap_placeholder, kwargs),
-            )
-        except Exception as error:
-            raise RuntimeError(_placeholder_message_from_args(args, kwargs)) from error
-
-        def wrap_meta_output(value: Any) -> Any:
-            if not isinstance(value, torch.Tensor):
-                return value
-
-            source = sources_by_meta_storage.get(value.untyped_storage()._cdata)
-            if source is None:
-                raise RuntimeError(_placeholder_message_from_args(args, kwargs))
-
-            return _make_placeholder_tensor(
-                _TensorMetadata(
-                    shape=tuple(value.shape),
-                    stride=tuple(value.stride()),
-                    dtype=value.dtype,
-                    device=source.device,
-                ),
-                _placeholder_message(source),
-                requires_grad=value.requires_grad,
-            )
-
-        return pytree.tree_map(wrap_meta_output, meta_output)
-
-
-def _checkpoint_context_fn(
-    region_name: str | None = None,
-) -> tuple[
-    contextlib.AbstractContextManager[None], contextlib.AbstractContextManager[None]
-]:
-    """Return context managers for PyTorch non-reentrant checkpointing.
-
-    Pass this as ``context_fn`` to ``torch.utils.checkpoint.checkpoint``. The two
-    contexts share one checkpoint region state so cached op records from the
-    original forward can be replayed by relative op name during recomputation.
-    """
-
-    region_state = _CheckpointRegionState(region_name=region_name)
-    return (
-        _CheckpointPhaseContext(
-            region_state,
-            _Phase.FORWARD,
-        ),
-        _CheckpointPhaseContext(
-            region_state,
-            _Phase.RECOMPUTE,
-        ),
-    )
-
-
-class _TriggerCheckpointRecompute(torch.autograd.Function):
-    """Autograd identity that installs one checkpoint-hook unpack boundary."""
-
-    @staticmethod
-    def forward(ctx: AutogradCtx, output: torch.Tensor) -> torch.Tensor:
-        # Save a zero-element tensor with the same dtype/device as the output so
-        # PyTorch's checkpoint unpack hook is triggered without retaining output
-        # storage or forcing a device transfer at the checkpoint boundary.
-        ctx.save_for_backward(
-            torch.empty((0,), dtype=output.dtype, device=output.device)
-        )
-        return output.view_as(output)
-
-    @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
-        # Trigger PyTorch non-reentrant checkpoint's saved-tensor unpack hook at
-        # the user-visible checkpoint boundary before nested custom autograd
-        # Function backward bodies unpack their own saved tensors.
-        (_,) = ctx.saved_tensors
-        return grad_output
-
-
-def _checkpoint_recompute_boundary(output: Any) -> Any:
-    """Force non-reentrant checkpoint replay before nested custom backprop.
-
-    Non-reentrant PyTorch checkpoint starts replay lazily when backward first
-    unpacks a tensor saved under checkpoint hooks. For remat regions containing
-    nested custom autograd Functions, replay should start at the checkpoint
-    output boundary rather than from inside an inner backward body. This helper
-    preserves values while inserting that boundary trigger on tensor outputs.
-    """
-
-    if isinstance(output, torch.Tensor):
-        return _TriggerCheckpointRecompute.apply(output)
-    # Exact builtin container checks keep the public contract small and avoid
-    # silently changing the type or invariants of subclasses such as namedtuple,
-    # custom mappings, or domain objects with constructor requirements.
-    if type(output) is tuple:
-        return tuple(_checkpoint_recompute_boundary(item) for item in output)
-    if type(output) is list:
-        return [_checkpoint_recompute_boundary(item) for item in output]
-    if type(output) is dict:
-        return {
-            key: _checkpoint_recompute_boundary(value) for key, value in output.items()
-        }
-    raise RuntimeError(
-        "torch_remat checkpoint function must return a Tensor or an exact "
-        "tuple/list/dict containing only supported checkpoint outputs"
-    )
+# --------------------------------------------------------------------------
+# Public API
+# --------------------------------------------------------------------------
 
 
 def checkpoint(
@@ -696,33 +112,58 @@ def checkpoint(
     region_name: str | None = None,
     determinism_check: str = "none",
     preserve_rng_state: bool = True,
+    detect_bare_ops: bool | str = "subclass",
+    input_saved_tensors_hooks: tuple[PackHook, UnpackHook] | None = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Return a decorator that builds a torch_remat checkpoint wrapper.
 
-    Checkpoint options, the function, and user function arguments are supplied
-    in three separate calls: ``checkpoint(...)(function)(*args, **kwargs)``.
-    This avoids collisions between checkpoint option names, function attributes,
-    and user keyword arguments.
+    Checkpoint options, the function, and user arguments are supplied in three
+    separate calls: ``checkpoint(...)(function)(*args, **kwargs)``.
+    ``checkpoint(function)(...)`` is intentionally unsupported to avoid
+    confusion with ``torch.utils.checkpoint.checkpoint``.
 
-    NB: ``checkpoint(function)(*args, **kwargs)`` is intentionally unsupported
-    to avoid confusion with ``torch.utils.checkpoint.checkpoint``, which cannot
-    support that calling convention for BC reasons. ``torch_remat`` always uses
-    non-reentrant checkpointing internally and only exposes the PyTorch knobs
-    that are expected to matter to remat users.
+    Everything inside the region recomputes by default; annotate calls with
+    :func:`op` to ``SAVE`` (keep activations, skip recompute) instead.
 
-    Keyword args:
-        region_name: Optional diagnostic name for this checkpoint region. This
-            name appears in torch_remat errors and memory reports.
-        determinism_check: A string specifying the PyTorch determinism check to
-            perform during non-reentrant checkpoint recomputation. ``"default"``
-            compares the shapes, dtypes, and devices of recomputed tensors
-            against the saved tensors. ``"none"`` disables this check.
-            Currently these are the only two supported PyTorch values.
-            Default: ``"none"``
-        preserve_rng_state: If ``False``, omit stashing and restoring the RNG
-            state during each checkpoint. Note that under ``torch.compile``,
-            this flag does not take effect and PyTorch always preserves RNG
-            state. Default: ``True``
+    Region arguments are forwarded unchanged (``torch.utils.checkpoint`` handles
+    them), but the region *output* must be a Tensor or a one-hop ``tuple`` /
+    ``list`` of Tensors; anything else raises at the region boundary.
+
+    Args:
+        region_name (str, optional): Label for the region, shown in memory
+            reports, traces, and error messages to identify which region an op
+            belongs to. When ``None`` the region renders as ``<unnamed>``.
+            Keyword-only. Default: ``None``.
+        determinism_check (str, optional): Forwarded verbatim to
+            ``torch.utils.checkpoint.checkpoint``; selects the check that
+            compares tensor metadata between the forward and the recompute to
+            catch nondeterministic regions. ``"none"`` disables it. Keyword-only.
+            Default: ``"none"``.
+        preserve_rng_state (bool, optional): Forwarded verbatim to
+            ``torch.utils.checkpoint.checkpoint``. If ``True``, the forward RNG
+            state is stashed and restored before recompute so RNG-using ops
+            replay identically. Keyword-only. Default: ``True``.
+        detect_bare_ops (bool or str, optional): How *bare* (un-``op``-wrapped)
+            consumers of a SAVE op's outputs are intercepted, so e.g. a residual
+            add or raw Triton kernel works without a :func:`op` wrapper. One of
+            ``True`` / ``"subclass"`` (wrap outputs in a tensor subclass),
+            ``"proxy"`` (wrap in a proxy object), ``"dispatch_mode"``,
+            ``"function_mode"`` (intercept via a torch mode), or ``False`` to opt
+            out -- a bare consumer then raises during recompute. See
+            :mod:`torch_remat._bare_op._strategy` for the trade-offs, and the
+            README for the full comparison. Keyword-only. Default: ``"subclass"``.
+        input_saved_tensors_hooks (tuple, optional): A ``(pack_hook, unpack_hook)`` pair
+            (same signature as ``torch.autograd.graph.saved_tensors_hooks``) applied to the
+            region's *input* tensors -- e.g. to offload a large residual stream to CPU.
+            ``pack_hook`` fires once per input at region entry, *before the body runs*, so it
+            must not synchronously free storage the body still reads (defer the free);
+            ``unpack_hook`` restores each input when the region is replayed for recompute.
+            Keyword-only. Default: ``None``.
+
+    Returns:
+        Callable: A decorator that takes the region ``function`` and returns a
+        checkpointed callable; call that with the region's own ``*args`` /
+        ``**kwargs``.
 
     Example:
         ```python
@@ -734,1029 +175,1200 @@ def checkpoint(
 
     def decorate(function: Callable[..., Any]) -> Callable[..., Any]:
         def wrapped_function(*inner_args: Any, **inner_kwargs: Any) -> Any:
-            # The boundary trigger must be inside the function passed to PyTorch
-            # checkpoint so its saved tensor is covered by PyTorch's checkpoint
-            # hooks and can force replay before nested custom backward code runs.
             output = function(*inner_args, **inner_kwargs)
             return _checkpoint_recompute_boundary(output)
 
+        @wraps(function)
         def checkpointed_function(*args: Any, **kwargs: Any) -> Any:
-            return _torch_checkpoint_with_forward_exception_cleanup(
-                wrapped_function,
-                function_args=args,
-                function_kwargs=kwargs,
-                context_fn=lambda: _checkpoint_context_fn(region_name),
-                determinism_check=determinism_check,
-                preserve_rng_state=preserve_rng_state,
+            # We install these around the WHOLE region but they fire only for the region
+            # inputs: torch.utils.checkpoint saves the inputs (via _make_saved_tensor) at
+            # region entry, then enters its own saved_tensors_hooks for recompute which
+            # shadows ours for every save in the body -- only the input save, before
+            # checkpoint's hook is installed, reaches ours. Can't scope tighter than the
+            # whole region: checkpoint's hook nests inside and stays across the body, so
+            # popping ours earlier would break the hook stack's LIFO order.
+            input_hooks_ctx: contextlib.AbstractContextManager[Any] = (
+                torch.autograd.graph.saved_tensors_hooks(*input_saved_tensors_hooks)
+                if input_saved_tensors_hooks is not None
+                else contextlib.nullcontext()
             )
+            with input_hooks_ctx:
+                return _torch_checkpoint_with_forward_exception_cleanup(
+                    wrapped_function,
+                    function_args=args,
+                    function_kwargs=kwargs,
+                    context_fn=lambda: _checkpoint_context_fn(
+                        region_name, detect_bare_ops
+                    ),
+                    determinism_check=determinism_check,
+                    preserve_rng_state=preserve_rng_state,
+                )
 
         return checkpointed_function
 
     return decorate
 
 
-def _keep_graph() -> bool:
-    """Return whether the current backward pass uses retain_graph=True."""
-
-    return torch._C._autograd._get_current_graph_task_keep_graph()  # type: ignore[attr-defined]
-
-
-def _torch_checkpoint_with_forward_exception_cleanup(
-    function: Callable[..., Any],
-    function_args: tuple[Any, ...],
-    function_kwargs: dict[str, Any],
-    context_fn: CheckpointContextFn,
-    determinism_check: str,
-    preserve_rng_state: bool,
-) -> Any:
-    """Run PyTorch non-reentrant checkpoint with local exception cleanup.
-
-    This is intentionally just the public ``torch.utils.checkpoint.checkpoint``
-    non-reentrant branch, plus ``gen.close()`` when the user forward raises.
-    Once PyTorch's public implementation closes the generator on that path, this
-    helper can be replaced with a direct call to ``torch.utils.checkpoint``.
-    Upstream fix: https://github.com/pytorch/pytorch/pull/184018
-    """
-
-    # Import locally so importing torch_remat does not eagerly bind PyTorch's
-    # private checkpoint implementation. This helper is the only compatibility
-    # layer that should depend on that private symbol.
-    from torch.utils.checkpoint import _checkpoint_without_reentrant_generator
-
-    # Match the public non-reentrant checkpoint defaults for the private
-    # generator parameters that appear after determinism_check.
-    checkpoint_debug = False
-    checkpoint_early_stop = True
-    gen = _checkpoint_without_reentrant_generator(
-        function,
-        preserve_rng_state,
-        context_fn,
-        determinism_check,
-        checkpoint_debug,
-        checkpoint_early_stop,
-        *function_args,
-        **function_kwargs,
-    )
-    next(gen)
-    try:
-        ret = function(*function_args, **function_kwargs)
-    except BaseException:
-        # PyTorch's public checkpoint() currently leaves the non-reentrant
-        # generator suspended if the user forward raises. That keeps both the
-        # PyTorch checkpoint hook and our forward context installed as long as
-        # the traceback is alive, which can corrupt later checkpoint regions.
-        # Drive the same private generator directly so we can close it on the
-        # exceptional path; this mirrors the upstream fix.
-        gen.close()
-        raise
-
-    try:
-        next(gen)
-    except StopIteration:
-        return ret
-    raise RuntimeError("torch.utils.checkpoint generator did not stop")
-
-
-def is_recomputing() -> bool:
-    """Return whether execution is currently in checkpoint recomputation.
-
-    Example:
-        ```python
-        if not remat.is_recomputing():
-            log_forward_only_metric(x)
-        ```
-    """
-
-    # Outside remat.checkpoint there is no active state, and user code should
-    # treat execution as ordinary forward rather than recompute.
-    state = _state.get()
-    return state is not None and state.phase is _Phase.RECOMPUTE
-
-
-@contextlib.contextmanager
-def collect_trace() -> Iterator[RematTrace]:
-    """Collect a reporting-only trace of remat annotations.
-
-    The trace records calls to :func:`op`, :func:`trace_scope`, and native save
-    regions during the original forward. Recomputation is intentionally skipped
-    so reports do not double-count replayed work.
-    """
-
-    trace = RematTrace()
-    token = _active_trace.set(trace)
-    try:
-        yield trace
-    finally:
-        _active_trace.reset(token)
-
-
-def trace_scope(
-    function: Callable[_P, _R],
-    name: str,
-    *,
-    metadata: str | None = None,
-) -> Callable[_P, _R]:
-    """Add a diagnostic hierarchy scope to the active op trace.
-
-    This is reporting-only. It does not change rematerialization behavior, op
-    names, or checkpoint policies.
-    """
-
-    if not callable(function):
-        raise RuntimeError("trace_scope expects a function as its first argument")
-    _validate_trace_scope_text(name, what="trace scope name")
-    if metadata is not None:
-        _validate_trace_scope_text(metadata, what="trace scope metadata")
-
-    @wraps(function)
-    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
-        trace = _active_trace.get()
-        if trace is None or is_recomputing():
-            return function(*args, **kwargs)
-
-        scope = ScopeTrace(name=name, metadata=metadata)
-        trace._current_entries().append(scope)
-        trace._scope_stack.append(scope)
-        try:
-            return function(*args, **kwargs)
-        finally:
-            popped_scope = trace._scope_stack.pop()
-            if popped_scope is not scope:
-                raise RuntimeError("torch_remat trace scope stack was corrupted")
-
-    return wrapper
-
-
-def _record_trace_op(
-    name: str,
-    *,
-    policy: CheckpointPolicy | None,
-    source: str,
-) -> None:
-    """Append an op to the active trace, if tracing original forward."""
-
-    trace = _active_trace.get()
-    if trace is None or is_recomputing():
-        return
-    trace._current_entries().append(OpTrace(name=name, policy=policy, source=source))
-
-
-def _append_trace_entry(
-    lines: list[str],
-    entry: OpTrace | ScopeTrace,
-    *,
-    indent: int,
-) -> None:
-    prefix = "  " * indent
-    if isinstance(entry, ScopeTrace):
-        metadata = "" if entry.metadata is None else f" [{entry.metadata}]"
-        lines.append(f"{prefix}{entry.name}{metadata}")
-        for child in entry.entries:
-            _append_trace_entry(lines, child, indent=indent + 1)
-        return
-
-    if entry.source == "native":
-        details = "native" if entry.policy is None else f"native {entry.policy.name}"
-    elif entry.policy is not None:
-        details = entry.policy.name
-    else:
-        details = entry.source
-    lines.append(f"{prefix}{entry.name}: {details}")
-
-
-@contextlib.contextmanager
-def _active_op_context(
-    name: str,
-    policy: CheckpointPolicy,
-) -> Iterator[None]:
-    token = _active_op.set((name, policy))
-    try:
-        yield
-    finally:
-        _active_op.reset(token)
-
-
 def op(
     function: Callable[_P, _R],
-    name: str | None = None,
+    name: str,
     *,
-    policy: CheckpointPolicy,
+    policy: CheckpointPolicy = CheckpointPolicy.SAVE,
 ) -> Callable[_P, _R]:
-    """Annotate one remat-aware custom autograd op call.
+    """Annotate one call inside a checkpoint region with a remat policy.
 
-    This lets call sites keep the remat name and policy out of the
-    ``autograd.Function.apply`` argument list.
+    ``function`` is used unmodified -- it may be a custom ``autograd.Function``'s
+    ``.apply``, a bare native op, or any callable taking a flat list of
+    Tensor/non-Tensor arguments and returning a Tensor or tuple of Tensors.
 
         ```python
-        return remat.op(MyOp.apply, "my.op", policy=remat.CheckpointPolicy.SAVE)(
-            x,
-            y,
-        )
+        y = remat.op(MyOp.apply, "my.op")(x)
         ```
+
+    With ``SAVE`` (the default -- the region already recomputes everything, so an
+    annotation normally marks the exception), the tensors the call's autograd
+    nodes save are kept by autograd on the original forward graph and the call
+    is not rerun during recompute. With ``RECOMPUTE``, the call is rerun during
+    recompute; any input that is an upstream ``SAVE`` op's output is made that
+    producer's responsibility to persist, so the rerun has real data.
+
+    Despite its name, a `remat.op` doesn't have to correspond to a true PyTorch
+    operator; you can scope it as large as you like. We recommend about the
+    granularity of an autograd function, since this gives you the most accurate
+    reporting of where save-for-backward costs are going.
+
+    Tensor inputs and outputs follow ``autograd.Function`` / ATen conventions --
+    a Tensor, or a *one-hop* ``tuple`` / ``list`` of Tensors -- deliberately not
+    full pytree (nor ``dict``). Arguments are walked leniently: anything else
+    (a ``dict``, a custom object, deeper nesting) is an opaque leaf handed to
+    ``function`` untouched -- but a ``SAVE`` output smuggled that way was never
+    seen by remat, so a ``RECOMPUTE`` consumer of it meets a placeholder error
+    during recompute rather than at the call. The *return* is validated
+    strictly: a non-Tensor or nested return raises ``RuntimeError``.
+
+    NB: if you smuggle an input into the callable (e.g., via a global or via a
+    closure), you had better ensure that it is available/recomputed in
+    recompute, otherwise we may fail to save it for backwards (only direct
+    inputs induce save.)
+
+    ``torch.compile`` is not supported yet.
+
+    Args:
+        function (Callable): The callable to annotate, used unmodified. It may be
+            a custom ``autograd.Function``'s ``.apply``, a bare native op, or any
+            callable taking a flat list of Tensor/non-Tensor arguments and
+            returning a Tensor or a one-hop ``tuple`` / ``list`` of Tensors.
+        name (str): Region-relative name for this op, shown in memory reports,
+            traces, and error messages. Must be non-empty and unique among the
+            op names reached in a single phase.
+        policy (CheckpointPolicy, optional): How the call is handled under
+            recompute. ``SAVE`` keeps the tensors the call saves for backward on
+            the original forward graph and skips rerunning the call during
+            recompute; ``RECOMPUTE`` reruns the call, and any input that is an
+            upstream ``SAVE`` op's output is made that producer's responsibility
+            to persist. Keyword-only. Default: ``CheckpointPolicy.SAVE``.
+
+    Returns:
+        Callable: A wrapper with the same signature as ``function``. Called
+        outside an active checkpoint region it simply forwards to ``function``.
+
+    Raises:
+        RuntimeError: If ``function`` is not callable, or ``policy`` is not a
+            :class:`CheckpointPolicy`.
+        ValueError: If ``name`` is empty.
     """
 
     if not callable(function):
         raise RuntimeError("op expects a function as its first argument")
-    if name is None:
-        raise RuntimeError("op(function, ...) expects an op_name")
     _validate_name(name, what="op_name")
     if not isinstance(policy, CheckpointPolicy):
         raise RuntimeError("op expects a CheckpointPolicy")
 
     @wraps(function)
     def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
-        _record_trace_op(name, policy=policy, source="custom")
-        with _active_op_context(name, policy):
+        state = _state.get()
+        if state is None:
+            # Outside a checkpoint region: behave as a plain call.
             return function(*args, **kwargs)
+
+        # Suppress the bare-op detection mode (if any) for this op's own processing,
+        # including the wrapped body: the consume/snapshot path already handles the op's
+        # SAVE-output arguments, so the mode must not re-handle them. Known gap: a SAVE
+        # output the body reaches via closure capture is handled by neither -- see the
+        # _suppress_bare_op_detection note in torch_remat._bare_op._common.
+        with _suppress_bare_op_detection():
+            _record_trace_op(name, policy=policy)
+
+            # Record this op invocation in the current phase, rejecting duplicates.
+            if name in state.claimed_names:
+                raise RuntimeError(
+                    f"Duplicate torch_remat op name "
+                    f"{_display_name(state.region_state, name)} during "
+                    f"{state.phase.name.lower()}"
+                )
+            state.claimed_names.add(name)
+
+            if policy is CheckpointPolicy.SAVE:
+                return cast(_R, _run_save_op(state, name, function, args, kwargs))
+            return cast(_R, _run_recompute_op(state, name, function, args, kwargs))
 
     return wrapper
 
 
-class _InertRematHandle:
-    """Handle for autograd Function forwards outside a checkpoint region.
+def save_for_backward(
+    ctx: Any,
+    saved: Mapping[str, torch.Tensor | None],
+) -> None:
+    """Named ``ctx.save_for_backward`` for use inside a :func:`op` forward.
 
-    All methods delegate to ordinary autograd behavior without recording
-    anything on a remat tape.
-    """
+    Call this in place of ``ctx.save_for_backward(...)`` to give the saved tensors
+    stable, meaningful names. Under a ``SAVE`` op the names label the tensors in
+    :func:`format_current_memory_report` instead of positional ``saved.0`` /
+    ``saved.1`` keys. ``None`` values are preserved positionally (as
+    ``ctx.save_for_backward`` does) but carry no name.
 
-    def __init__(self, ctx: AutogradCtx) -> None:
-        self._ctx = ctx
+    Using it is optional and always safe: outside a ``SAVE`` op (a ``RECOMPUTE`` op,
+    or no active checkpoint region) it simply forwards to ``ctx.save_for_backward``
+    and the names are ignored.
 
-    def maybe_load_saved(self) -> Output | None:
-        return None
+    Args:
+        ctx: The ``autograd.Function`` context object handed to ``forward``; the
+            tensors are forwarded to its ``ctx.save_for_backward``.
+        saved (Mapping[str, Tensor or None]): Mapping from report name to tensor.
+            Each name labels its tensor in :func:`format_current_memory_report`
+            in place of a positional ``saved.<i>`` key; it must be non-empty and
+            must not contain ``'.'``. A ``None`` value is preserved positionally
+            (as ``ctx.save_for_backward`` does) but carries no name.
 
-    def save_or_load_inputs(
-        self,
-        *args: torch.Tensor,
-    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-        return _return_like_args(args)
-
-    def save_for_backward(
-        self,
-        saved_tensors: Mapping[str, torch.Tensor | None],
-    ) -> None:
-        tensors_to_save: dict[str, SavedTensor] = dict(saved_tensors)
-        for tensor_name, tensor in tensors_to_save.items():
-            _validate_name(tensor_name, what="save_for_backward key")
-            if "." in tensor_name:
-                raise RuntimeError(
-                    f"save_for_backward key {tensor_name!r} must not contain '.'"
-                )
-            if tensor is not None and not isinstance(tensor, torch.Tensor):
-                raise RuntimeError(
-                    f"save_for_backward.{tensor_name} must be a tensor or None"
-                )
-        self._ctx.save_for_backward(*tensors_to_save.values())
-
-    def record_outputs(self, *outs: Output) -> Output:
-        if len(outs) == 1:
-            return outs[0]
-        if all(isinstance(out, torch.Tensor) for out in outs):
-            return cast(tuple[torch.Tensor, ...], outs)
-        raise RuntimeError("record_outputs accepts tensors or a single output tuple")
-
-
-class RematHandle:
-    """Handle for one remat-aware autograd Function forward call.
-
-    This handle lets us do materialization related save/load inside of a
-    custom autograd function forwards.  Obtain this at the start of a custom
-    ``autograd.Function.forward`` using :func:`get_handle`.
+    Raises:
+        ValueError: If a name is empty.
+        RuntimeError: If a name contains ``'.'``, or a value is neither a Tensor
+            nor ``None``.
 
     Example:
         ```python
-        handle = remat.get_handle(ctx, op_name, remat_policy)
-        if (ret := handle.maybe_load_saved()) is not None:
-            return ret
-
-        x = handle.save_or_load_inputs(x)
-        y = my_op_fwd1(x)
-        z = my_op_fwd2(y)
-        handle.save_for_backward({"x": x, "y": y})
-        return handle.record_outputs(z)
+        def forward(ctx, x):
+            y = f(x)
+            remat.save_for_backward(ctx, {"x": x, "y": y})
+            return g(y)
         ```
     """
 
-    def __init__(
-        self,
-        ctx: AutogradCtx,
-        op_name: str,
-        policy: CheckpointPolicy,
-        active_state: _ActiveCheckpointRegion,
-        record: _OpRecord,
-    ) -> None:
-        self._ctx = ctx
-        self._op_name = op_name
-        self._policy = policy
-        self._active_state = active_state
-        self._record = record
-
-    def maybe_load_saved(self) -> Output | None:
-        """Load saved tensors and return stub outputs during replay, if possible.
-
-        The idiomatic use of this method is to test whether a custom autograd
-        forward can short-circuit its expensive body. If this returns a
-        non-None result, return it directly.
-
-        In the forward phase this always returns ``None``. During recompute,
-        this returns data-inaccessible placeholder outputs for ``SAVE`` ops and
-        loads the tensors previously recorded by :meth:`save_for_backward`
-        into ``ctx``.  Outputs are never retained solely because they were
-        returned; if a later ``RECOMPUTE`` op needs a real value that would
-        otherwise be a placeholder, that use site is responsible for
-        saving/loading it via :meth:`save_or_load_inputs`.
-
-        Example:
-            ```python
-            handle = remat.get_handle(ctx, op_name, remat_policy)
-            if (ret := handle.maybe_load_saved()) is not None:
-                return ret
-            ```
-        """
-
-        active_state = self._active_state
-        if (
-            active_state.phase is _Phase.FORWARD
-            or self._policy is CheckpointPolicy.RECOMPUTE
-        ):
-            return None
-
-        record = self._record
-        output = record.placeholder_output(active_state.region_state)
-
-        # SAVE-policy recompute skips the user forward body, so it must still
-        # populate the recompute autograd graph's ctx in the same order as the
-        # original ctx.save_for_backward call.
-        saved_tensors: list[SavedTensor] = []
-        for tensor_name in record.saved_for_backward_names:
-            saved_tensors.append(
-                record.load_saved_tensor(active_state.region_state, tensor_name)
-            )
-        if saved_tensors:
-            self._ctx.save_for_backward(*saved_tensors)
-        _release_record_after_recompute_if_needed(record)
-        return output
-
-    def save_or_load_inputs(
-        self,
-        *args: torch.Tensor,
-    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-        """Save unavailable recompute inputs in forward, or load them in replay.
-
-        This is only active for ``RECOMPUTE`` ops. In the original forward, any
-        input that would replay as a data-inaccessible placeholder is retained by
-        this handle. During recompute, the retained real input is loaded back
-        and returned in place of the placeholder. For ``SAVE`` ops, inputs are
-        returned unchanged.
-
-        Place this immediately after :meth:`maybe_load_saved` and before the
-        expensive forward body.
-
-        Example:
-            ```python
-            x = handle.save_or_load_inputs(x)
-            y = my_op_fwd1(x)
-            ```
-        """
-
-        if self._policy is not CheckpointPolicy.RECOMPUTE:
-            assert self._active_state.phase is not _Phase.RECOMPUTE, (
-                f"save_or_load_inputs called on {self._op_name} with policy "
-                f"{self._policy} during recompute; SAVE ops must short-circuit "
-                f"via maybe_load_saved()"
-            )
-            return _return_like_args(args)
-
-        active_state = self._active_state
-        if active_state.phase is _Phase.RECOMPUTE:
-            loaded_args: list[torch.Tensor] = []
-            record = self._record
-            for index, tensor in enumerate(args):
-                slot_name = f"input.{index}"
-                if slot_name not in record.tensor_slots:
-                    # This input was already real during forward replay, either
-                    # because it came from a RECOMPUTE producer or because it was
-                    # not a torch_remat placeholder source.
-                    loaded_args.append(tensor)
-                    continue
-
-                loaded_tensor = record.load_saved_tensor(
-                    active_state.region_state, slot_name
-                )
-                if loaded_tensor is None:
-                    raise RuntimeError(
-                        f"input {self._op_name}.{index} was saved as None"
-                    )
-                loaded_args.append(loaded_tensor)
-
-            return _return_like_args(tuple(loaded_args))
-
-        record = self._record
-        for index, tensor in enumerate(args):
-            if not _is_stub_on_recompute(tensor):
-                continue
-
-            # Only outputs whose producer policy is SAVE carry this marker.
-            # Retaining these inputs makes this RECOMPUTE op independent of
-            # the skipped producer's placeholder output during replay.
-            record.store_saved_tensor_slot(
-                active_state.region_state,
-                f"input.{index}",
-                tensor,
-            )
-
-        return _return_like_args(args)
-
-    def save_for_backward(
-        self,
-        saved_tensors: Mapping[str, torch.Tensor | None],
-    ) -> None:
-        """Named replacement for ``ctx.save_for_backward``.
-
-        The mapping gives names to every tensor passed to
-        ``ctx.save_for_backward``; insertion order determines the order seen by
-        ``ctx.saved_tensors`` in backward. For ``SAVE`` ops, the tensors are
-        also recorded on the torch_remat tape so :meth:`maybe_load_saved` can
-        load them into the recompute autograd graph. For ``RECOMPUTE`` ops,
-        they are only saved to the current autograd graph.
-
-        ``None`` is a valid saved slot value and is preserved in
-        ``ctx.saved_tensors``.
-
-        Example:
-            ```python
-            handle.save_for_backward(
-                {"x": x, "y": y},  # order matches ctx.saved_tensors
-            )
-            ```
-        """
-
-        active_state = self._active_state
-        tensors_to_save: dict[str, SavedTensor] = dict(saved_tensors)
-        for tensor_name, tensor in tensors_to_save.items():
-            _validate_name(tensor_name, what="save_for_backward key")
-            if "." in tensor_name:
-                raise RuntimeError(
-                    f"save_for_backward key {tensor_name!r} must not contain '.'"
-                )
-            if tensor is not None and not isinstance(tensor, torch.Tensor):
-                raise RuntimeError(
-                    f"save_for_backward.{tensor_name} must be a tensor or None"
-                )
-
-        if (
-            active_state.phase is _Phase.RECOMPUTE
-            and self._policy is not CheckpointPolicy.RECOMPUTE
-        ):
-            # For SAVE-policy recompute, maybe_load_saved is the only path that
-            # both restores ctx.saved_tensors and returns the placeholder output
-            # schema. Reaching save_for_backward means user code failed to take
-            # that short-circuit path.
-            raise RuntimeError(
-                "SAVE-policy torch_remat forwards must call maybe_load_saved() "
-                "and return its placeholder output during recompute before "
-                "calling save_for_backward"
-            )
-
-        if self._policy is not CheckpointPolicy.RECOMPUTE:
-            record = self._record
-            for tensor_name, tensor in tensors_to_save.items():
-                record.store_saved_tensor_slot(
-                    active_state.region_state,
-                    tensor_name,
-                    tensor,
-                )
-                record.saved_for_backward_names.append(tensor_name)
-
-        if tensors_to_save:
-            # Preserve ordinary autograd behavior for the current graph. In
-            # original forward this supports uncheckpointed use; in recompute it
-            # transfers ownership to PyTorch's backward graph.
-            self._ctx.save_for_backward(*tensors_to_save.values())
-
-    def record_outputs(self, *outs: Output) -> Output:
-        """Record output metadata for this autograd Function call.
-
-        For ``SAVE`` ops in the original forward, this records enough output
-        schema and tensor metadata to synthesize data-inaccessible placeholders
-        during recompute. The returned value preserves the single-tensor versus
-        tuple schema expected by the autograd engine. Output tensor storage is
-        not retained; include any output needed by backward in
-        :meth:`save_for_backward`.
-
-        A single output is conventionally named ``out`` in memory reports; tuple
-        outputs are named by position.
-
-        Example:
-            ```python
-            z = my_op_fwd2(y)
-            return handle.record_outputs(z)
-            ```
-        """
-
-        active_state = self._active_state
-        if len(outs) == 1:
-            output = outs[0]
-        elif all(isinstance(out, torch.Tensor) for out in outs):
-            output = cast(tuple[torch.Tensor, ...], outs)
-        else:
-            raise RuntimeError(
-                "record_outputs accepts tensors or a single output tuple"
-            )
-
-        record = self._record
-        assert (
-            active_state.phase is not _Phase.RECOMPUTE
-            or self._policy is CheckpointPolicy.RECOMPUTE
-        ), (
-            f"record_outputs called on {self._op_name} with policy "
-            f"{self._policy} during recompute; SAVE ops must short-circuit "
-            f"via maybe_load_saved()"
-        )
-
-        if isinstance(output, torch.Tensor):
-            output_tensors: Output = output
-        elif isinstance(output, tuple) and all(
-            isinstance(tensor, torch.Tensor) for tensor in output
-        ):
-            output_tensors = cast(tuple[torch.Tensor, ...], output)
-        else:
-            raise RuntimeError(
-                "output must be a Tensor or tuple of Tensors when checkpoint forward runs"
-            )
-
-        if self._policy is not CheckpointPolicy.RECOMPUTE:
-            record.record_output_schema(output_tensors)
-            for tensor in _output_tensors(output_tensors):
-                # Downstream RECOMPUTE handles use this marker to retain only
-                # inputs that would otherwise be placeholder outputs in replay.
-                setattr(tensor, _STUB_ON_RECOMPUTE_ATTR, True)
-
-        if active_state.phase is _Phase.RECOMPUTE:
-            _release_record_after_recompute_if_needed(record)
-
-        return output_tensors
-
-
-def get_handle(
-    ctx: AutogradCtx,
-    op_name: str,
-    policy: CheckpointPolicy,
-) -> RematHandle | _InertRematHandle:
-    """Return a ``RematHandle`` for one remat-aware autograd Function call.
-
-    Call this at the start of a custom ``autograd.Function.forward``. In the
-    original forward of an active checkpoint region, this creates or finds the
-    call's private tape record and establishes its checkpoint policy. During
-    recompute, it looks up the existing tape record. Outside a checkpoint
-    region, it returns an inert handle whose methods behave like normal
-    autograd-forward helpers.
-
-    The ``op_name`` is relative to the current checkpoint region and must be
-    stable and unique for this forward invocation. Conflicting policies for
-    the same name in one region are rejected.
-
-    Example:
-        ```python
-        handle = remat.get_handle(ctx, op_name, remat_policy)
-        ```
-    """
-
-    _validate_name(op_name, what="op_name")
-    if not any(ctx.needs_input_grad):
-        return _InertRematHandle(ctx)
-
-    active_state = _state.get()
-    if active_state is None:
-        return _InertRematHandle(ctx)
-
-    # A remat-aware custom Function should create exactly one handle for its
-    # stable op_name in each phase. Duplicates usually mean two logical ops are
-    # sharing a name or one forward body is drifting between phases.
-    _claim_handle_name(active_state, op_name)
-    if active_state.phase is _Phase.FORWARD:
-        record = _get_or_create_policy_record(
-            active_state.region_state,
-            op_name,
-            policy,
-        )
-    else:
-        record = _expect_policy_record(
-            active_state.region_state,
-            op_name,
-            policy,
-            "get_handle",
-        )
-
-    return RematHandle(ctx, op_name, policy, active_state, record)
-
-
-def auto_forward(
-    *save_for_backward_names: str,
-) -> Callable[[Callable[..., Output]], Callable[..., Output]]:
-    """Decorate a high-level ``autograd.Function.forward`` implementation.
-
-    The decorated forward takes the same arguments as the underlying
-    ``autograd.Function.forward``. Calls to ``ctx.save_for_backward`` are
-    captured and named with ``save_for_backward_names``. Only direct positional tensor
-    arguments are passed through :meth:`RematHandle.save_or_load_inputs`; nested
-    tensor containers should use the explicit handle API so their replay inputs
-    can be named intentionally.
-
-    Example:
-        ```python
-        class MyOp(torch.autograd.Function):
-            @staticmethod
-            @remat.auto_forward("x", "y")
-            def forward(ctx, x):
-                y = my_op_fwd1(x)
-                z = my_op_fwd2(y)
-                ctx.save_for_backward(x, y)
-                return z
-        ```
-    """
-
-    seen_names: set[str] = set()
-    for tensor_name in save_for_backward_names:
-        _validate_name(tensor_name, what="auto_forward save_for_backward name")
+    scratch = _active_save_op.get()
+    for tensor_name, tensor in saved.items():
+        _validate_name(tensor_name, what="save_for_backward name")
         if "." in tensor_name:
             raise RuntimeError(
-                f"auto_forward save_for_backward name {tensor_name!r} must not "
-                "contain '.'"
+                f"save_for_backward name {tensor_name!r} must not contain '.'"
             )
-        if tensor_name in seen_names:
+        if tensor is not None and not isinstance(tensor, torch.Tensor):
             raise RuntimeError(
-                f"Duplicate auto_forward save_for_backward name: {tensor_name}"
+                f"save_for_backward[{tensor_name!r}] must be a Tensor or None"
             )
-        seen_names.add(tensor_name)
-
-    def decorator(forward: Callable[..., Output]) -> Callable[..., Output]:
-        @wraps(forward)
-        def wrapper(ctx: AutogradCtx, *args: Any) -> Output:
-            context = _active_op.get()
-            if context is None:
-                if _state.get() is None:
-                    return forward(ctx, *args)
-                raise RuntimeError("auto_forward expects an active remat.op call")
-            op_name, remat_policy = context
-            body_args = args
-
-            handle = get_handle(ctx, op_name, remat_policy)
-            if (ret := handle.maybe_load_saved()) is not None:
-                return ret
-
-            tensor_args = tuple(
-                arg for arg in body_args if isinstance(arg, torch.Tensor)
-            )
-            loaded_args = handle.save_or_load_inputs(*tensor_args)
-            # save_or_load_inputs only operates on tensors, but the wrapped
-            # forward must still receive its non-tensor positional arguments in
-            # their original positions.
-            loaded_tensor_iter = iter(
-                (loaded_args,) if isinstance(loaded_args, torch.Tensor) else loaded_args
-            )
-            body_args = tuple(
-                next(loaded_tensor_iter) if isinstance(arg, torch.Tensor) else arg
-                for arg in body_args
-            )
-            proxy_ctx = _SaveForBackwardProxy(ctx)
-            output = forward(proxy_ctx, *body_args)
-            named_saved_tensors = proxy_ctx.named_saved_tensors(save_for_backward_names)
-            handle.save_for_backward(named_saved_tensors)
-            return handle.record_outputs(output)
-
-        return wrapper
-
-    return decorator
+        if scratch is not None and isinstance(tensor, torch.Tensor):
+            # Record the name in the op's forward scratch, keyed by the exact tensor
+            # object: pack looks the name up for the tensor it is handed (see
+            # :func:`_resolve_save_name`), so a name cannot shift onto another op's
+            # tensor -- the scratch dies with this op's forward, so the name cannot
+            # outlive the op (or mutate the user's tensor). Gated on being inside a
+            # SAVE op so a plain ``save_for_backward`` outside a remat region
+            # records nothing.
+            scratch.pending_save_names[tensor] = tensor_name
+    ctx.save_for_backward(*saved.values())
 
 
-class _CheckpointPhaseContext(contextlib.AbstractContextManager[None]):
-    """Reusable context manager for one checkpoint phase.
-
-    PyTorch non-reentrant checkpoint stores these context managers and enters
-    them later around the original forward and replay.
-    """
-
-    def __init__(
-        self,
-        region_state: _CheckpointRegionState,
-        phase: _Phase,
-    ) -> None:
-        self._region_state = region_state
-        self._phase = phase
-        self._token: contextvars.Token[_ActiveCheckpointRegion | None] | None = None
-
-    def __enter__(self) -> None:
-        self._token = _state.set(
-            _ActiveCheckpointRegion(region_state=self._region_state, phase=self._phase)
-        )
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> None:
-        try:
-            if (
-                (exc_type is None or _is_checkpoint_early_stop_exception(exc_type))
-                and self._phase is _Phase.RECOMPUTE
-                and not _keep_graph()
-            ):
-                _check_remat_tape_released_after_recompute(self._region_state)
-        finally:
-            if self._token is not None:
-                _state.reset(self._token)
-                self._token = None
+# Task-local so concurrent forwards don't clobber each other's hooks. Only the
+# store (forward) side reads this; the load side uses the unpack hook bound to
+# each slot at pack time, so we never rely on this contextvar propagating into
+# a separate backward/recompute thread.
+_active_saved_tensors_hooks: contextvars.ContextVar[
+    tuple[PackHook, UnpackHook] | None
+] = contextvars.ContextVar("torch_remat_saved_tensors_hooks", default=None)
 
 
-class _SaveForBackwardProxy:
-    """Capture decorator-body save_for_backward calls.
-
-    The proxy forwards arbitrary ctx attributes to the real autograd context so
-    decorator users can keep normal ctx.foo assignments, while intercepting only
-    save_for_backward to attach names before the real ctx sees the tensors.
-    """
-
-    _ctx: AutogradCtx
-    _saved_tensors: tuple[SavedTensor, ...] | None
-
-    def __init__(self, ctx: AutogradCtx) -> None:
-        object.__setattr__(self, "_ctx", ctx)
-        object.__setattr__(self, "_saved_tensors", None)
-
-    def save_for_backward(self, *tensors: SavedTensor) -> None:
-        self._saved_tensors = tensors
-
-    def named_saved_tensors(
-        self,
-        names: tuple[str, ...],
-    ) -> dict[str, SavedTensor]:
-        tensors = () if self._saved_tensors is None else self._saved_tensors
-        if len(names) != len(tensors):
-            raise RuntimeError(
-                "auto_forward save_for_backward names must match "
-                "ctx.save_for_backward tensor count"
-            )
-
-        return dict(zip(names, tensors))
-
-    def __getattr__(self, name: str) -> Any:
-        return object.__getattribute__(
-            object.__getattribute__(self, "_ctx"),
-            name,
-        )
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        if name.startswith("_"):
-            object.__setattr__(self, name, value)
-            return
-
-        setattr(self._ctx, name, value)
+# LIFO stack of reset tokens for the tokenless _push/_pop mutators below, so
+# _pop can restore the prior hooks without the caller threading a token through.
+# Task-local for the same reason as _active_saved_tensors_hooks: concurrent
+# forwards must not pop each other's tokens. Immutable tuple so ContextVar's
+# copy-on-set semantics hold.
+_saved_tensors_hooks_tokens: contextvars.ContextVar[tuple[contextvars.Token, ...]] = (
+    contextvars.ContextVar("torch_remat_saved_tensors_hooks_tokens", default=())
+)
 
 
-def _return_like_args(
-    args: tuple[torch.Tensor, ...],
-) -> torch.Tensor | tuple[torch.Tensor, ...]:
-    """Return one tensor as itself, or multiple tensors as a tuple."""
-
-    if len(args) == 1:
-        return args[0]
-    return args
-
-
-def _expect_record(
-    region_state: _CheckpointRegionState,
-    op_name: str,
-) -> _OpRecord:
-    """Return a forward record by name or raise."""
-
-    record = region_state.records.get(op_name)
-    if record is None:
-        raise RuntimeError(
-            f"No saved torch_remat op record for {_display_name(region_state, op_name)}"
-        )
-
-    return record
-
-
-def _expect_policy_record(
-    region_state: _CheckpointRegionState,
-    op_name: str,
-    policy: CheckpointPolicy,
-    caller: str,
-) -> _OpRecord:
-    """Return a high-level op record with an established policy."""
-
-    record = region_state.records.get(op_name)
-    if record is None or record.policy is None:
-        raise RuntimeError(
-            f"{caller} must follow maybe_load_saved or save_for_backward for {op_name}"
-        )
-
-    if record.policy is not policy:
-        raise RuntimeError(
-            f"Conflicting checkpoint policies for {_display_name(region_state, op_name)} "
-            f"during recompute: forward used {record.policy.name}, "
-            f"recompute used {policy.name}"
-        )
-
-    return record
-
-
-def _get_or_create_policy_record(
-    region_state: _CheckpointRegionState,
-    op_name: str,
-    policy: CheckpointPolicy,
-) -> _OpRecord:
-    """Return an op record and establish its checkpoint policy."""
-
-    record = region_state.records.get(op_name)
-    if record is None:
-        record = _OpRecord(op_name=op_name)
-        region_state.records[op_name] = record
-    if record.policy is not None and record.policy is not policy:
-        raise RuntimeError(
-            f"Conflicting checkpoint policies for {_display_name(region_state, op_name)}"
-        )
-
-    record.policy = policy
-    return record
-
-
-def _claim_handle_name(
-    active_state: _ActiveCheckpointRegion,
-    op_name: str,
+def _push_saved_tensors_hooks(
+    pack_hook: PackHook,
+    unpack_hook: UnpackHook,
 ) -> None:
-    """Record one handle retrieval in the current checkpoint phase."""
+    """Raw mutator: install ``(pack_hook, unpack_hook)`` until a matching
+    :func:`_pop_saved_tensors_hooks`.
 
-    if op_name in active_state.handle_names:
+    Prefer the :func:`saved_tensors_hooks` context manager. This exists for
+    callers whose install and uninstall span two methods (e.g. a manager's
+    ``__enter__`` / ``__exit__``) and so cannot hold a single ``with`` block.
+    Calls must nest LIFO -- each ``_pop`` undoes the most recent ``_push``.
+    """
+    token = _active_saved_tensors_hooks.set((pack_hook, unpack_hook))
+    _saved_tensors_hooks_tokens.set(_saved_tensors_hooks_tokens.get() + (token,))
+
+
+def _pop_saved_tensors_hooks() -> None:
+    """Raw mutator: undo the most recent :func:`_push_saved_tensors_hooks`."""
+    tokens = _saved_tensors_hooks_tokens.get()
+    if not tokens:
         raise RuntimeError(
-            "Duplicate torch_remat handle retrieval for "
-            f"{_display_name(active_state.region_state, op_name)} "
-            f"during {active_state.phase.name.lower()}"
+            "_pop_saved_tensors_hooks called without a matching _push_saved_tensors_hooks"
         )
-
-    active_state.handle_names.add(op_name)
-
-
-def _make_placeholder_tensor(
-    metadata: _TensorMetadata,
-    message: str,
-    *,
-    requires_grad: bool = False,
-) -> torch.Tensor:
-    """Return a shaped placeholder whose tensor-data access raises."""
-
-    placeholder = _PlaceholderTensor(metadata, message, requires_grad=requires_grad)
-    _set_placeholder_storage_data_ptr_error(placeholder)
-    return placeholder
+    token = tokens[-1]
+    _saved_tensors_hooks_tokens.set(tokens[:-1])
+    _active_saved_tensors_hooks.reset(token)
 
 
-def _set_placeholder_storage_data_ptr_error(tensor: _PlaceholderTensor) -> None:
-    """Make data_ptr access on placeholder storage raise the remat diagnostic."""
+@contextlib.contextmanager
+def saved_tensors_hooks(
+    pack_hook: PackHook,
+    unpack_hook: UnpackHook,
+) -> Iterator[None]:
+    """Apply hooks that trigger when tensors are saved in forwards for load in
+    recompute/backward.
 
-    torch._C._set_storage_data_ptr_access_error_msg(
-        tensor.untyped_storage()._cdata,
-        _placeholder_message(tensor),
+    The remat analogue of ``torch.autograd.graph.saved_tensors_hooks``:
+    ``pack_hook(tensor) -> packed`` runs for every tensor which is saved for
+    recompute/backward (this is both normal `save_for_backward` tensors as
+    well as outputs of SAVE regions which are needed for RECOMPUTE regions),
+    and ``unpack_hook(packed) -> tensor`` at each load.  The autograd API
+    cannot be used for this, as saved tensor hooks are not compositional and
+    you will override the saved tensor hooks that ``torch_remat`` uses for
+    its functionality.
+
+    Although saved tensor hooks are a versatile mechanism, we originally
+    designed this with the intent that it can be used for activation
+    offloading type use cases.
+
+    There are two important behavioral differences from traditional autograd
+    hooks which need to be emphasized:
+
+    1. If you want to run some code before any unpack hooks are triggered,
+       you should do so at the start of the forward logic in ``remat.checkpoint``
+       when ``remat.is_recomputing()``.  This is because saved output unpack
+       hooks will trigger during recompute phase, before we start executing
+       backwards.  Don't use an autograd function, this will be too late!
+
+    2. Unpack hooks are not guaranteed to run in reverse order of pack hooks;
+       indeed, unpack hooks for saved outputs will always trigger in the same
+       order as their pack hooks, before all other hooks (as they are needed
+       in the same order for forwards.)
+
+    Args:
+        pack_hook (Callable[[Tensor], Any]): Runs once for every tensor saved
+            for recompute/backward (both ordinary ``save_for_backward`` tensors
+            and SAVE-region outputs needed by a RECOMPUTE region), returning an
+            opaque payload that autograd holds in place of the tensor -- so the
+            original may be dropped or offloaded.
+        unpack_hook (Callable[[Any], Tensor]): Runs at each load, taking the
+            payload ``pack_hook`` returned and reconstructing the tensor. Bound
+            per-save, so it fires with the payload it packed even after the
+            ``with`` block has exited.
+
+    Yields:
+        None: The hooks apply to saves that occur within the ``with`` block.
+    """
+
+    _push_saved_tensors_hooks(pack_hook, unpack_hook)
+    try:
+        yield
+    finally:
+        _pop_saved_tensors_hooks()
+
+
+# --------------------------------------------------------------------------
+# SAVE-op records and record lifecycle
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class _SaveRecord:
+    """Per remat.op information (metadata and tensors) generated during
+    forward that is needed for recompute.  Note that not every Tensor saved
+    between forward and recompute is stored here.
+
+    When you SAVE a remat.op, so that it doesn't reexecute during recompute,
+    we need to record three main pieces of information to actually run
+    recompute and backwards later:
+
+    - The tensors that are `save_for_backward`, for obvious reasons!
+      These actually aren't stored in this record: we keep them directly as
+      saved tensors in the autograd graph, the way a normal tensor that is
+      saved for backwards would be saved (in principle, we could have saved it
+      in this record, but there are small benefits to keeping it in the
+      autograd graph, such as prompt deallocation of tensors saved for
+      backward if their autograd node goes dead).  For debugging purposes, we
+      do maintain a weak `saved_tensor_names` that lets us enumerate all tensors
+      we've saved for backwards.
+
+    - However, there is an exception to the above: if a tensor that is saved
+      for backward is an alias of an input tensor to the input region, AND
+      that input tensor comes from a RECOMPUTE region, we can avoid saving
+      it altogether since we can always rederive the alias at recompute time.
+      `saved_input_recipes` records the information to do this recomputation.
+      There's some special logic in the saved tensor hooks to divert
+      pack/unpack when this situation is detected.
+
+    - Normally, autograd doesn't save the output of an operation (unless it
+      is specifically needed for backwards).  But if the output of a SAVE
+      region passes to a RECOMPUTE region, we must save it so we can run
+      the recompute!  `output_slots` records tensors we've saved in this way.
+      Additionally, if it turns out an output of a SAVE region doesn't need
+      to be used for anything in recompute (e.g., it passes to a SAVE region),
+      we still need to construct a placeholder for it, since we do have to
+      return *something*; `output_schema` records this information.
+
+    There's no corresponding _RecomputeRecord, because we never save anything
+    on a RECOMPUTE op.  A RECOMPUTE op can induce a prior SAVE op to need to
+    save some outputs it wouldn't have needed to save otherwise (SAVE-RECOMPUTE
+    crossing), but it's always "producer's responsibility" to save a tensor for
+    backwards.  Each output of a SAVE op has a `persist_output` thunk that a
+    consumer calls if it turns out to need that output; calling it fills in the
+    corresponding `output_slots` entry on the producer's record.
+
+    This struct only holds durable state that is needed during recompute; there's also
+    some transient state in `_SaveOpForwardScratch` that we use for bookkeeping within
+    the forward execution of a SAVE remat.op only.
+    """
+
+    # Region-relative name for this op.
+    op_name: str
+
+    # --- Metadata about save_for_backward tensors
+    # The actual tensors are stored in the autograd graph; however, remat
+    # supports reporting how much memory was saved for backwards without
+    # reference to the autograd graph, so we keep (weakly) track of every
+    # tensor that was saved in the op so we can enumerate them.  If you use
+    # `remat.save_for_backward`, you also get to attach names to saved
+    # tensors (otherwise they get defaulted names), which makes reports more
+    # readable.  NB: this does NOT include save for backward tensors that are
+    # aliases of RECOMPUTE inputs, because those don't get saved at all! (so no
+    # weak tensor to key on).
+    saved_tensor_names: MutableMapping[torch.Tensor, str] = field(
+        default_factory=WeakTensorKeyDictionary
     )
 
+    # --- Metadata about save_for_backward tensors that are aliases of RECOMPUTE inputs
+    # See _SavedInputRecipe for details.  The order of this list doesn't
+    # matter (it's populated in the order inputs are saved for backwards.)
+    saved_input_recipes: list[_SavedInputRecipe] = field(default_factory=list)
 
-def _placeholder_message(tensor: _PlaceholderTensor) -> str:
-    """Return the diagnostic message carried by one placeholder."""
+    # --- Metadata about outputs, and saved output tensors needed for recompute
+    # The "schema" of the output, specifying metadata of the tensors and the
+    # concrete values of all non-Tensor outputs, so we can reconstruct the
+    # output during recompute to continue eager execution.
+    output_schema: _OutputSchema | None = None
 
-    message = object.__getattribute__(tensor, _REPORT_PLACEHOLDER_MESSAGE_ATTR)
-    assert isinstance(message, str)
-    return message
+    # Outputs that are saved for recompute, so we can produce an output tensor
+    # of a SAVE region that will be needed for RECOMPUTE.  This is indexed by
+    # flattened position order in `output_schema`.  Not all outputs will be
+    # saved, only the ones consumed by RECOMPUTE regions.
+    #
+    # Note that outputs saved for recompute DO trigger saved tensor hooks, see
+    # :func:`saved_tensors_hooks` for more details.
+    output_slots: dict[int, _OutputSlot] = field(default_factory=dict)
 
 
-def _placeholder_message_from_args(
+@dataclass
+class _SaveOpForwardScratch:
+    """Forward-only pack bookkeeping for one SAVE op, discarded when its forward returns."""
+
+    # Every time a tensor is saved for backwards, and it wasn't directly named
+    # using ``remat.save_for_backward``, we assign it a fresh name per this
+    # counter.  Note this counter is per-op!
+    unnamed_save_counter: int = 0
+
+    # Names attached via ``remat.save_for_backward``, keyed weakly by tensor
+    # identity. Weak keys never pin the tensor, so no entry can form the gc-invisible
+    # Node <-> payload cycle a strong ref would (nor need a teardown to break it), and
+    # a dead tensor's entry drops itself before its id can be recycled. The whole map
+    # is discarded with this scratch when the op's forward returns, so a name can
+    # neither leak onto another op's saves nor onto the user's tensor (as a setattr
+    # tag would).
+    pending_save_names: WeakTensorKeyDictionary = field(
+        default_factory=WeakTensorKeyDictionary
+    )
+
+    # Storages of this op's identity-hook (resident) saves, weakly held. An output
+    # whose storage is in here is already kept alive by autograd for backward, so it
+    # is persisted eagerly (see :func:`_prepare_outputs`) at no memory cost.
+    saved_identity_storages: set[StorageWeakRef] = field(default_factory=set)
+
+
+# --------------------------------------------------------------------------
+# Op dispatch: forward and recompute entry points
+# --------------------------------------------------------------------------
+
+
+def _run_save_op(
+    state: _ActiveCheckpointRegion,
+    name: str,
+    function: Callable[..., Any],
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
-) -> str:
-    """Return a placeholder message from dispatch inputs."""
+) -> Output:
+    """Run (forward) or skip (recompute) a SAVE op.
 
-    for value in pytree.tree_leaves((args, kwargs)):
-        if isinstance(value, _PlaceholderTensor):
-            return _placeholder_message(value)
+    Forward installs a nested ``saved_tensors_hooks`` that shadows checkpoint's
+    hooks. The pack hook sorts each saved tensor into one of three fates:
 
-    return "Attempted to use a torch_remat placeholder tensor"
+    * a RECOMPUTE-sourced input (or a view of one) is *not* retained -- replay
+      reproduces it, so pack records a rebuild recipe instead (this is what
+      avoids pinning an upstream RECOMPUTE output just because we saved it);
+    * with user :func:`saved_tensors_hooks` installed, delegate to them
+      (autograd holds the packed payload, so the tensor can be offloaded);
+    * otherwise identity: the tensor stays a normal autograd saved tensor on
+      the original forward graph, and remat keeps only a weak report-only name.
 
+    Recompute skips the call and returns each output from its persisted value,
+    or a placeholder when none was saved (see :func:`_load_saved_outputs`).
+    """
 
-def _release_record_after_recompute_if_needed(record: _OpRecord) -> None:
-    """Release remat-owned state once recompute has transferred ownership."""
-
-    if _keep_graph():
-        return
-
-    # At this point SAVE-policy tensors have been copied into recompute ctx and
-    # RECOMPUTE-policy tensors were produced in the replay graph. Clearing the
-    # remat tape here matches PyTorch's default non-retained backward lifetime.
-    record.tensor_slots.clear()
-    record.saved_for_backward_names.clear()
-    record.output_metadata = ()
-    record.native_sac_tensors.clear()
-    record.native_op_counts.clear()
-    record.native_sac_contexts = None
-    record.released = True
-
-
-def _is_checkpoint_early_stop_exception(
-    exc_type: type[BaseException] | None,
-) -> bool:
-    """Return whether an exception is PyTorch checkpoint's early-stop signal."""
-
-    if exc_type is None:
-        return False
-
-    from torch.utils.checkpoint import _StopRecomputationError
-
-    return issubclass(exc_type, _StopRecomputationError)
-
-
-def _check_remat_tape_released_after_recompute(
-    region_state: _CheckpointRegionState,
-) -> None:
-    """Raise if recompute exited while the remat tape still owns entries."""
-
-    unreleased_records = [
-        record
-        for record in region_state.records.values()
-        if _record_retains_tape(record)
-    ]
-    if not unreleased_records:
-        return
-
-    # Import locally to avoid a module import cycle; reporting imports private
-    # structures from this module.
-    from torch_remat._reporting import _format_memory_report
-
-    region = (
-        region_state.region_name
-        if region_state.region_name is not None
-        else "<unnamed>"
-    )
-    lines = [
-        "torch_remat checkpoint region "
-        f"{region} finished recompute with unreleased remat tape entries.",
-        "This usually means forward recorded saved tensors for an op that was "
-        "not executed during recompute, often because PyTorch checkpoint "
-        "early-stop skipped work that backward did not need.",
-        "Unreleased records:",
-    ]
-    lines.extend(
-        f"  {_display_name(region_state, record.op_name)}: "
-        f"{_format_unreleased_record_summary(record)}"
-        for record in unreleased_records
-    )
-    lines.append("Retained memory report:")
-    lines.append(_format_memory_report(region_state))
-    raise RuntimeError("\n".join(lines))
-
-
-def _record_retains_tape(record: _OpRecord) -> bool:
-    """Return whether a record still owns tape state after recompute."""
-
-    return bool(
-        record.tensor_slots
-        or record.saved_for_backward_names
-        or record.output_metadata
-        or record.native_sac_tensors
-        or record.native_op_counts
-        or record.native_sac_contexts is not None
-    )
-
-
-def _format_unreleased_record_summary(record: _OpRecord) -> str:
-    """Format one unreleased record for the recompute-exit diagnostic."""
-
-    pieces: list[str] = []
-    if record.policy is not None:
-        pieces.append(f"policy={record.policy.name}")
-    if record.tensor_slots:
-        pieces.append(
-            "saved_tensors="
-            + ",".join(
-                f"{name}({_format_saved_tensor_slot(slot)})"
-                for name, slot in record.tensor_slots.items()
+    region_state = state.region_state
+    if state.phase is _Phase.RECOMPUTE:
+        record = region_state.records.get(name)
+        if record is None:
+            raise RuntimeError(
+                f"No SAVE op record for {_display_name(region_state, name)} during "
+                "recompute; forward and recompute followed different code paths (or the "
+                "op's policy differs between them)"
             )
+        if record.saved_input_recipes:
+            _rederive_saved_inputs(record, region_state, args, kwargs)
+        return _load_saved_outputs(record, region_state)
+
+    # The wrapper's duplicate-name check is phase-local; this guards the cross-phase
+    # records dict against a phase-dispatch bug clobbering the forward record.
+    assert name not in region_state.records, (
+        f"torch_remat internal error: a SAVE record for {name!r} already exists"
+    )
+    record = _SaveRecord(op_name=name)
+    region_state.records[name] = record
+    scratch = _SaveOpForwardScratch()
+
+    args, kwargs, input_infos = _unwrap_and_snapshot_inputs(region_state, args, kwargs)
+
+    def pack(tensor: torch.Tensor) -> object:
+        # Resolve the report name before branching on the save's fate, so the
+        # unnamed-save counter advances in pack order and a save's saved.<i> label
+        # doesn't shift depending on whether saved-tensor hooks are installed.
+        name = _resolve_save_name(scratch, tensor)
+
+        # A recompute-sourced saved input, or any saved view (whose base is always
+        # non-stub), is not retained: replay reproduces it, so record a rebuild recipe
+        # instead. A SAVE-sourced stub input is not reproduced by replay, so it falls
+        # through and is retained like any other save.
+        match = _classify_saved_input(tensor, input_infos)
+        if match is not None:
+            info, view_spec = match
+            if view_spec is not None or not info.is_stub:
+                slot_name = f"saved_input.{len(record.saved_input_recipes)}"
+                record.saved_input_recipes.append(
+                    _SavedInputRecipe(
+                        path=info.path,
+                        slot_name=slot_name,
+                        view_spec=view_spec,
+                        name=name,
+                    )
+                )
+                return _SavedInputRef(slot_name)
+
+        # User remat-level saved-tensor hooks: autograd holds the packed payload (the
+        # original tensor may be dropped, e.g. offloaded). No version check and no
+        # memory-report row -- the payload is opaque. The hook gets a *detached*
+        # tensor (same storage/version), like the persist-output path: a payload
+        # that retains the tensor (e.g. an identity pack) must not close the
+        # gc-invisible C++ Node <-> payload cycle that _default_pack's detach
+        # breaks -- without this, an op saving its own output through such a hook
+        # leaks the graph if dropped without backward.
+        hooks = _active_saved_tensors_hooks.get()
+        if hooks is not None:
+            pack_hook, unpack_hook = hooks
+            return _SavedHookData(pack_hook(tensor.detach()), unpack_hook)
+
+        # Default (identity hook): the tensor stays a normal autograd saved tensor.
+        return _default_pack(record, scratch, tensor, name)
+
+    def unpack(saved: object) -> torch.Tensor:
+        if isinstance(saved, _SavedInputRef):
+            return _load_saved_input(record, region_state, saved.slot_name)
+        if isinstance(saved, _SavedHookData):
+            # Restore via the pair that packed it -- works even after the user's
+            # hook scope has exited.
+            return saved.unpack_hook(saved.packed)
+        assert isinstance(saved, _SavedTensor), saved
+        return _default_unpack(region_state, record, saved)
+
+    # Expose the forward scratch so save_for_backward (called inside the body) can
+    # name this op's saves.
+    token = _active_save_op.set(scratch)
+    try:
+        with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+            output = function(*args, **kwargs)
+    finally:
+        _active_save_op.reset(token)
+
+    validated_output = _validate_output(output, reject_leaves_for=(region_state, name))
+    _record_output_schema(record, validated_output)
+    return _prepare_outputs(region_state, record, scratch, validated_output)
+
+
+def _run_recompute_op(
+    state: _ActiveCheckpointRegion,
+    name: str,
+    function: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> Output:
+    """Run a RECOMPUTE op in both phases.
+
+    On the original forward, an input that is an upstream SAVE op's output triggers
+    that producer's persist-output thunk (so the skipped producer can reproduce it on
+    replay) and is unwrapped to the grad-connected real for the body. During recompute
+    the op simply reruns: skipped producers have already returned real outputs into
+    the replay dataflow, so it holds no tape state and needs no substitution of its own.
+    """
+
+    region_state = state.region_state
+    if state.phase is _Phase.RECOMPUTE:
+        if name in region_state.records:
+            raise RuntimeError(
+                f"Conflicting checkpoint policies for {_display_name(region_state, name)}: "
+                "the forward ran it as SAVE but recompute runs it as RECOMPUTE"
+            )
+        return _validate_output(function(*args, **kwargs))
+
+    # Forward. Any SAVE-output input must trigger its producer's persist-output thunk.
+    # A wrapping strategy (subclass / proxy) additionally hands the body a carrier we
+    # must unwrap to the grad-connected real, rebuilding the arg pytree; a plain-output
+    # strategy leaves SAVE outputs as real tensors, so we only walk for the
+    # persist-output side effect and pass args through.
+    if region_state.bare_op_strategy.wraps_outputs:
+
+        def consume(_token: PathToken, leaf: object) -> object:
+            handle = _save_output_handle(region_state, leaf)
+            if handle is None:
+                return leaf
+            handle.persist_output()
+            return handle.unwrap(leaf)
+
+        args, kwargs = map_arg_leaves(consume, args, kwargs)
+    else:
+        for _token, leaf in iter_arg_leaves(args, kwargs):
+            handle = _save_output_handle(region_state, leaf)
+            if handle is not None:
+                handle.persist_output()
+
+    return _validate_output(
+        function(*args, **kwargs), reject_leaves_for=(region_state, name)
+    )
+
+
+# --------------------------------------------------------------------------
+# SAVE op forward: inputs, saved tensors, outputs
+# --------------------------------------------------------------------------
+
+
+def _unwrap_and_snapshot_inputs(
+    region_state: _CheckpointRegionState,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> tuple[tuple[Any, ...], dict[str, Any], list[_InputInfo]]:
+    """Unwrap a SAVE op's upstream-SAVE-output inputs and snapshot their layout.
+
+    An input that is another SAVE op's output (found via the region's save-output
+    index) is marked a *stub*: it is not reproduced by recompute, so pack must retain
+    a saved copy rather than divert it to a rebuild recipe. Any other input is
+    reproduced by replay. Unlike a RECOMPUTE consumer, this does NOT trigger the
+    producer's persist-output thunk -- a skipped SAVE op does not rerun on replay, so
+    its body needs no reproduced input.
+
+    The snapshot is plain data (weak storage ref, no tensor reference), so the pack
+    closure -- which outlives this call on the autograd graph -- keeps no input alive;
+    pack classifies each saved tensor against it by storage. As in
+    :func:`_run_recompute_op`, a wrapping strategy also unwraps each stub to its
+    grad-connected real (rebuilding the arg pytree); a plain strategy passes args
+    through untouched.
+    """
+
+    _assert_phase(_Phase.FORWARD)
+
+    wraps_outputs = region_state.bare_op_strategy.wraps_outputs
+    infos: list[_InputInfo] = []
+
+    def visit(token: PathToken, leaf: object) -> object:
+        handle = _save_output_handle(region_state, leaf)
+        is_stub = handle is not None
+        if is_stub and wraps_outputs:
+            leaf = handle.unwrap(leaf)
+        if isinstance(leaf, torch.Tensor) and not _is_placeholder(leaf):
+            infos.append(
+                _InputInfo(
+                    path=token,
+                    storage_ref=weakref.ref(leaf.untyped_storage()),
+                    dtype=leaf.dtype,
+                    shape=tuple(leaf.shape),
+                    stride=tuple(leaf.stride()),
+                    storage_offset=leaf.storage_offset(),
+                    version=leaf._version,
+                    is_stub=is_stub,
+                )
+            )
+        return leaf
+
+    if wraps_outputs:
+        new_args, new_kwargs = map_arg_leaves(visit, args, kwargs)
+        return new_args, new_kwargs, infos
+    for token, leaf in iter_arg_leaves(args, kwargs):
+        visit(token, leaf)
+    return args, kwargs, infos
+
+
+def _resolve_save_name(scratch: _SaveOpForwardScratch, tensor: torch.Tensor) -> str:
+    """Return the report name for a tensor a SAVE op saved for backward.
+
+    The :func:`save_for_backward` name recorded in this op's forward scratch for the
+    exact tensor object, else a positional ``saved.<i>`` from the op's unnamed-save
+    counter.
+    """
+
+    _assert_phase(_Phase.FORWARD)
+
+    name = scratch.pending_save_names.get(tensor)
+    if name is not None:
+        return name
+    name = f"saved.{scratch.unnamed_save_counter}"
+    scratch.unnamed_save_counter += 1
+    return name
+
+
+def _default_pack(
+    record: _SaveRecord,
+    scratch: _SaveOpForwardScratch,
+    tensor: torch.Tensor,
+    name: str,
+) -> _SavedTensor:
+    """Default pack for a SAVE saved tensor: hand autograd an ordinary *detached* copy.
+
+    Detaching matters: when an op saves one of its *own* outputs, handing autograd the
+    live grad_fn-bearing tensor closes a C++ ``Node`` <-> ``TensorImpl`` refcount cycle
+    (through the hook payload) that Python's gc cannot reclaim, so a graph dropped
+    without a backward would leak. This is the Python equivalent of autograd's own
+    ``tensor_data()`` cycle-break. The grad_fn-less tensor handed back at backward is
+    fine because remat does not support double backward through a SAVE op.
+
+    The payload also carries the save-time version for the in-place guard (see
+    :func:`_default_unpack`); the report ``name`` goes in the weak report-only index.
+    """
+
+    _assert_phase(_Phase.FORWARD)
+
+    saved = tensor.detach()
+    record.saved_tensor_names[saved] = name
+    # Note this tensor's storage (shared with the original) as resident, so an output
+    # sharing it can be eagerly persisted (see :func:`_prepare_outputs`).
+    scratch.saved_identity_storages.add(StorageWeakRef(saved.untyped_storage()))
+    return _SavedTensor(saved, saved._version)
+
+
+def _prepare_outputs(
+    region_state: _CheckpointRegionState,
+    record: _SaveRecord,
+    scratch: _SaveOpForwardScratch,
+    output: Output,
+) -> Output:
+    """Return a SAVE op's outputs, representing each per the region's bare-op strategy.
+
+    ``strategy.make_output`` builds the forward stand-in for each output: ``value`` is
+    what the op returns to its caller, and ``handle`` is registered in
+    ``region_state.save_output_index`` under ``value`` -- unless it is ``None`` (the
+    proxy, which self-identifies by type). Downstream consumers identify SAVE outputs
+    uniformly through :func:`torch_remat._region._save_output_handle`.
+
+    An output that is *itself* saved for backward (its storage is in
+    ``scratch.saved_identity_storages``) is persisted eagerly. It is resident for
+    backward anyway, so this costs no extra memory and lets a bare consumer of it work
+    during recompute even without an opt-in strategy.
+    """
+
+    strategy = region_state.bare_op_strategy
+
+    def make(index: int, real: torch.Tensor) -> tuple[Any, _SaveOutputHandle | None]:
+        # Weak ref + lazy snapshot (see _PersistOutputThunk), so a SAVE output nothing
+        # consumes is never pinned alive by its own persist-output thunk.
+        persist_output = _PersistOutputThunk(
+            record=record, slot_index=index, output_ref=weakref.ref(real)
         )
-    if record.output_metadata:
-        pieces.append(f"output_placeholders={len(record.output_metadata)}")
-    if record.native_sac_tensors:
-        pieces.append(f"native_saved_outputs={len(record.native_sac_tensors)}")
-    if record.native_sac_contexts is not None:
-        pieces.append("native_sac_contexts=live")
-    return " ".join(pieces)
+        value, handle = strategy.make_output(real, persist_output)
+        if StorageWeakRef(real.untyped_storage()) in scratch.saved_identity_storages:
+            persist_output()  # saved for backward, so resident anyway -- persist eagerly
+        return value, handle
+
+    tensors = _output_tensors(output)
+
+    if not strategy.wraps_outputs:
+        # Plain strategy: values are the real tensors, container unchanged -- register
+        # only. Two output positions returning the *same* tensor collapse onto one
+        # index key, so merge the handles: each position owns its own tape slot, and
+        # consuming the shared value must persist all of them.
+        for index, real in enumerate(tensors):
+            _value, handle = make(index, real)
+            existing = region_state.save_output_index.get(real)
+            if existing is not None:
+                handle = _merge_save_output_handles(existing, handle)
+            region_state.save_output_index[real] = handle
+        return output
+
+    # Wrapping strategy: each output becomes a distinct carrier (never colliding in
+    # the index, so no merge) -- rebuild the container around them.
+    returned: list[Any] = []
+    for index, real in enumerate(tensors):
+        value, handle = make(index, real)
+        if handle is not None:
+            region_state.save_output_index[value] = handle
+        returned.append(value)
+    if isinstance(output, torch.Tensor):
+        return returned[0]
+    return (list if isinstance(output, list) else tuple)(returned)
 
 
-def _format_saved_tensor_slot(slot: _SavedTensorSlot) -> str:
-    """Format one saved tensor slot for diagnostics."""
+@dataclass
+class _PersistOutputThunk:
+    """Callable that records one SAVE output on the tape, once (producer responsibility).
 
-    tensor = slot.tensor
+    A SAVE op is skipped during recompute, so any consumer that needs its output during
+    replay fires this thunk during the forward: a bare consumer via the detection
+    strategy, a ``remat.op`` consumer via the handle, or the eager persist of an
+    output that is itself saved for backward.
+    All consumer kinds share one tape slot, the output's position.
+
+    The output is referenced *weakly* and snapshotted (detached) only when called:
+    every consumer holds the output live at the moment it fires this, and until then
+    nothing pins it -- a SAVE output consumed by nothing is freed after the forward
+    rather than kept resident to backward. A dead weakref means no consumer, so the
+    call is a no-op.
+
+    When a remat saved-tensor hook is installed, the persisted value is packed through
+    it (offload); otherwise it is held resident.
+    """
+
+    record: _SaveRecord
+    slot_index: int
+    output_ref: weakref.ReferenceType[torch.Tensor]
+
+    def __call__(self) -> None:
+        if self.slot_index in self.record.output_slots:
+            return
+        real = self.output_ref()
+        if real is None:
+            return
+        detached = real.detach()
+        hooks = _active_saved_tensors_hooks.get()
+        if hooks is not None:
+            # Bind the matching unpack hook to the slot so replay reloads via the pair
+            # that packed it, not whatever hooks are active at load time.
+            pack_hook, unpack_hook = hooks
+            self.record.output_slots[self.slot_index] = _OutputSlot(
+                tensor=None,
+                version=None,
+                packed=pack_hook(detached),
+                unpack_hook=unpack_hook,
+                requires_grad=real.requires_grad,
+                is_leaf=real.is_leaf,
+            )
+            return
+        self.record.output_slots[self.slot_index] = _OutputSlot(
+            tensor=detached,
+            version=detached._version,
+            requires_grad=real.requires_grad,
+            is_leaf=real.is_leaf,
+        )
+
+
+def _record_output_schema(record: _SaveRecord, output: Output) -> None:
+    """Record a SAVE op's boundary output metadata and report labels on ``record``."""
+
+    tensors = _output_tensors(output)
+    container: type | None = None
+    if not isinstance(output, torch.Tensor):
+        container = list if isinstance(output, list) else tuple
+    record.output_schema = _OutputSchema(
+        container=container,
+        specs=tuple(
+            _OutputSpec(
+                metadata=_TensorMetadata(
+                    shape=tuple(tensor.shape),
+                    stride=tuple(tensor.stride()),
+                    dtype=tensor.dtype,
+                    device=tensor.device,
+                    storage_nbytes=tensor.untyped_storage().nbytes(),
+                ),
+                requires_grad=tensor.requires_grad,
+            )
+            for tensor in tensors
+        ),
+    )
+
+
+# --------------------------------------------------------------------------
+# SAVE op recompute: reload saved values and reproduce outputs
+# --------------------------------------------------------------------------
+
+
+def _rederive_saved_inputs(
+    record: _SaveRecord,
+    region_state: _CheckpointRegionState,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> None:
+    """Fill recompute-sourced saved-input slots during a skipped SAVE replay.
+
+    The op's saved inputs were not retained in the forward; capture their values
+    now from the reproduced args -- detached, so the throwaway recompute graph is
+    not kept alive -- for the op's unpack hook to hand back at backward. A saved
+    view is rebuilt from the reproduced base with ``as_strided``.
+
+    Load-bearing invariant: this fires only if replay actually reaches this
+    skipped op. That holds because ``_TriggerCheckpointRecompute`` at the region
+    output is the highest-index checkpoint holder, so the first backward unpack
+    forces a full replay before any saved-input unpack reads a slot. A change
+    that lets recompute stop earlier would silently skip rederiving them.
+    """
+
+    _assert_phase(_Phase.RECOMPUTE)
+
+    leaves_by_path = dict(iter_arg_leaves(args, kwargs))
+    captured_slots: dict[str, torch.Tensor] = {}
+    for recipe in record.saved_input_recipes:
+        captured = leaves_by_path[recipe.path]
+        if _is_placeholder(captured):
+            raise RuntimeError(
+                f"{_display_name(region_state, record.op_name)} (policy SAVE) saved "
+                f"an input ({recipe.name}) for backward that recompute was expected to "
+                "reproduce, but it replays as a placeholder. The saved input is a bare "
+                "(unwrapped) view or derivative of an upstream SAVE op's output, "
+                "which is not reproduced during recompute. Wrap that producer in "
+                "remat.op(..., policy=RECOMPUTE) so its output is real during "
+                "replay."
+            )
+        if recipe.view_spec is None:
+            value = captured.detach()
+        else:
+            value = _rebuild_saved_view(
+                region_state, record.op_name, captured, recipe.view_spec
+            )
+        captured_slots[recipe.slot_name] = value
+    # Replace the op's whole entry so a re-replay (retain_graph) starts from fresh values.
+    region_state.recompute_saved_inputs[record.op_name] = captured_slots
+
+
+def _load_saved_outputs(
+    record: _SaveRecord, region_state: _CheckpointRegionState
+) -> Output:
+    """Return a skipped SAVE op's outputs during recompute, preserving the container.
+
+    A persisted output is reproduced straight from the tape into the replay dataflow,
+    with its autograd metadata restored so a downstream op rebuilds the same backward
+    node (and its holders refill) it did on the forward. An output with no saved
+    value -- genuinely dead -- is a storage-free placeholder that raises if its data
+    is actually read.
+    """
+
+    _assert_phase(_Phase.RECOMPUTE)
+
+    schema = record.output_schema
+    if schema is None:
+        raise RuntimeError(
+            f"No output metadata available for "
+            f"{_display_name(region_state, record.op_name)}"
+        )
+
+    # Free each output slot as it is served, except under retain_graph where a later
+    # backward replays and reads it again. Outside a backward graph task the C++
+    # accessor returns True (conservative "keep"), so no extra guard is needed.
+    pop = not torch._C._autograd._get_current_graph_task_keep_graph()  # type: ignore[attr-defined]
+    display_name = _display_name(region_state, record.op_name)
+    outputs: list[torch.Tensor] = []
+    for index, spec in enumerate(schema.specs):
+        slot = record.output_slots.get(index)
+        if slot is not None:
+            loaded = _load_output_slot(
+                record.output_slots,
+                region_state,
+                record.op_name,
+                index,
+                pop=pop,
+            )
+            outputs.append(
+                _fabricate_recompute_input(
+                    loaded, requires_grad=slot.requires_grad, is_leaf=slot.is_leaf
+                )
+            )
+            continue
+
+        source = (
+            f"{display_name}."
+            f"{_output_name(index, is_sequence=schema.container is not None)}"
+        )
+        placeholder = _make_placeholder_tensor(
+            spec.metadata,
+            _placeholder_message_text(source, display_name),
+            requires_grad=spec.requires_grad,
+        )
+        if spec.requires_grad:
+            # Make the placeholder non-leaf with a fresh grad_fn (saving
+            # nothing) so a consumer that builds on it during replay sees the
+            # same autograd shape the original output had.
+            placeholder = _MakeNonLeaf.apply(placeholder)
+        outputs.append(placeholder)
+
+    if schema.container is None:
+        return outputs[0]
+    return schema.container(outputs)
+
+
+def _load_output_slot(
+    slots: dict[int, _OutputSlot],
+    region_state: _CheckpointRegionState,
+    op_name: str,
+    index: int,
+    *,
+    pop: bool = False,
+) -> torch.Tensor:
+    """Load one persisted SAVE-output tensor by its output position.
+
+    A slot is either resident (holds a live tensor, checked against its recorded
+    version counter for in-place mutation -- PyTorch's own guard does not fire for
+    tensors packed through custom hooks) or offloaded (recovered through the unpack
+    hook bound at pack time). ``pop`` deletes the slot after loading so the tensor
+    is freed as soon as replay serves it; the caller passes ``pop=False`` under
+    ``retain_graph=True``, where a later backward reads the slot again.
+    """
+
+    name = _output_slot_name(index)
+    slot = slots.get(index)
+    if slot is None:
+        saved_names = ", ".join(_output_slot_name(i) for i in sorted(slots)) or "(none)"
+        raise RuntimeError(
+            f"No saved tensor {name} for "
+            f"{_display_name(region_state, op_name)} "
+            f"(saved tensors: {saved_names}). "
+            "This usually means forward and recompute followed different code paths."
+        )
+    unpack_hook = slot.unpack_hook
+    if unpack_hook is not None:
+        tensor = unpack_hook(slot.packed)
+    else:
+        tensor = slot.tensor
+        assert tensor is not None  # resident slots always hold a real tensor
+        if slot.version is not None and tensor._version != slot.version:
+            raise RuntimeError(
+                f"Saved tensor {name} for "
+                f"{_display_name(region_state, op_name)} was modified in-place "
+                "after it was saved"
+            )
+    if pop:
+        del slots[index]
+    return tensor
+
+
+def _load_saved_input(
+    record: _SaveRecord,
+    region_state: _CheckpointRegionState,
+    slot_name: str,
+) -> torch.Tensor:
+    """Return a saved input's recompute-materialized value for the op's unpack hook.
+
+    :func:`_rederive_saved_inputs` filled the region's recompute buffer when replay
+    reached the skipped op; a missing entry means replay never reached it. Not popped:
+    it may back more than one saved-tensor reference, and is rebuilt each replay
+    under ``retain_graph``.
+    """
+
+    slots = region_state.recompute_saved_inputs.get(record.op_name)
+    tensor = slots.get(slot_name) if slots is not None else None
     if tensor is None:
-        return "None"
-    return f"shape={tuple(tensor.shape)} dtype={tensor.dtype} device={tensor.device}"
+        saved_names = ", ".join(slots) if slots else "(none)"
+        raise RuntimeError(
+            f"No saved input {slot_name} for "
+            f"{_display_name(region_state, record.op_name)} "
+            f"(saved inputs: {saved_names}). "
+            "This usually means forward and recompute followed different code paths."
+        )
+    return tensor
+
+
+def _default_unpack(
+    region_state: _CheckpointRegionState,
+    record: _SaveRecord,
+    packed: _SavedTensor,
+) -> torch.Tensor:
+    """Return the detached SAVE copy autograd kept, re-checking for in-place mutation.
+
+    Autograd's native version-counter guard does not fire for tensors packed through
+    custom ``saved_tensors_hooks``, so compare the save-time version ourselves. The
+    report index is consulted only to name the tensor in the error; a miss there
+    degrades the message, never the check.
+    """
+
+    tensor = packed.tensor
+    if tensor._version != packed.version:
+        name = record.saved_tensor_names.get(tensor, "(unknown)")
+        raise RuntimeError(
+            f"Saved tensor {name} for "
+            f"{_display_name(region_state, record.op_name)} was modified "
+            "in-place after it was saved"
+        )
+    return tensor
+
+
+def _fabricate_recompute_input(
+    tensor: torch.Tensor,
+    *,
+    requires_grad: bool,
+    is_leaf: bool,
+) -> torch.Tensor:
+    """Return a recompute stand-in reproducing the saved input's autograd metadata.
+
+    ``requires_grad`` (captured at save time) must match so the RECOMPUTE op rebuilds
+    its backward node and its ``save_for_backward`` packs refill checkpoint's holders.
+    A requires-grad input is always non-leaf here -- a remat.op never yields a
+    requires-grad *leaf* (see :func:`_reject_grad_leaf`) -- so it gets a fresh
+    grad_fn via :class:`_MakeNonLeaf` (which saves nothing, so it adds no checkpoint pack);
+    ``is_leaf`` is carried only to assert that invariant.
+    """
+
+    base = tensor.detach()
+    if not requires_grad:
+        # Non-requires-grad tensors are always leaves; nothing more to reproduce.
+        return base
+    base.requires_grad_(True)
+    assert not is_leaf, "a requires-grad recompute input must be non-leaf"
+    return _MakeNonLeaf.apply(base)
+
+
+class _MakeNonLeaf(torch.autograd.Function):
+    """Identity that makes its output non-leaf via a fresh grad_fn that saves nothing.
+
+    Used during recompute to turn a tape-loaded SAVE output into a non-leaf
+    requires-grad tensor without emitting any save_for_backward pack -- so the
+    downstream RECOMPUTE op builds its backward node (and its holders fill)
+    without desyncing checkpoint's saved-tensor counter.
+
+    This node is fabricated only while recompute rebuilds the forward graph, and
+    non-reentrant checkpoint discards that graph once it has refilled saved
+    tensors. Its backward must therefore never run; reaching it means the
+    synthetic node leaked into the real backward graph, so it raises rather than
+    silently passing gradient through.
+    """
+
+    @staticmethod
+    def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
+        del ctx
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+        del ctx, grad_output
+        raise RuntimeError(
+            "torch_remat internal error: _MakeNonLeaf.backward was invoked. This "
+            "synthetic autograd node exists only to reproduce a saved tensor's "
+            "autograd metadata during recompute and must never be "
+            "backpropagated through."
+        )
+
+
+# --------------------------------------------------------------------------
+# Shared output and validation helpers
+# --------------------------------------------------------------------------
+
+
+_OP_OUTPUT_TYPE_MESSAGE = (
+    "remat.op function must return a Tensor, or a tuple or list of Tensors"
+)
+
+
+def _validate_output(
+    output: Any,
+    reject_leaves_for: tuple[_CheckpointRegionState, str] | None = None,
+) -> Output:
+    """Check a remat op returned a Tensor, or a one-hop tuple/list of Tensors.
+
+    Returns the output unchanged. When ``reject_leaves_for`` (the ``(region_state,
+    op_name)`` of an eager forward op) is given, the same walk also rejects a
+    requires-grad *leaf* output (see :func:`_reject_grad_leaf`); the recompute rerun
+    passes ``None`` since leaf rejection already ran on the forward.
+    """
+
+    if isinstance(output, torch.Tensor):
+        if reject_leaves_for is not None:
+            _reject_grad_leaf(output, reject_leaves_for)
+        return output
+    if isinstance(output, (tuple, list)):
+        for leaf in output:
+            if not isinstance(leaf, torch.Tensor):
+                raise RuntimeError(_OP_OUTPUT_TYPE_MESSAGE)
+            if reject_leaves_for is not None:
+                _reject_grad_leaf(leaf, reject_leaves_for)
+        return output
+    raise RuntimeError(_OP_OUTPUT_TYPE_MESSAGE)
+
+
+def _reject_grad_leaf(
+    tensor: torch.Tensor, region_and_op: tuple[_CheckpointRegionState, str]
+) -> None:
+    """Raise if a remat.op returned a requires-grad *leaf* (a graph endpoint).
+
+    An ``autograd.Function`` or any differentiable op always gives its output a grad_fn, so a
+    requires-grad leaf out of a remat.op means it wrapped a bare allocation (e.g.
+    ``torch.zeros(..., requires_grad=True)``) rather than a real computation. That has no
+    legitimate use inside a checkpoint region -- the value is disconnected from the region's
+    inputs -- and it makes recompute's autograd shape ambiguous, so we reject it rather than
+    silently reproduce it.
+    """
+
+    if tensor.requires_grad and tensor.is_leaf:
+        region_state, op_name = region_and_op
+        raise RuntimeError(
+            f"{_display_name(region_state, op_name)} returned a leaf tensor that "
+            "requires grad (a requires_grad tensor with no grad_fn). A remat.op "
+            "must return the result of a real computation; this usually means it "
+            "wrapped a bare allocation like torch.zeros(..., requires_grad=True). "
+            "Move the allocation outside the checkpoint region (or do not wrap it "
+            "in remat.op)."
+        )
+
+
+def _output_tensors(output: Output) -> tuple[torch.Tensor, ...]:
+    """Return output tensors in return-schema order.
+
+    ``output`` is validated to a Tensor or a flat tuple/list of Tensors, so every
+    value leaf is a Tensor.
+    """
+
+    return cast("tuple[torch.Tensor, ...]", value_leaves(output))
+
+
+def _output_name(index: int, *, is_sequence: bool) -> str:
+    """Return the canonical report name for one output position."""
+
+    if not is_sequence:
+        return "out"
+    return str(index)
+
+
+def _output_slot_name(index: int) -> str:
+    """Render a persisted output slot's report/error name from its position index.
+
+    Display only (memory reports, error messages); slots are keyed by the raw int.
+    """
+
+    return f"output.{index}"
 
 
 def _validate_name(name: str, *, what: str) -> None:
@@ -1764,47 +1376,3 @@ def _validate_name(name: str, *, what: str) -> None:
 
     if not name:
         raise ValueError(f"torch_remat {what} must be non-empty")
-
-
-def _validate_trace_scope_text(text: str, *, what: str) -> None:
-    """Validate user-facing trace scope text."""
-
-    if not isinstance(text, str):
-        raise RuntimeError(f"torch_remat {what} must be a string")
-    if not text:
-        raise ValueError(f"torch_remat {what} must be non-empty")
-
-
-def _display_name(region_state: _CheckpointRegionState, op_name: str) -> str:
-    """Render a diagnostic op name, including the checkpoint region."""
-
-    if region_state.region_name is None:
-        return op_name
-
-    return f"{region_state.region_name}::{op_name}"
-
-
-def _output_tensors(output: Output) -> tuple[torch.Tensor, ...]:
-    """Return output tensors in return-schema order."""
-
-    if isinstance(output, torch.Tensor):
-        return (output,)
-    return output
-
-
-def _output_name(index: int, *, output_is_tuple: bool) -> str:
-    """Return the canonical report name for one output position."""
-
-    if not output_is_tuple:
-        return "out"
-    return str(index)
-
-
-def _expect_state() -> _ActiveCheckpointRegion:
-    """Return the active checkpoint state or raise a useful error."""
-
-    state = _state.get()
-    if state is None:
-        raise RuntimeError("No active torch_remat checkpoint region")
-
-    return state
