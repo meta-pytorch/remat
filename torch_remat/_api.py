@@ -237,14 +237,18 @@ def op(
     granularity of an autograd function, since this gives you the most accurate
     reporting of where save-for-backward costs are going.
 
-    Tensor inputs and outputs follow ``autograd.Function`` / ATen conventions --
-    a Tensor, or a *one-hop* ``tuple`` / ``list`` of Tensors -- deliberately not
-    full pytree (nor ``dict``). Arguments are walked leniently: anything else
-    (a ``dict``, a custom object, deeper nesting) is an opaque leaf handed to
-    ``function`` untouched -- but a ``SAVE`` output smuggled that way was never
-    seen by remat, so a ``RECOMPUTE`` consumer of it meets a placeholder error
-    during recompute rather than at the call. The *return* is validated
-    strictly: a non-Tensor or nested return raises ``RuntimeError``.
+    Tensor inputs and outputs follow ATen conventions -- a Tensor, or a
+    *one-hop* ``tuple`` / ``list`` of Tensors -- deliberately not full pytree
+    (nor ``dict``). Arguments are walked leniently: anything else (a ``dict``, a
+    custom object, deeper nesting) is an opaque leaf handed to ``function``
+    untouched. That leniency has a cost: if an upstream ``SAVE`` op's output is
+    hidden inside such a leaf, remat's argument walk never finds it and so never
+    arranges for the producer to persist it. A ``RECOMPUTE`` consumer of that
+    output then gets the skipped producer's stand-in placeholder instead of real
+    data, which raises -- but only during recompute (inside backward), not at
+    this call, so keep SAVE outputs at the top level or one hop deep. The
+    *return* is validated strictly: a non-Tensor or nested return raises
+    ``RuntimeError``.
 
     NB: if you smuggle an input into the callable (e.g., via a global or via a
     closure), you had better ensure that it is available/recomputed in
@@ -1064,7 +1068,7 @@ def _rederive_saved_inputs(
             )
         captured_slots[recipe.slot_name] = value
     # Replace the op's whole entry so a re-replay (retain_graph) starts from fresh values.
-    region_state.recompute_saved_inputs[record.op_name] = captured_slots
+    region_state.rederived_saved_inputs[record.op_name] = captured_slots
 
 
 def _load_saved_outputs(
@@ -1190,7 +1194,7 @@ def _load_saved_input(
     under ``retain_graph``.
     """
 
-    slots = region_state.recompute_saved_inputs.get(record.op_name)
+    slots = region_state.rederived_saved_inputs.get(record.op_name)
     tensor = slots.get(slot_name) if slots is not None else None
     if tensor is None:
         saved_names = ", ".join(slots) if slots else "(none)"

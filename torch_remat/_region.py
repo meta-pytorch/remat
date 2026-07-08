@@ -86,7 +86,7 @@ class _CheckpointRegionState:
     # its entry (``_rederive_saved_inputs``) and the op's unpack hook reads it
     # (``_load_saved_input``). Each op's entry is fully replaced per replay, so a
     # ``retain_graph`` backward gets fresh values.
-    recompute_saved_inputs: dict[str, dict[str, torch.Tensor]] = field(
+    rederived_saved_inputs: dict[str, dict[str, torch.Tensor]] = field(
         default_factory=dict
     )
 

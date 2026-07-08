@@ -382,7 +382,7 @@ class LifetimeTest(expecttest.TestCase):
                     self.assertEqual([], list(consumer_record.saved_input_recipes))
                     self.assertEqual([], list(consumer_record.output_slots))
                     self.assertEqual(1, len(consumer_record.saved_tensor_names))
-                    self.assertEqual({}, active.region_state.recompute_saved_inputs)
+                    self.assertEqual({}, active.region_state.rederived_saved_inputs)
                     del out
 
         # And it produces correct gradients end to end.
