@@ -9,7 +9,7 @@
 """Tests for the ``remat.checkpoint`` region wrapper: option/user-kwarg isolation,
 forward-exception state unwinding, trace collection, forced recompute before an inner
 custom backward, the one-hop pytree rules at the region boundary, the
-forward/recompute phase helpers, and the default save-policy release /
+forward/recompute phase helpers, and the default saved-tensor release /
 ``retain_graph`` behavior."""
 
 from __future__ import annotations
@@ -53,10 +53,10 @@ class CheckpointTest(expecttest.TestCase):
                 return grad_output
 
         def failing_body(x: torch.Tensor) -> torch.Tensor:
-            return remat.op(
+            return remat.region(
                 FailingForward.apply,
                 "failing.forward",
-                policy=remat.SAVE,
+                recompute=False,
             )(x)
 
         caught_exception: RuntimeError | None = None
@@ -88,10 +88,10 @@ class CheckpointTest(expecttest.TestCase):
                 return grad_output * 2 * x
 
         def followup_body(x: torch.Tensor) -> torch.Tensor:
-            return remat.op(
+            return remat.region(
                 FollowupSquare.apply,
                 "followup.square",
-                policy=remat.SAVE,
+                recompute=False,
             )(x)
 
         x = torch.tensor([2.0], requires_grad=True)
@@ -104,15 +104,15 @@ class CheckpointTest(expecttest.TestCase):
 
     def test_collect_trace_records_original_forward_annotations(self) -> None:
         def scope_body(x: torch.Tensor) -> torch.Tensor:
-            y = remat.op(
+            y = remat.region(
                 torch.sin,
                 "sin",
-                policy=remat.SAVE,
+                recompute=False,
             )(x)
-            return remat.op(
+            return remat.region(
                 torch.cos,
                 "cos",
-                policy=remat.RECOMPUTE,
+                recompute=True,
             )(y)
 
         def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
@@ -132,8 +132,8 @@ class CheckpointTest(expecttest.TestCase):
             """\
 torch_remat trace
 scope [test_flag]
-  sin: SAVE
-  cos: RECOMPUTE""",
+  sin: save
+  cos: recompute""",
         )
 
     def test_checkpoint_forces_recompute_before_inner_custom_backward(self) -> None:
@@ -302,10 +302,10 @@ inner_backward_after_unpack""",
                 return grad_output * 2 * x
 
         def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
-            return remat.op(
+            return remat.region(
                 SavedTensorProbe.apply,
                 "saved.probe",
-                policy=remat.SAVE,
+                recompute=False,
             )(x)
 
         x = torch.tensor([2.0, 3.0], requires_grad=True)
@@ -337,10 +337,10 @@ inner_backward_after_unpack""",
                 return grad_output * 2 * x
 
         def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
-            return remat.op(
+            return remat.region(
                 RetainGraphSquare.apply,
                 "retain.square",
-                policy=remat.SAVE,
+                recompute=False,
             )(x)
 
         x = torch.tensor([2.0, 3.0], requires_grad=True)

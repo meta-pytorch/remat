@@ -8,17 +8,15 @@
 
 """Reporting-only diagnostic tracing for torch_remat checkpoint regions.
 
-:func:`collect_trace` records the :func:`torch_remat.op` annotations and
+:func:`collect_trace` records the :func:`torch_remat.region` annotations and
 :func:`trace_scope` hierarchy seen during one original forward, for inspection and
-debugging. Tracing never changes rematerialization behavior, op names, or
-checkpoint policies, and recomputation is skipped so replayed work is not
+debugging. Tracing never changes rematerialization behavior, region names, or
+recompute settings, and recomputation is skipped so replayed work is not
 double-counted.
 
 This module depends only on the region/phase plumbing in :mod:`torch_remat._region`;
 the core (:mod:`torch_remat._api`) imports the recording hook from here, so the
-dependency runs one way (``_api`` -> ``_trace`` -> ``_region``) with no cycle. The
-sole reference back to ``_api`` is the :class:`~torch_remat._api.CheckpointPolicy`
-annotation, kept under ``TYPE_CHECKING`` so it is never imported at runtime.
+dependency runs one way (``_api`` -> ``_trace`` -> ``_region``) with no cycle.
 """
 
 from __future__ import annotations
@@ -27,12 +25,9 @@ import contextlib
 import contextvars
 from dataclasses import dataclass, field
 from functools import wraps
-from typing import Callable, Iterator, ParamSpec, TYPE_CHECKING, TypeVar
+from typing import Callable, Iterator, ParamSpec, TypeVar
 
 from torch_remat._region import is_recomputing
-
-if TYPE_CHECKING:
-    from torch_remat._api import CheckpointPolicy
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -40,10 +35,10 @@ _R = TypeVar("_R")
 
 @dataclass
 class OpTrace:
-    """One remat op observed by diagnostic tracing."""
+    """One remat region observed by diagnostic tracing."""
 
     name: str
-    policy: CheckpointPolicy | None
+    recompute: bool
 
 
 @dataclass
@@ -84,7 +79,7 @@ _active_trace: contextvars.ContextVar[RematTrace | None] = contextvars.ContextVa
 def collect_trace() -> Iterator[RematTrace]:
     """Collect a reporting-only trace of remat annotations.
 
-    Records calls to :func:`op` and :func:`trace_scope`
+    Records calls to :func:`region` and :func:`trace_scope`
     during the original forward. Recomputation is skipped so reports do not
     double-count replayed work.
 
@@ -110,8 +105,8 @@ def trace_scope(
 ) -> Callable[_P, _R]:
     """Add a diagnostic hierarchy scope to the active op trace.
 
-    Reporting-only: it does not change rematerialization behavior, op names, or
-    checkpoint policies.
+    Reporting-only: it does not change rematerialization behavior, region names, or
+    recompute settings.
 
     Args:
         function (Callable): The callable to wrap, used unmodified. Ops and
@@ -160,14 +155,14 @@ def trace_scope(
 def _record_trace_op(
     name: str,
     *,
-    policy: CheckpointPolicy | None,
+    recompute: bool,
 ) -> None:
-    """Append an op to the active trace, if tracing original forward."""
+    """Append a region to the active trace, if tracing original forward."""
 
     trace = _active_trace.get()
     if trace is None or is_recomputing():
         return
-    trace._current_entries().append(OpTrace(name=name, policy=policy))
+    trace._current_entries().append(OpTrace(name=name, recompute=recompute))
 
 
 def _append_trace_entry(
@@ -184,7 +179,7 @@ def _append_trace_entry(
             _append_trace_entry(lines, child, indent=indent + 1)
         return
 
-    details = entry.policy.name if entry.policy is not None else "op"
+    details = "recompute" if entry.recompute else "save"
     lines.append(f"{prefix}{entry.name}: {details}")
 
 

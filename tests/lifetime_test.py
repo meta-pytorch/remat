@@ -6,11 +6,11 @@
 
 # pyre-strict
 
-"""Tests for retention and GC semantics across policy crossings: a RECOMPUTE op retains
-none of its original saved tensors, a saved-own-output is freed without gc, and the
-RECOMPUTE/SAVE producer-consumer chains keep or drop the producer output exactly as
-the tape model requires -- plus dead SAVE outputs are freed and SAVE saved tensors
-live on autograd, not the tape."""
+"""Tests for retention and GC semantics across recompute/save crossings: a
+recompute=True region retains none of its original saved tensors, a saved-own-output
+is freed without gc, and the recompute/save producer-consumer chains keep or drop the
+producer output exactly as the tape model requires -- plus dead saved outputs are
+freed and saved tensors live on autograd, not the tape."""
 
 from __future__ import annotations
 
@@ -52,10 +52,10 @@ class LifetimeTest(expecttest.TestCase):
                 return grad_output * 2
 
         def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
-            return remat.op(
+            return remat.region(
                 SavedTensorLifetimeProbe.apply,
                 "saved.tensor.lifetime",
-                policy=remat.RECOMPUTE,
+                recompute=True,
             )(x)
 
         x = torch.tensor([2.0, 3.0], requires_grad=True)
@@ -97,8 +97,8 @@ class LifetimeTest(expecttest.TestCase):
                 return grad_output * 2
 
         def region(x: torch.Tensor) -> torch.Tensor:
-            return remat.op(
-                SavesOwnOutput.apply, "saves.own.output", policy=remat.SAVE
+            return remat.region(
+                SavesOwnOutput.apply, "saves.own.output", recompute=False
             )(x)
 
         was_enabled = gc.isenabled()
@@ -146,8 +146,8 @@ class LifetimeTest(expecttest.TestCase):
                     return grad_output * 2
 
             def region(x: torch.Tensor) -> torch.Tensor:
-                return remat.op(
-                    SavesOwnOutput.apply, "saves.own.output", policy=remat.SAVE
+                return remat.region(
+                    SavesOwnOutput.apply, "saves.own.output", recompute=False
                 )(x)
 
             with remat.saved_tensors_hooks(lambda t: t, lambda t: t):
@@ -190,8 +190,8 @@ class LifetimeTest(expecttest.TestCase):
                     return grad_output * 2
 
             def region(x: torch.Tensor) -> torch.Tensor:
-                return remat.op(
-                    SavesOwnOutput.apply, "saves.own.output", policy=remat.SAVE
+                return remat.region(
+                    SavesOwnOutput.apply, "saves.own.output", recompute=False
                 )(x)
 
             with remat.saved_tensors_hooks(pack, lambda index: stash[cast(int, index)]):
@@ -242,15 +242,15 @@ class LifetimeTest(expecttest.TestCase):
                 return grad_output * torch.ones_like(x)
 
         def checkpointed_region(x: torch.Tensor) -> torch.Tensor:
-            y = remat.op(
+            y = remat.region(
                 Producer.apply,
                 "producer",
-                policy=remat.RECOMPUTE,
+                recompute=True,
             )(x)
-            return remat.op(
+            return remat.region(
                 Consumer.apply,
                 "consumer",
-                policy=remat.RECOMPUTE,
+                recompute=True,
             )(y)
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
@@ -305,15 +305,15 @@ class LifetimeTest(expecttest.TestCase):
                 return grad_output * 2 * y
 
         def region(x: torch.Tensor) -> torch.Tensor:
-            y = remat.op(
+            y = remat.region(
                 Producer.apply,
                 "producer",
-                policy=remat.RECOMPUTE,
+                recompute=True,
             )(x)
-            return remat.op(
+            return remat.region(
                 Consumer.apply,
                 "consumer",
-                policy=remat.SAVE,
+                recompute=False,
             )(y)
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
@@ -358,8 +358,8 @@ class LifetimeTest(expecttest.TestCase):
                 return grad_output * 2 * y
 
         def consumes_save(x: torch.Tensor) -> torch.Tensor:
-            y = remat.op(ProducerSave.apply, "producer", policy=remat.SAVE)(x)
-            return remat.op(ConsumerSave.apply, "consumer", policy=remat.SAVE)(y)
+            y = remat.region(ProducerSave.apply, "producer", recompute=False)(x)
+            return remat.region(ConsumerSave.apply, "consumer", recompute=False)(y)
 
         # Introspect the forward: the stub input lands on the autograd-owned
         # attribution index, not on the consumer's tape.
@@ -419,10 +419,10 @@ class LifetimeTest(expecttest.TestCase):
             return y * 2
 
         def region(x: torch.Tensor) -> torch.Tensor:
-            y = remat.op(ProducerSave.apply, "producer", policy=remat.SAVE)(x)
-            a = remat.op(bare, "bare", policy=remat.RECOMPUTE)(y)
-            b = remat.op(in_list, "in_list", policy=remat.RECOMPUTE)([y])
-            c = remat.op(in_kwargs, "in_kwargs", policy=remat.RECOMPUTE)(y=y)
+            y = remat.region(ProducerSave.apply, "producer", recompute=False)(x)
+            a = remat.region(bare, "bare", recompute=True)(y)
+            b = remat.region(in_list, "in_list", recompute=True)([y])
+            c = remat.region(in_kwargs, "in_kwargs", recompute=True)(y=y)
             return a + b + c
 
         # Introspect the forward: the producer holds the single durably saved output.0,
@@ -468,7 +468,7 @@ class LifetimeTest(expecttest.TestCase):
         forward_context, _ = _checkpoint_context_fn("blk")
         x = torch.tensor([2.0, 3.0], requires_grad=True)
         with forward_context:
-            y = remat.op(Probe.apply, "probe", policy=remat.SAVE)(x)
+            y = remat.region(Probe.apply, "probe", recompute=False)(x)
             active = _state.get()
             assert active is not None
             record = active.region_state.records["probe"]
@@ -525,8 +525,8 @@ class LifetimeTest(expecttest.TestCase):
 
                 def region(x: torch.Tensor) -> torch.Tensor:
                     nonlocal aux_ref
-                    main, aux = remat.op(
-                        TwoOutputSave.apply, "twoout", policy=remat.SAVE
+                    main, aux = remat.region(
+                        TwoOutputSave.apply, "twoout", recompute=False
                     )(x)
                     if not remat.is_recomputing():
                         # Weakref the real produced tensor (the wrapper's inner for the

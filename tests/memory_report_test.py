@@ -58,8 +58,8 @@ class MemoryReportTest(expecttest.TestCase):
             return t * 2
 
         def region(x: torch.Tensor) -> torch.Tensor:
-            y = remat.op(ProducerSave.apply, "producer", policy=remat.SAVE)(x)
-            return remat.op(consumer, "consumer", policy=remat.RECOMPUTE)(y)
+            y = remat.region(ProducerSave.apply, "producer", recompute=False)(x)
+            return remat.region(consumer, "consumer", recompute=True)(y)
 
         forward_context, _ = _checkpoint_context_fn("layers.0")
         with forward_context:
@@ -69,7 +69,7 @@ class MemoryReportTest(expecttest.TestCase):
                 """\
 layers.0: 8 B resident in 1 storage(s)
 layers.0::producer: 8 B
-        8 B  output.0               (2,)       float32  cpu    SAVE""",
+        8 B  output.0               (2,)       float32  cpu""",
             )
 
     def test_memory_report_folds_exact_alias_save_and_output(self) -> None:
@@ -95,7 +95,7 @@ layers.0::producer: 8 B
         forward_context, _ = _checkpoint_context_fn("layers.0")
         with forward_context:
             # Hold the output so the SAVE saves stay live for the report.
-            out = remat.op(Sq.apply, "sq", policy=remat.SAVE)(
+            out = remat.region(Sq.apply, "sq", recompute=False)(
                 torch.tensor([1.0, 2.0], requires_grad=True)
             )
             self.assertExpectedInline(
@@ -103,8 +103,8 @@ layers.0::producer: 8 B
                 """\
 layers.0: 16 B resident in 2 storage(s)
 layers.0::sq: 16 B
-        8 B  y = output.0           (2,)       float32  cpu    SAVE
-        8 B  gf                     (2,)       float32  cpu    SAVE""",
+        8 B  y = output.0           (2,)       float32  cpu
+        8 B  gf                     (2,)       float32  cpu""",
             )
             self.assertEqual((2,), tuple(out.shape))
 
@@ -131,7 +131,7 @@ layers.0::sq: 16 B
 
         forward_context, _ = _checkpoint_context_fn("layers.0")
         with forward_context:
-            out = remat.op(TwoViews.apply, "attn", policy=remat.SAVE)(
+            out = remat.region(TwoViews.apply, "attn", recompute=False)(
                 torch.ones(2, 3, requires_grad=True)
             )
             self.assertExpectedInline(
@@ -139,9 +139,9 @@ layers.0::sq: 16 B
                 """\
 layers.0: 96 B resident in 1 storage(s)
 layers.0::attn: 96 B
-       96 B  base of q, k                      float32  cpu    SAVE   ! held for 64 B of 96 B
-          - q          view (2, 4)     SAVE      spans 32 B
-          - k          view (2, 4)     SAVE      spans 32 B""",
+       96 B  base of q, k                      float32  cpu      ! held for 64 B of 96 B
+          - q          view (2, 4)     spans 32 B
+          - k          view (2, 4)     spans 32 B""",
             )
             self.assertEqual((2, 3), tuple(out.shape))
 
@@ -165,7 +165,7 @@ layers.0::attn: 96 B
 
         forward_context, _ = _checkpoint_context_fn("layers.0")
         with forward_context:
-            out = remat.op(OneSlice.apply, "op", policy=remat.SAVE)(
+            out = remat.region(OneSlice.apply, "op", recompute=False)(
                 torch.ones(3, requires_grad=True)
             )
             self.assertExpectedInline(
@@ -173,7 +173,7 @@ layers.0::attn: 96 B
                 """\
 layers.0: 40 B resident in 1 storage(s)
 layers.0::op: 40 B
-       40 B  v                      (4,)       float32  cpu    SAVE   ! held for 16 B of 40 B""",
+       40 B  v                      (4,)       float32  cpu      ! held for 16 B of 40 B""",
             )
             self.assertEqual((3,), tuple(out.shape))
 
@@ -195,7 +195,7 @@ layers.0::op: 40 B
 
         forward_context, _ = _checkpoint_context_fn("layers.0")
         with forward_context:
-            out = remat.op(SaveInputView.apply, "proj", policy=remat.SAVE)(
+            out = remat.region(SaveInputView.apply, "proj", recompute=False)(
                 torch.ones(2, 12, requires_grad=True)
             )
             self.assertExpectedInline(
@@ -229,7 +229,7 @@ layers.0: 0 B resident in 0 storage(s)
 
         forward_context, _ = _checkpoint_context_fn("blk")
         with forward_context:
-            out = remat.op(TwoShapes.apply, "op", policy=remat.SAVE)(
+            out = remat.region(TwoShapes.apply, "op", recompute=False)(
                 torch.tensor([1.0, 2.0, 3.0, 4.0], requires_grad=True)
             )
             report = remat.format_current_memory_report()
@@ -238,8 +238,8 @@ layers.0: 0 B resident in 0 storage(s)
                 """\
 blk: 16 B resident in 1 storage(s)
 blk::op: 16 B
-       16 B  a = output.0           (4,)       float32  cpu    SAVE
-          - av         view (2, 2)     SAVE      spans 16 B""",
+       16 B  a = output.0           (4,)       float32  cpu
+          - av         view (2, 2)     spans 16 B""",
             )
             self.assertEqual((4,), tuple(out.shape))
         # The differently-shaped view is a child, never folded into the ``=`` chain.
@@ -264,7 +264,7 @@ blk::op: 16 B
 
         forward_context, _ = _checkpoint_context_fn("blk")
         with forward_context:
-            out = remat.op(SaveInternal.apply, "op", policy=remat.SAVE)(
+            out = remat.region(SaveInternal.apply, "op", recompute=False)(
                 torch.ones(3, requires_grad=True)
             )
             del out  # drop the graph; the weakly-held save is collected
@@ -310,10 +310,10 @@ blk: 0 B resident in 0 storage(s)
 
         forward_context, _ = _checkpoint_context_fn("layers.0")
         with forward_context:
-            out_a = remat.op(Sq.apply, "sq", policy=remat.SAVE)(
+            out_a = remat.region(Sq.apply, "sq", recompute=False)(
                 torch.tensor([1.0, 2.0], requires_grad=True)
             )
-            out_b = remat.op(TwoViews.apply, "attn", policy=remat.SAVE)(
+            out_b = remat.region(TwoViews.apply, "attn", recompute=False)(
                 torch.ones(2, 3, requires_grad=True)
             )
             report = remat.format_current_memory_report()
@@ -342,10 +342,10 @@ blk: 0 B resident in 0 storage(s)
             # Hold the op output: its grad_fn now owns the SAVE saved tensors via
             # autograd (not the remat tape), so the report can see lse/probs only
             # while that graph is alive.
-            out = remat.op(
+            out = remat.region(
                 Probe.apply,
                 "attn.softmax",
-                policy=remat.SAVE,
+                recompute=False,
             )(x)
 
             self.assertExpectedInline(
@@ -353,7 +353,7 @@ blk: 0 B resident in 0 storage(s)
                 """\
 layers.0: 28 B resident in 2 storage(s)
 layers.0::attn.softmax: 28 B
-       12 B  lse                    (3,)       float32  cpu    SAVE
-       16 B  probs                  (4,)       float32  cpu    SAVE""",
+       12 B  lse                    (3,)       float32  cpu
+       16 B  probs                  (4,)       float32  cpu""",
             )
             self.assertEqual((1,), tuple(out.shape))

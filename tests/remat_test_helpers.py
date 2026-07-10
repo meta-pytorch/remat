@@ -43,9 +43,9 @@ def _numel(shape: tuple[int, ...]) -> int:
 # :mod:`torch_remat._bare_op._function_mode`). For a bare op consuming a SAVE output passed to
 # it as an argument -- what these behavioral tests exercise -- all four produce identical
 # observable behavior (gradients, tape slots); their internals are covered separately. They are
-# NOT identical for a SAVE output consumed *inside* a ``remat.op`` body via closure capture: the
+# NOT identical for a SAVE output consumed *inside* a ``remat.region`` body via closure capture: the
 # wrapper strategies (subclass, proxy) catch it, the modes (which are suppressed for the whole
-# ``remat.op`` body) miss it and raise a placeholder error during recompute. See the
+# ``remat.region`` body) miss it and raise a placeholder error during recompute. See the
 # ``_suppress_bare_op_detection`` note in :mod:`torch_remat._bare_op._common`.
 _BARE_OP_STRATEGIES: tuple[str, ...] = (
     "subclass",
@@ -58,8 +58,8 @@ _BARE_OP_STRATEGIES: tuple[str, ...] = (
 # Shared execution trace for the wedge test below. The ops and the toy offloader
 # append human-readable events here; _run_wedge_model resets it per run and joins
 # it into the string the test asserts with assertExpectedInline. _WEDGE_LABEL /
-# _WEDGE_POLICY carry the current op's region label + policy into the op's forward
-# (the wrapped forward(ctx, x) does not receive the op_name), set by each
+# _WEDGE_POLICY carry the current region's label + recompute mode into the op's
+# forward (the wrapped forward(ctx, x) does not receive the region name), set by each
 # _wedge_step right before the op runs -- safe because execution is synchronous.
 _WEDGE_TRACE: list[str] = []
 _WEDGE_LABEL: str = ""
@@ -168,23 +168,21 @@ class _WedgeRelu(torch.autograd.Function):
 
 
 def _wedge_step(  # pyre-ignore[3]
-    t: torch.Tensor, label: str, op: Any, policy: remat.CheckpointPolicy
+    t: torch.Tensor, label: str, op: Any, recompute: bool
 ):
     global _WEDGE_LABEL, _WEDGE_POLICY
     _WEDGE_LABEL = label
-    _WEDGE_POLICY = policy.name
-    return remat.op(op, label, policy=policy)(t)
+    _WEDGE_POLICY = "recompute" if recompute else "save"
+    return remat.region(op, label, recompute=recompute)(t)
 
 
 def _wedge_block_body(prefix: str):  # pyre-ignore[3]
-    """A SAVE -> RECOMPUTE -> SAVE wedge: Sq[SAVE] -> Relu[RECOMPUTE] -> Sq[SAVE]."""
+    """A save -> recompute -> save wedge: Sq[save] -> Relu[recompute] -> Sq[save]."""
 
     def body(t: torch.Tensor) -> torch.Tensor:
-        save = remat.SAVE
-        recompute = remat.RECOMPUTE
-        t = _wedge_step(t, f"{prefix}.in", _WedgeSq.apply, save)
-        t = _wedge_step(t, f"{prefix}.mid", _WedgeRelu.apply, recompute)
-        t = _wedge_step(t, f"{prefix}.out", _WedgeSq.apply, save)
+        t = _wedge_step(t, f"{prefix}.in", _WedgeSq.apply, recompute=False)
+        t = _wedge_step(t, f"{prefix}.mid", _WedgeRelu.apply, recompute=True)
+        t = _wedge_step(t, f"{prefix}.out", _WedgeSq.apply, recompute=False)
         return t
 
     return body

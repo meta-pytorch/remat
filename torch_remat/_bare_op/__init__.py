@@ -8,7 +8,7 @@
 
 """Bare-op detection strategies for a SAVE op's outputs.
 
-A *bare* consumer of a SAVE output -- one not wrapped in :func:`torch_remat.op` -- is
+A *bare* consumer of a SAVE output -- one not wrapped in :func:`torch_remat.region` -- is
 intercepted per ``checkpoint(..., detect_bare_ops=...)`` (default ``"subclass"``;
 ``False`` opts out). This package holds the four intercepting strategies plus their
 shared plumbing; :mod:`torch_remat._api` selects one via :mod:`._strategy` and

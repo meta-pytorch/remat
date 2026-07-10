@@ -31,7 +31,7 @@ class SavedTensorsHooksTest(expecttest.TestCase):
     def test_saved_tensors_hooks_fire_at_save_and_load_not_recompute(
         self,
     ) -> None:
-        # A SAVE-policy op routes its saved tensors through the active remat
+        # A recompute=False region routes its saved tensors through the active remat
         # saved_tensors_hooks. pack must fire once per saved tensor in the original
         # forward, unpack once per saved tensor when backward reads them back, and
         # pack must NOT fire again during recompute. A custom pack/unpack pair that
@@ -69,10 +69,10 @@ class SavedTensorsHooksTest(expecttest.TestCase):
                 return grad_output * two_x
 
         def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
-            return remat.op(
+            return remat.region(
                 Square.apply,
                 "sq",
-                policy=remat.SAVE,
+                recompute=False,
             )(x)
 
         x = torch.tensor([2.0, 3.0], requires_grad=True)
@@ -121,10 +121,10 @@ class SavedTensorsHooksTest(expecttest.TestCase):
                 return grad_output * two_x
 
         def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
-            return remat.op(
+            return remat.region(
                 Square.apply,
                 "sq",
-                policy=remat.SAVE,
+                recompute=False,
             )(x)
 
         x = torch.tensor([2.0, 3.0], requires_grad=True)
@@ -191,28 +191,28 @@ class SavedTensorsHooksTest(expecttest.TestCase):
             trace,
             """\
 == forward ==
-compute block.0.in [SAVE]
+compute block.0.in [save]
   pack t0 = block.0.in.gf
   pack t1 = block.0.in.y
-compute block.0.mid [RECOMPUTE]
-compute block.0.out [SAVE]
+compute block.0.mid [recompute]
+compute block.0.out [save]
   pack t2 = block.0.out.gf
   commit block.0: free []
-compute block.1.in [SAVE]
+compute block.1.in [save]
   pack t3 = block.1.in.gf
   pack t4 = block.1.in.y
-compute block.1.mid [RECOMPUTE]
-compute block.1.out [SAVE]
+compute block.1.mid [recompute]
+compute block.1.out [save]
   pack t5 = block.1.out.gf
   commit block.1: free [t0, t1, t2]
   flush: free [t3, t4, t5]
 == backward ==
   unpack t4 = block.1.in.y
-compute block.1.mid [RECOMPUTE] (recompute)
+compute block.1.mid [recompute] (recompute)
   unpack t5 = block.1.out.gf
   unpack t3 = block.1.in.gf
   unpack t1 = block.0.in.y
-compute block.0.mid [RECOMPUTE] (recompute)
+compute block.0.mid [recompute] (recompute)
   unpack t2 = block.0.out.gf
   unpack t0 = block.0.in.gf""",
         )
@@ -257,29 +257,29 @@ compute block.0.mid [RECOMPUTE] (recompute)
             trace,
             """\
 == forward ==
-compute block.0.in [SAVE]
+compute block.0.in [save]
   pack block.0.in.gf
   pack block.0.in.y
-compute block.0.mid [RECOMPUTE]
-compute block.0.out [SAVE]
+compute block.0.mid [recompute]
+compute block.0.out [save]
   pack block.0.out.gf
 offload block.0: D2H 3 tensors, free device
-compute block.1.in [SAVE]
+compute block.1.in [save]
   pack block.1.in.gf
   pack block.1.in.y
-compute block.1.mid [RECOMPUTE]
-compute block.1.out [SAVE]
+compute block.1.mid [recompute]
+compute block.1.out [save]
   pack block.1.out.gf
 offload block.1: D2H 3 tensors, free device
 == backward ==
 onload block.1: H2D 3 tensors
   unpack block.1.in.y
-compute block.1.mid [RECOMPUTE] (recompute)
+compute block.1.mid [recompute] (recompute)
   unpack block.1.out.gf
   unpack block.1.in.gf
 onload block.0: H2D 3 tensors
   unpack block.0.in.y
-compute block.0.mid [RECOMPUTE] (recompute)
+compute block.0.mid [recompute] (recompute)
   unpack block.0.out.gf
   unpack block.0.in.gf""",
         )
@@ -327,7 +327,7 @@ compute block.0.mid [RECOMPUTE] (recompute)
                 return grad_output * 2 * x
 
         def body(x: torch.Tensor) -> torch.Tensor:
-            return remat.op(Square.apply, "sq", policy=remat.RECOMPUTE)(x)
+            return remat.region(Square.apply, "sq", recompute=True)(x)
 
         leaf = torch.tensor([2.0, 3.0], requires_grad=True)
         region_input = leaf * 1.0  # non-leaf, so it is a real saved input

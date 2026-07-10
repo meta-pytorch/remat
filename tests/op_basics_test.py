@@ -6,10 +6,10 @@
 
 # pyre-strict
 
-"""Tests for the ``remat.op`` call surface and policy semantics: kwarg forwarding and
-state cleanup outside a region, non-callable / missing-name rejection, the SAVE
-default policy, SAVE running once vs RECOMPUTE rerunning its body, forward/recompute
-policy agreement, duplicate op-name detection, leaf-requires-grad rejection, and the
+"""Tests for the ``remat.region`` call surface and recompute semantics: kwarg
+forwarding and state cleanup outside a region, non-callable / missing-name rejection,
+recompute=False running once vs recompute=True rerunning its body, forward/recompute
+agreement, duplicate region-name detection, leaf-requires-grad rejection, and the
 identity node's backprop guard."""
 
 from __future__ import annotations
@@ -31,14 +31,14 @@ class OpBasicsTest(expecttest.TestCase):
         def scale(x: torch.Tensor, *, factor: float) -> torch.Tensor:
             return x * factor
 
-        # Outside a checkpoint region, op() is a transparent call that forwards
+        # Outside a checkpoint region, region() is a transparent call that forwards
         # positional and keyword arguments to the wrapped function and leaves no
         # active remat state behind.
         x = torch.tensor([2.0])
-        y = remat.op(
+        y = remat.region(
             scale,
             "scale",
-            policy=remat.RECOMPUTE,
+            recompute=True,
         )(x, factor=3.0)
 
         self.assertTrue(torch.equal(y, torch.tensor([6.0])))
@@ -48,10 +48,10 @@ class OpBasicsTest(expecttest.TestCase):
             raise RuntimeError("intentional failure")
 
         with self.assertRaisesRegex(RuntimeError, "intentional failure"):
-            remat.op(
+            remat.region(
                 fail,
                 "failure",
-                policy=remat.RECOMPUTE,
+                recompute=True,
             )()
 
         self.assertIsNone(_state.get())
@@ -61,29 +61,29 @@ class OpBasicsTest(expecttest.TestCase):
         # must be supplied to get past the signature and reach this check.
         with self.assertRaisesRegex(
             RuntimeError,
-            "op expects a function as its first argument",
+            "region expects a function as its first argument",
         ):
-            remat.op(
+            remat.region(
                 cast(Any, "context.style"),
                 "context.style",
-                policy=remat.RECOMPUTE,
+                recompute=True,
             )
-        # op_name is a required positional; omitting it is a plain TypeError.
+        # name is a required positional; omitting it is a plain TypeError.
         with self.assertRaises(TypeError):
-            remat.op(torch.sin, policy=remat.RECOMPUTE)
+            remat.region(torch.sin, recompute=True)
 
-    def test_op_policy_defaults_to_save(self) -> None:
-        # A checkpoint region recomputes by default, so an explicit op annotation
-        # defaults to SAVE. Only SAVE ops get a record, so a policy-less op that
-        # produces a record proves the default.
+    def test_recompute_false_produces_save_record(self) -> None:
+        # A checkpoint region recomputes everything by default; a recompute=False
+        # annotation is the exception that saves. Only saved regions get a record,
+        # so a recompute=False region that produces a record proves it saved.
         forward_context, _ = _checkpoint_context_fn("r")
         with forward_context:
-            remat.op(lambda t: t + 1, "defaulted")(
+            remat.region(lambda t: t + 1, "saved", recompute=False)(
                 torch.tensor([1.0], requires_grad=True)
             )
             active = _state.get()
             assert active is not None
-            self.assertIn("defaulted", active.region_state.records)
+            self.assertIn("saved", active.region_state.records)
 
     def test_save_op_runs_once_and_skips_recompute_body(self) -> None:
         class FunctionStyleSquare(torch.autograd.Function):
@@ -105,10 +105,10 @@ class OpBasicsTest(expecttest.TestCase):
                 return grad_output * 2 * x
 
         def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
-            return remat.op(
+            return remat.region(
                 FunctionStyleSquare.apply,
                 "function.style.square",
-                policy=remat.SAVE,
+                recompute=False,
             )(x)
 
         x = torch.tensor([2.0, 3.0], requires_grad=True)
@@ -134,10 +134,10 @@ class OpBasicsTest(expecttest.TestCase):
                 return grad_output * 2 * x
 
         def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
-            return remat.op(
+            return remat.region(
                 ReadmeSquare.apply,
                 "readme.square",
-                policy=remat.RECOMPUTE,
+                recompute=True,
             )(x)
 
         x = torch.tensor([2.0, 3.0], requires_grad=True)
@@ -147,7 +147,7 @@ class OpBasicsTest(expecttest.TestCase):
         self.assertEqual(2, ReadmeSquare.forward_runs)
         self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
 
-    def test_recompute_policy_must_match_forward_policy(self) -> None:
+    def test_recompute_setting_must_match_forward(self) -> None:
         class PolicyDrift(torch.autograd.Function):
             @staticmethod
             def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
@@ -161,27 +161,31 @@ class OpBasicsTest(expecttest.TestCase):
                 return grad_output * 2 * x
 
         def run(x: torch.Tensor) -> torch.Tensor:
-            policy = remat.RECOMPUTE if remat.is_recomputing() else remat.SAVE
-            return remat.op(PolicyDrift.apply, "policy.drift", policy=policy)(x)
+            # Drift the setting between phases: recompute=True on the replay,
+            # recompute=False on the original forward.
+            recompute = True if remat.is_recomputing() else False
+            return remat.region(PolicyDrift.apply, "policy.drift", recompute=recompute)(
+                x
+            )
 
         y = remat.checkpoint()(run)(torch.ones(1, requires_grad=True))
 
-        with self.assertRaisesRegex(RuntimeError, "Conflicting checkpoint policies"):
+        with self.assertRaisesRegex(RuntimeError, "Conflicting recompute settings"):
             y.sum().backward()
 
     def test_leaf_requires_grad_output_from_remat_op_errors(self) -> None:
-        # A remat.op that returns a requires-grad *leaf* (a bare allocation, not the
+        # A remat.region that returns a requires-grad *leaf* (a bare allocation, not the
         # result of a real computation) is rejected: an autograd.Function or a
         # differentiable op always gives its output a grad_fn, so a leaf here is
         # meaningless (disconnected from the region's inputs). Caught in the original
-        # forward, for both SAVE and RECOMPUTE ops.
+        # forward, for both recompute=False and recompute=True regions.
         def alloc(t: torch.Tensor) -> torch.Tensor:
             return torch.full_like(t, 2.0).requires_grad_(True)
 
         x = torch.randn(4, dtype=torch.float64, requires_grad=True)
 
         def save_block(x: torch.Tensor) -> torch.Tensor:
-            return remat.op(alloc, "alloc", policy=remat.SAVE)(x)
+            return remat.region(alloc, "alloc", recompute=False)(x)
 
         with self.assertRaisesRegex(
             RuntimeError, "returned a leaf tensor that requires grad"
@@ -189,7 +193,7 @@ class OpBasicsTest(expecttest.TestCase):
             remat.checkpoint()(save_block)(x)
 
         def recompute_block(x: torch.Tensor) -> torch.Tensor:
-            return remat.op(alloc, "alloc", policy=remat.RECOMPUTE)(x)
+            return remat.region(alloc, "alloc", recompute=True)(x)
 
         with self.assertRaisesRegex(
             RuntimeError, "returned a leaf tensor that requires grad"
@@ -219,15 +223,15 @@ class OpBasicsTest(expecttest.TestCase):
                 (x,) = ctx.saved_tensors
                 return grad_output * ctx.scale * x
 
-        # Outside a checkpoint region op() is a plain call, so the wrapped
+        # Outside a checkpoint region region() is a plain call, so the wrapped
         # Function's own save_for_backward flows through user saved_tensors_hooks
         # untouched by remat.
         x = torch.tensor([2.0, 3.0], requires_grad=True)
         with torch.autograd.graph.saved_tensors_hooks(pack_hook, unpack_hook):
-            y = remat.op(
+            y = remat.region(
                 UncheckpointedSquare.apply,
                 "sq",
-                policy=remat.SAVE,
+                recompute=False,
             )(x)
             y.sum().backward()
 
@@ -259,20 +263,20 @@ class OpBasicsTest(expecttest.TestCase):
                 return grad_output * 2 * x
 
         def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
-            y = remat.op(
+            y = remat.region(
                 FirstDuplicate.apply,
                 "duplicate.forward",
-                policy=remat.SAVE,
+                recompute=False,
             )(x)
-            return remat.op(
+            return remat.region(
                 SecondDuplicate.apply,
                 "duplicate.forward",
-                policy=remat.SAVE,
+                recompute=False,
             )(y)
 
         with self.assertRaisesRegex(
             RuntimeError,
-            "Duplicate torch_remat op name.*during forward",
+            "Duplicate torch_remat region name.*during forward",
         ):
             remat.checkpoint()(checkpoint_body)(torch.ones(1, requires_grad=True))
 

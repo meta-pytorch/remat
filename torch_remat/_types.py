@@ -8,16 +8,15 @@
 
 """Plain-data types for the torch_remat tape.
 
-The checkpoint-policy enum, the saved-tensor pack/unpack hook aliases, and the
-pure-data records that :mod:`torch_remat._api` builds during forward and consults
-during recompute (:class:`~torch_remat._api._SaveRecord` owns them on the tape).
+The saved-tensor pack/unpack hook aliases and the pure-data records that
+:mod:`torch_remat._api` builds during forward and consults during recompute
+(:class:`~torch_remat._api._SaveRecord` owns them on the tape).
 """
 
 from __future__ import annotations
 
 import weakref
 from dataclasses import dataclass
-from enum import Enum
 from typing import Callable, TypeAlias
 
 import torch
@@ -29,17 +28,6 @@ from torch_remat._pytree import PathToken
 # at remat's tape instead of autograd's saved-tensors machinery.
 PackHook: TypeAlias = Callable[[torch.Tensor], object]
 UnpackHook: TypeAlias = Callable[[object], torch.Tensor]
-
-
-class CheckpointPolicy(Enum):
-    """Policy controlling how a remat op call is handled under checkpointing."""
-
-    # Rerun this op during checkpoint recompute.
-    RECOMPUTE = 0
-
-    # Skip this op during recompute; its saved tensors stay on the autograd graph
-    # (owned by autograd) and its outputs replay as data-inaccessible placeholders.
-    SAVE = 1
 
 
 @dataclass

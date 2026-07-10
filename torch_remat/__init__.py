@@ -10,8 +10,7 @@ from torch_remat._api import (  # noqa: F401
     _pop_saved_tensors_hooks,
     _push_saved_tensors_hooks,
     checkpoint,
-    CheckpointPolicy,
-    op,
+    region,
     save_for_backward,
     saved_tensors_hooks,
 )
@@ -21,8 +20,3 @@ from torch_remat._reporting import (  # noqa: F401
     print_current_memory_report,
 )
 from torch_remat._trace import collect_trace, trace_scope  # noqa: F401
-
-# Convenience aliases for the two checkpoint policies, so callers can write
-# ``remat.SAVE`` / ``remat.RECOMPUTE`` instead of ``remat.CheckpointPolicy.SAVE``.
-SAVE = CheckpointPolicy.SAVE
-RECOMPUTE = CheckpointPolicy.RECOMPUTE

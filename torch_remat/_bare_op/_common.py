@@ -14,14 +14,14 @@ storage-aliasing view classification (proxy and function mode), and the mode
 suppression switch.
 
 Suppression: a *mode* strategy sees every op, including the ones inside a
-``remat.op`` body whose SAVE-output inputs the op's own consume / snapshot path has
+``remat.region`` body whose SAVE-output inputs the op's own consume / snapshot path has
 already handled. So the ``op`` wrapper runs its processing (body included) under
 :func:`_suppress_bare_op_detection`, and each mode passes straight through when the
 flag is set; only user code *between* op calls runs with the mode live. The wrapper
 strategies (subclass / proxy) never read the flag -- a wrapped output trips
 interception on any touch.
 
-Known gap: suppression covers the whole ``remat.op`` body, but only the op's
+Known gap: suppression covers the whole ``remat.region`` body, but only the op's
 *arguments* are actually handled. A SAVE output the body reaches via closure capture
 is therefore missed by the modes (it hits a placeholder during recompute) while the
 wrapper strategies still catch it. Narrowing suppression to remat's own processing
@@ -164,7 +164,7 @@ def _inplace_message(op: object) -> str:
         f"torch_remat: {op} tried to mutate a SAVE op's output in place. A SAVE op "
         "keeps its output for backward and reproduces it during recompute, so "
         "mutating it would corrupt both copies. Wrap the mutating op in "
-        "remat.op(...) (or apply it before the value leaves the producing op)."
+        "remat.region(...) (or apply it before the value leaves the producing op)."
     )
 
 
@@ -325,7 +325,7 @@ def _bare_op_detection_suppressed() -> bool:
 def _suppress_bare_op_detection() -> Iterator[None]:
     """Suppress the forward bare-op detection mode for the duration of the block.
 
-    Wrapped around a ``remat.op``'s own processing (and the region boundary) so a mode
+    Wrapped around a ``remat.region``'s own processing (and the region boundary) so a mode
     strategy does not re-save SAVE outputs the op has already persisted / snapshotted.
     A no-op for the non-mode strategies (nothing reads the flag), so it is always safe to
     install.

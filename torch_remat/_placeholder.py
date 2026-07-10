@@ -9,24 +9,25 @@
 """Storage-free placeholder tensors for skipped SAVE op outputs during recompute.
 
 By default, all compute inside `remat.checkpoint` is recomputed.  However, you can
-use `remat.op` to mark some regions as `SAVE`, in which case they shouldn't be
-recomputed.  This poses a problem: what do we *return* from `remat.op` when its
-internal compute has been skipped?  In some cases, we will have saved these outputs
-for other reasons (e.g., `remat.op` saved it for backwards, or in forward we found
-out some other `RECOMPUTE` region would need it and we have to save it so we can
-actually run the recompute.)  But sometimes, the output is simply *not needed at all*,
-e.g., if it is to be fed immediately into another `SAVE` region.  But we have to
-return something, and it has to be a convincing enough facsimile of the real thing
-that benign things (like checking its size) still work.  Thus the placeholder tensor.
+use `remat.region` with `recompute=False` to mark some regions as saved, in which
+case they shouldn't be recomputed.  This poses a problem: what do we *return* from
+`remat.region` when its internal compute has been skipped?  In some cases, we will
+have saved these outputs for other reasons (e.g., `remat.region` saved it for
+backwards, or in forward we found out some other `recompute=True` region would need
+it and we have to save it so we can actually run the recompute.)  But sometimes, the
+output is simply *not needed at all*, e.g., if it is to be fed immediately into
+another saved region.  But we have to return something, and it has to be a convincing
+enough facsimile of the real thing that benign things (like checking its size) still
+work.  Thus the placeholder tensor.
 
 It's important to note that a placeholder ONLY exists during recompute, and should
 ONLY be produced in situations where we know that the tensor will never be used (as
 determined by forwards).  It is an error to try to do actual compute on a placeholder.
 
 One small complication is that if I do a (bare) view operation on the output of a
-`SAVE` region, I shouldn't force this output to be saved; it could be that the view
-never gets used in any useful way.  This implies that we should also support
-(metadata only) view operations on a placeholder.
+saved (`recompute=False`) region, I shouldn't force this output to be saved; it could
+be that the view never gets used in any useful way.  This implies that we should also
+support (metadata only) view operations on a placeholder.
 
 Rather than a tensor subclass with a ``__torch_dispatch__`` that hand-classifies
 each op as view-vs-compute, a placeholder is a plain ``torch.Tensor`` backed by a
@@ -42,9 +43,9 @@ memory.  Because a placeholder is a plain tensor, "is this a placeholder?" is
 answered by probing the storage (:func:`_is_placeholder`), which also makes a view
 of a placeholder test true.
 
-Design note: crossing the SAVE->RECOMPUTE boundary is the *producer's*
-responsibility -- a SAVE op durably saves any output a consumer needs, so on replay
-the real tensor simply shows up in the dataflow. The rejected alternative (the
+Design note: crossing the save->recompute boundary is the *producer's*
+responsibility -- a saved region durably saves any output a consumer needs, so on
+replay the real tensor simply shows up in the dataflow. The rejected alternative (the
 consumer ferries the value onto its own tape slot and substitutes it by position)
 is worse for debugging: you emit placeholders with no real data, then magically
 swap in real data when they are used. Better to have the real tensor present from
@@ -140,7 +141,7 @@ def _placeholder_message(tensor: torch.Tensor) -> str:
 
 
 def _placeholder_message_text(source: str, op_display_name: str) -> str:
-    """Build the diagnostic carried by a skipped SAVE op's placeholder output.
+    """Build the diagnostic carried by a skipped saved region's placeholder output.
 
     The failure it describes is config-dependent and only surfaces during the
     recompute pass (inside backward), so the message has to stand on its own --
@@ -148,25 +149,27 @@ def _placeholder_message_text(source: str, op_display_name: str) -> str:
     """
 
     return (
-        f"{source} is a placeholder for the output of remat.op '{op_display_name}' "
-        "(policy SAVE): a SAVE op is skipped during recompute, so its output is "
-        "not recomputed -- only a metadata placeholder stands in, and something "
+        f"{source} is a placeholder for the output of remat.region '{op_display_name}' "
+        "(recompute=False): a saved region is skipped during recompute, so its output "
+        "is not recomputed -- only a metadata placeholder stands in, and something "
         "read its data.\n"
-        "A SAVE op's output is real during recompute only if some consumer made the "
-        "producer durably save it: a remat.op consumer does this automatically, as does "
-        "a bare consumer when detect_bare_ops is enabled. With detect_bare_ops disabled, "
-        "a plain bare/unwrapped op -- a view then .contiguous(), a residual add, anything "
-        "not wrapped in remat.op -- does not, and hits this placeholder instead.\n"
-        f"This is policy-dependent: it appears only because '{op_display_name}' is "
-        "SAVE; the same code works when it is RECOMPUTE (its output is then real). "
-        "That is why a region can pass with everything RECOMPUTE and fail once an "
-        "op is switched to SAVE.\n"
+        "A saved region's output is real during recompute only if some consumer made "
+        "the producer durably save it: a remat.region consumer does this automatically, "
+        "as does a bare consumer when detect_bare_ops is enabled. With detect_bare_ops "
+        "disabled, a plain bare/unwrapped op -- a view then .contiguous(), a residual "
+        "add, anything not wrapped in remat.region -- does not, and hits this "
+        "placeholder instead.\n"
+        f"This depends on recompute: it appears only because '{op_display_name}' has "
+        "recompute=False; the same code works with recompute=True (its output is then "
+        "real). That is why a region can pass with everything recompute=True and fail "
+        "once a region is switched to recompute=False.\n"
         "Fix one of:\n"
-        "  (1) wrap the consuming op in remat.op(..., policy=RECOMPUTE) so it loads "
-        "the saved value during recompute (e.g. make a residual add a RECOMPUTE op);\n"
-        "  (2) move the consuming op into a remat.op region (do the reshape/add "
-        "inside the producing or consuming op);\n"
-        f"  (3) give '{op_display_name}' policy=RECOMPUTE."
+        "  (1) wrap the consuming op in remat.region(..., recompute=True) so it loads "
+        "the saved value during recompute (e.g. make a residual add a recompute=True "
+        "region);\n"
+        "  (2) move the consuming op into a remat.region (do the reshape/add "
+        "inside the producing or consuming region);\n"
+        f"  (3) give '{op_display_name}' recompute=True."
     )
 
 

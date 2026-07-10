@@ -39,7 +39,6 @@ import torch
 from torch_remat._api import (
     _output_slot_name,
     _SaveRecord,
-    CheckpointPolicy,
 )
 from torch_remat._region import (
     _CheckpointRegionState,
@@ -67,7 +66,6 @@ class _Value:
     tensor: torch.Tensor
     names: list[str] = field(default_factory=list)
     covered: int = 0
-    policy: CheckpointPolicy = CheckpointPolicy.SAVE
 
 
 @dataclass
@@ -270,7 +268,6 @@ def _format_storage(storage: _Storage) -> list[str]:
         children = list(storage.values)
     children.sort(key=lambda value: value.tensor.storage_offset())
 
-    policy = _strongest_policy(storage.values).name
     dtype = str(storage.dtype).replace("torch.", "")
     used = _covered_bytes(
         [iv for value in storage.values for iv in _addressed_intervals(value.tensor)]
@@ -288,13 +285,13 @@ def _format_storage(storage: _Storage) -> list[str]:
 
     lines: list[str] = [
         f"  {_format_bytes(storage.nbytes):>9}  {name_col:<22} {shape:<10} {dtype:<8} "
-        f"{str(storage.device):<6} {policy}{flag}".rstrip()
+        f"{str(storage.device):<6}{flag}".rstrip()
     ]
     for view in children:
         view_name = " = ".join(_order_names(view.names))
         view_shape = f"{tuple(view.tensor.shape)}"
         lines.append(
-            f"          - {view_name:<10} view {view_shape:<10} {view.policy.name:<9} "
+            f"          - {view_name:<10} view {view_shape:<10} "
             f"spans {_format_bytes(view.covered)}".rstrip()
         )
     return lines
@@ -333,21 +330,6 @@ def _order_names(names: list[str]) -> list[str]:
     saves = [n for n in names if not n.startswith("output.")]
     slots = sorted(n for n in names if n.startswith("output."))
     return saves + slots
-
-
-def _strongest_policy(values: list[_Value]) -> CheckpointPolicy:
-    """Return the policy that best explains residency -- SAVE outranks RECOMPUTE.
-
-    SAVE is the residency-*forcing* policy, so when a storage is held under a mix of names
-    (e.g. a nameless base pinned by SAVE views) the strongest one is the honest answer to
-    "why is this byte here".
-    """
-
-    strongest = CheckpointPolicy.RECOMPUTE
-    for value in values:
-        if value.policy.value > strongest.value:
-            strongest = value.policy
-    return strongest
 
 
 def _storage_key(tensor: torch.Tensor) -> tuple[torch.device, int] | None:

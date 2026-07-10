@@ -9,7 +9,7 @@
 """The ``__torch_dispatch__`` wrapper-subclass bare-op strategy (``"subclass"``, the default).
 
 :class:`_SaveTensor` is a **wrapper** ``torch.Tensor`` subclass holding a SAVE op's
-produced tensor as ``_inner``. A ``remat.op`` / boundary consumer just reads
+produced tensor as ``_inner``. A ``remat.region`` / boundary consumer just reads
 ``_inner``; a *bare* op trips :meth:`_SaveTensor.__torch_dispatch__`, which fires the
 producer's ``persist_output`` (once) and runs the op on the unwrapped inner -- every
 output is plain, so the wrapper never propagates past one hop.

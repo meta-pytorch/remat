@@ -73,10 +73,10 @@ class SaveRegionTest(expecttest.TestCase):
         x = torch.tensor([1.0, 2.0, 3.0, 4.0], requires_grad=True)
 
         def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
-            return remat.op(
+            return remat.region(
                 SavesOutputView.apply,
                 "saves.output",
-                policy=remat.SAVE,
+                recompute=False,
             )(x)
 
         y = remat.checkpoint()(checkpoint_body)(x)
@@ -103,10 +103,10 @@ class SaveRegionTest(expecttest.TestCase):
                 return grad_output * (right - left + 1)
 
         def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
-            return remat.op(
+            return remat.region(
                 OptionalSavedTensor.apply,
                 "optional.save",
-                policy=remat.SAVE,
+                recompute=False,
             )(x)
 
         x = torch.tensor([3.0, 4.0], requires_grad=True)
@@ -146,10 +146,10 @@ class SaveRegionTest(expecttest.TestCase):
         x = torch.tensor([2.0, 3.0], requires_grad=True)
 
         def checkpoint_body(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            return remat.op(
+            return remat.region(
                 TupleReturn.apply,
                 "tuple.return",
-                policy=remat.SAVE,
+                recompute=False,
             )(value)
 
         left, right = remat.checkpoint()(checkpoint_body)(x)
@@ -187,15 +187,15 @@ class SaveRegionTest(expecttest.TestCase):
                 return torch.cat([grad_output, torch.zeros_like(grad_output)])
 
         def checkpointed_region(x: torch.Tensor) -> torch.Tensor:
-            produced = remat.op(
+            produced = remat.region(
                 Producer.apply,
                 "producer",
-                policy=remat.RECOMPUTE,
+                recompute=True,
             )(x)
-            return remat.op(
+            return remat.region(
                 ViewConsumer.apply,
                 "view.consumer",
-                policy=remat.SAVE,
+                recompute=False,
             )(produced)
 
         y = remat.checkpoint()(checkpointed_region)(torch.ones(2, requires_grad=True))
@@ -231,9 +231,9 @@ class SaveRegionTest(expecttest.TestCase):
                 return grad_output * 2 * v
 
         def region(x: torch.Tensor) -> torch.Tensor:
-            y = remat.op(ProducerSave.apply, "producer", policy=remat.SAVE)(x)
+            y = remat.region(ProducerSave.apply, "producer", recompute=False)(x)
             v = y.view_as(y)  # bare metadata view of a SAVE output
-            return remat.op(SaveInput.apply, "consumer", policy=remat.SAVE)(v)
+            return remat.region(SaveInput.apply, "consumer", recompute=False)(v)
 
         # The bare view of a SAVE output needs the bare-op detection strategy.
         for strategy in _BARE_OP_STRATEGIES:
@@ -287,15 +287,15 @@ class SaveRegionTest(expecttest.TestCase):
                 return grad_output * 2 * y
 
         def region(x: torch.Tensor) -> torch.Tensor:
-            y = remat.op(
+            y = remat.region(
                 Producer.apply,
                 "producer",
-                policy=remat.RECOMPUTE,
+                recompute=True,
             )(x)
-            return remat.op(
+            return remat.region(
                 Consumer.apply,
                 "consumer",
-                policy=remat.SAVE,
+                recompute=False,
             )(y)
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
@@ -329,7 +329,7 @@ class SaveRegionTest(expecttest.TestCase):
         x = base.clone().requires_grad_(True)
         Affine.runs = 0
         y = remat.checkpoint()(
-            lambda t: remat.op(Affine.apply, "affine", policy=remat.SAVE)(t)
+            lambda t: remat.region(Affine.apply, "affine", recompute=False)(t)
         )(x)
         y.sum().backward()
         self.assertEqual(1, Affine.runs)  # SAVE: body not rerun during recompute
@@ -378,13 +378,13 @@ class SaveRegionTest(expecttest.TestCase):
             # Hold the op output so RealSave's grad_fn keeps the saved internal
             # "live" alive for the report (a saved input would instead be diverted
             # off the identity hook and not reported).
-            out = remat.op(span, "span", policy=remat.SAVE)(x)
+            out = remat.region(span, "span", recompute=False)(x)
             self.assertExpectedInline(
                 remat.format_current_memory_report(),
                 """\
 blk: 12 B resident in 1 storage(s)
 blk::span: 12 B
-       12 B  live                   (3,)       float32  cpu    SAVE""",
+       12 B  live                   (3,)       float32  cpu""",
             )
             self.assertEqual((3,), tuple(out.shape))
 
@@ -415,10 +415,10 @@ blk::span: 12 B
                 return grad_output * 2
 
         def body(x: torch.Tensor) -> torch.Tensor:
-            saved = remat.op(SavedDouble.apply, "double", policy=remat.SAVE)(x)
+            saved = remat.region(SavedDouble.apply, "double", recompute=False)(x)
             recomputed = x * 3
             # add(saved, recomputed, alpha=2) = 2x + 2 * 3x = 8x
-            return remat.op(torch.add, "add", policy=remat.RECOMPUTE)(
+            return remat.region(torch.add, "add", recompute=True)(
                 saved, recomputed, alpha=2.0
             )
 
@@ -449,13 +449,13 @@ blk::span: 12 B
                 return grad_output * 2
 
         def body(x: torch.Tensor) -> torch.Tensor:
-            saved = remat.op(SavedDouble.apply, "double", policy=remat.SAVE)(x)
+            saved = remat.region(SavedDouble.apply, "double", recompute=False)(x)
             recomputed = x * 3
             # stack([2x, 3x]).sum(0) = 5x
-            return remat.op(
+            return remat.region(
                 lambda tensors: torch.stack(tensors).sum(0),
                 "stack",
-                policy=remat.RECOMPUTE,
+                recompute=True,
             )([saved, recomputed])
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
@@ -471,15 +471,15 @@ blk::span: 12 B
         seen_container: list[type] = []
 
         def body(x: torch.Tensor) -> torch.Tensor:
-            pair = remat.op(
+            pair = remat.region(
                 lambda t: [t * 2, t * 3],
                 "split",
-                policy=remat.SAVE,
+                recompute=False,
             )(x)
             seen_container.append(type(pair))
             first, second = pair
             # add(2x, 3x) = 5x; both inputs are SAVE outputs ferried on recompute.
-            return remat.op(torch.add, "add", policy=remat.RECOMPUTE)(first, second)
+            return remat.region(torch.add, "add", recompute=True)(first, second)
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
         out = remat.checkpoint()(body)(x)
@@ -497,12 +497,12 @@ blk::span: 12 B
         def block(t: torch.Tensor) -> torch.Tensor:
             # A SAVE region of several native ops: every internal SavedVariable is
             # taped under one nested hook and the whole span is skipped on recompute.
-            saved = remat.op(
+            saved = remat.region(
                 lambda u: torch.exp(torch.sin(u)) * u,
                 "blk",
-                policy=remat.SAVE,
+                recompute=False,
             )(t)
-            return remat.op(lambda u: u * u, "sq", policy=remat.RECOMPUTE)(saved)
+            return remat.region(lambda u: u * u, "sq", recompute=True)(saved)
 
         def reference(t: torch.Tensor) -> torch.Tensor:
             return (torch.exp(torch.sin(t)) * t) ** 2
@@ -515,7 +515,7 @@ blk::span: 12 B
     def test_save_op_with_reshape_in_region_feeds_recompute(self) -> None:
         # The attention pattern done right for the tape model: the qkv projection's
         # view/unbind/contiguous live *inside* the SAVE op, so its outputs (not bare
-        # views of them) are what flow downstream, and every consumer is a remat.op
+        # views of them) are what flow downstream, and every consumer is a remat.region
         # that ferries them past the placeholders during recompute.
         class Rope(torch.autograd.Function):
             @staticmethod
@@ -543,12 +543,12 @@ blk::span: 12 B
             return q.contiguous(), k.contiguous(), v.contiguous()
 
         def attention(t: torch.Tensor) -> torch.Tensor:
-            q, k, v = remat.op(qkv_proj, "qkv", policy=remat.SAVE)(t)
-            q, k = remat.op(Rope.apply, "rope", policy=remat.RECOMPUTE)(q, k)
-            return remat.op(
+            q, k, v = remat.region(qkv_proj, "qkv", recompute=False)(t)
+            q, k = remat.region(Rope.apply, "rope", recompute=True)(q, k)
+            return remat.region(
                 lambda a, b, c: (a + b + c).sum(),
                 "combine",
-                policy=remat.RECOMPUTE,
+                recompute=True,
             )(q, k, v)
 
         x = base.clone().requires_grad_(True)
@@ -578,7 +578,7 @@ blk::span: 12 B
                 return grad_output * grad_factor
 
         def body(x: torch.Tensor) -> torch.Tensor:
-            return remat.op(Square.apply, "sq", policy=remat.SAVE)(x)
+            return remat.region(Square.apply, "sq", recompute=False)(x)
 
         x = torch.tensor([2.0, 3.0], requires_grad=True)
         y = remat.checkpoint()(body)(x)
@@ -609,7 +609,7 @@ blk::span: 12 B
 
         def region(x: torch.Tensor) -> torch.Tensor:
             h = x * 1.0  # RECOMPUTE-produced tensor feeding the SAVE op
-            y = remat.op(InplaceExp.apply, "exp", policy=remat.SAVE)(h)
+            y = remat.region(InplaceExp.apply, "exp", recompute=False)(h)
             return y * 1.0
 
         base = torch.randn(4, dtype=torch.float64)
@@ -656,12 +656,12 @@ blk::span: 12 B
                 return grad_output * 2 * y
 
         def region(x: torch.Tensor) -> torch.Tensor:
-            y = remat.op(
+            y = remat.region(
                 Producer.apply,
                 "producer",
-                policy=remat.RECOMPUTE,
+                recompute=True,
             )(x)
-            return remat.op(Consumer.apply, "consumer", policy=remat.SAVE)(y)
+            return remat.region(Consumer.apply, "consumer", recompute=False)(y)
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
         out = remat.checkpoint(region_name="r")(region)(x)
@@ -714,12 +714,12 @@ blk::span: 12 B
                 return grad_output * 2 * torch.cat([first, second])
 
         def region(x: torch.Tensor) -> torch.Tensor:
-            y = remat.op(
+            y = remat.region(
                 Producer.apply,
                 "producer",
-                policy=remat.RECOMPUTE,
+                recompute=True,
             )(x)
-            return remat.op(Consumer.apply, "consumer", policy=remat.SAVE)(y)
+            return remat.region(Consumer.apply, "consumer", recompute=False)(y)
 
         x = torch.tensor([1.0, 2.0, 3.0, 4.0], requires_grad=True)
         out = remat.checkpoint(region_name="r")(region)(x)
@@ -761,12 +761,12 @@ blk::span: 12 B
                 return grad_output * 2 * torch.cat([first, second])
 
         def region(x: torch.Tensor) -> torch.Tensor:
-            y = remat.op(
+            y = remat.region(
                 Producer.apply,
                 "producer",
-                policy=remat.RECOMPUTE,
+                recompute=True,
             )(x)
-            return remat.op(Consumer.apply, "consumer", policy=remat.SAVE)(y)
+            return remat.region(Consumer.apply, "consumer", recompute=False)(y)
 
         x = torch.tensor([1.0, 2.0, 3.0, 4.0], requires_grad=True)
         out = remat.checkpoint(region_name="r")(region)(x)
@@ -818,12 +818,12 @@ blk::span: 12 B
                 return grad_output * 2 * torch.stack([row0, row1])
 
         def region(x: torch.Tensor) -> torch.Tensor:
-            y = remat.op(
+            y = remat.region(
                 Producer.apply,
                 "producer",
-                policy=remat.RECOMPUTE,
+                recompute=True,
             )(x)
-            return remat.op(Consumer.apply, "consumer", policy=remat.SAVE)(y)
+            return remat.region(Consumer.apply, "consumer", recompute=False)(y)
 
         def reference(x: torch.Tensor) -> torch.Tensor:
             return ((x * 3).t() ** 2).sum()
@@ -872,12 +872,12 @@ blk::span: 12 B
                 return grad_output * 2 * torch.cat([head, head])
 
         def region(x: torch.Tensor) -> torch.Tensor:
-            y = remat.op(
+            y = remat.region(
                 DriftingProducer.apply,
                 "producer",
-                policy=remat.RECOMPUTE,
+                recompute=True,
             )(x)
-            return remat.op(Consumer.apply, "consumer", policy=remat.SAVE)(y)
+            return remat.region(Consumer.apply, "consumer", recompute=False)(y)
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
         out = remat.checkpoint(region_name="r")(region)(x)

@@ -16,10 +16,10 @@ what we support is:
 
 * A **value** is a leaf, or *one* hop of ``list`` / ``tuple`` whose elements are
   leaves. This is the shape of an ATen operator's arguments and results
-  (``Tensor``, ``Tensor[]``, ``(Tensor, Tensor)``) and of a ``remat.op`` call's
+  (``Tensor``, ``Tensor[]``, ``(Tensor, Tensor)``) and of a ``remat.region`` call's
   return.
 * A call's **arguments** are ``args`` (positional) plus ``kwargs`` (keyword),
-  where each argument is a value. This is what a ``remat.op``-wrapped callable and
+  where each argument is a value. This is what a ``remat.region``-wrapped callable and
   ``__torch_dispatch__`` receive.
 
 A **leaf** is anything else -- a ``Tensor``, but also ``None``, an ``int``, a

@@ -75,7 +75,7 @@ class _BareOpStrategy:
         ["_CheckpointRegionState"], contextlib.AbstractContextManager[None]
     ]
     # True when make_output wraps the SAVE output in a carrier (subclass / proxy). A
-    # remat.op consumer reads this to decide statically whether a SAVE-output input
+    # remat.region consumer reads this to decide statically whether a SAVE-output input
     # needs unwrapping (and an arg-pytree rebuild), or only a persist-output trigger.
     wraps_outputs: bool
 

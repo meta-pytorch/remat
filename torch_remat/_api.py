@@ -8,17 +8,18 @@
 
 """Explicit activation rematerialization for checkpoint regions.
 
-:func:`checkpoint` wraps a region that recomputes by default; :func:`op`
-annotates one call inside it with a :class:`CheckpointPolicy` (``SAVE`` or
-``RECOMPUTE``). The wrapped callable is used unmodified.
+:func:`checkpoint` wraps a region that recomputes by default; :func:`region`
+annotates one call inside it, choosing whether to rerun it under recompute
+(``recompute=True``) or keep its activations for backward (``recompute=False``).
+The wrapped callable is used unmodified.
 
 The region runs under PyTorch non-reentrant checkpointing: backward executes
 the *original* forward grad_fns, recompute only refills their saved tensors.
-A ``SAVE`` op installs a nested ``saved_tensors_hooks`` that shadows
+A ``recompute=False`` region installs a nested ``saved_tensors_hooks`` that shadows
 checkpoint's hooks, so its saved tensors stay ordinary autograd saved tensors
-on the original graph; the op is skipped during recompute (returning
-placeholder outputs). A ``RECOMPUTE`` op runs normally in both passes; its one
-extra duty is at the boundary: an input that is an upstream ``SAVE`` op's
+on the original graph; it is skipped during recompute (returning placeholder
+outputs). A ``recompute=True`` region runs normally in both passes; its one extra
+duty is at the boundary: an input that is an upstream ``recompute=False`` region's
 output is made the *producer's* responsibility to persist, so replay can
 reproduce it into the dataflow.
 """
@@ -84,7 +85,6 @@ from torch_remat._types import (
     _SavedInputRecipe,
     _SavedInputRef,
     _SavedTensor,
-    CheckpointPolicy,
     PackHook,
     UnpackHook,
 )
@@ -123,7 +123,8 @@ def checkpoint(
     confusion with ``torch.utils.checkpoint.checkpoint``.
 
     Everything inside the region recomputes by default; annotate calls with
-    :func:`op` to ``SAVE`` (keep activations, skip recompute) instead.
+    :func:`region` (``recompute=False``) to keep their activations and skip
+    recompute instead.
 
     Region arguments are forwarded unchanged (``torch.utils.checkpoint`` handles
     them), but the region *output* must be a Tensor or a one-hop ``tuple`` /
@@ -209,30 +210,31 @@ def checkpoint(
     return decorate
 
 
-def op(
+def region(
     function: Callable[_P, _R],
     name: str,
     *,
-    policy: CheckpointPolicy = CheckpointPolicy.SAVE,
+    recompute: bool,
 ) -> Callable[_P, _R]:
-    """Annotate one call inside a checkpoint region with a remat policy.
+    """Annotate one call inside a checkpoint region, choosing recompute vs. save.
 
     ``function`` is used unmodified -- it may be a custom ``autograd.Function``'s
     ``.apply``, a bare native op, or any callable taking a flat list of
     Tensor/non-Tensor arguments and returning a Tensor or tuple of Tensors.
 
         ```python
-        y = remat.op(MyOp.apply, "my.op")(x)
+        y = remat.region(MyOp.apply, "my.op", recompute=False)(x)
         ```
 
-    With ``SAVE`` (the default -- the region already recomputes everything, so an
-    annotation normally marks the exception), the tensors the call's autograd
-    nodes save are kept by autograd on the original forward graph and the call
-    is not rerun during recompute. With ``RECOMPUTE``, the call is rerun during
-    recompute; any input that is an upstream ``SAVE`` op's output is made that
+    With ``recompute=False`` (save), the tensors the call's autograd nodes save are
+    kept by autograd on the original forward graph and the call is not rerun during
+    recompute. The enclosing region already recomputes everything, so a
+    ``recompute=False`` annotation normally marks the exception -- the activations
+    you want to keep. With ``recompute=True``, the call is rerun during recompute;
+    any input that is an upstream ``recompute=False`` region's output is made that
     producer's responsibility to persist, so the rerun has real data.
 
-    Despite its name, a `remat.op` doesn't have to correspond to a true PyTorch
+    Despite the name, a ``remat.region`` doesn't have to correspond to a true PyTorch
     operator; you can scope it as large as you like. We recommend about the
     granularity of an autograd function, since this gives you the most accurate
     reporting of where save-for-backward costs are going.
@@ -241,13 +243,13 @@ def op(
     *one-hop* ``tuple`` / ``list`` of Tensors -- deliberately not full pytree
     (nor ``dict``). Arguments are walked leniently: anything else (a ``dict``, a
     custom object, deeper nesting) is an opaque leaf handed to ``function``
-    untouched. That leniency has a cost: if an upstream ``SAVE`` op's output is
-    hidden inside such a leaf, remat's argument walk never finds it and so never
-    arranges for the producer to persist it. A ``RECOMPUTE`` consumer of that
-    output then gets the skipped producer's stand-in placeholder instead of real
-    data, which raises -- but only during recompute (inside backward), not at
-    this call, so keep SAVE outputs at the top level or one hop deep. The
-    *return* is validated strictly: a non-Tensor or nested return raises
+    untouched. That leniency has a cost: if an upstream ``recompute=False``
+    region's output is hidden inside such a leaf, remat's argument walk never finds
+    it and so never arranges for the producer to persist it. A ``recompute=True``
+    consumer of that output then gets the skipped producer's stand-in placeholder
+    instead of real data, which raises -- but only during recompute (inside
+    backward), not at this call, so keep saved outputs at the top level or one hop
+    deep. The *return* is validated strictly: a non-Tensor or nested return raises
     ``RuntimeError``.
 
     NB: if you smuggle an input into the callable (e.g., via a global or via a
@@ -262,31 +264,31 @@ def op(
             a custom ``autograd.Function``'s ``.apply``, a bare native op, or any
             callable taking a flat list of Tensor/non-Tensor arguments and
             returning a Tensor or a one-hop ``tuple`` / ``list`` of Tensors.
-        name (str): Region-relative name for this op, shown in memory reports,
+        name (str): Region-relative name for this call, shown in memory reports,
             traces, and error messages. Must be non-empty and unique among the
-            op names reached in a single phase.
-        policy (CheckpointPolicy, optional): How the call is handled under
-            recompute. ``SAVE`` keeps the tensors the call saves for backward on
-            the original forward graph and skips rerunning the call during
-            recompute; ``RECOMPUTE`` reruns the call, and any input that is an
-            upstream ``SAVE`` op's output is made that producer's responsibility
-            to persist. Keyword-only. Default: ``CheckpointPolicy.SAVE``.
+            names reached in a single phase.
+        recompute (bool): How the call is handled under recompute. ``False`` (save)
+            keeps the tensors the call saves for backward on the original forward
+            graph and skips rerunning the call during recompute; ``True`` reruns the
+            call, and any input that is an upstream ``recompute=False`` region's
+            output is made that producer's responsibility to persist. Keyword-only,
+            required.
 
     Returns:
         Callable: A wrapper with the same signature as ``function``. Called
         outside an active checkpoint region it simply forwards to ``function``.
 
     Raises:
-        RuntimeError: If ``function`` is not callable, or ``policy`` is not a
-            :class:`CheckpointPolicy`.
+        RuntimeError: If ``function`` is not callable, or ``recompute`` is not a
+            ``bool``.
         ValueError: If ``name`` is empty.
     """
 
     if not callable(function):
-        raise RuntimeError("op expects a function as its first argument")
-    _validate_name(name, what="op_name")
-    if not isinstance(policy, CheckpointPolicy):
-        raise RuntimeError("op expects a CheckpointPolicy")
+        raise RuntimeError("region expects a function as its first argument")
+    _validate_name(name, what="region name")
+    if not isinstance(recompute, bool):
+        raise RuntimeError("region expects recompute to be a bool")
 
     @wraps(function)
     def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
@@ -295,24 +297,24 @@ def op(
             # Outside a checkpoint region: behave as a plain call.
             return function(*args, **kwargs)
 
-        # Suppress the bare-op detection mode (if any) for this op's own processing,
-        # including the wrapped body: the consume/snapshot path already handles the op's
-        # SAVE-output arguments, so the mode must not re-handle them. Known gap: a SAVE
-        # output the body reaches via closure capture is handled by neither -- see the
-        # _suppress_bare_op_detection note in torch_remat._bare_op._common.
+        # Suppress the bare-op detection mode (if any) for this region's own processing,
+        # including the wrapped body: the consume/snapshot path already handles the
+        # region's saved-output arguments, so the mode must not re-handle them. Known
+        # gap: a saved output the body reaches via closure capture is handled by neither
+        # -- see the _suppress_bare_op_detection note in torch_remat._bare_op._common.
         with _suppress_bare_op_detection():
-            _record_trace_op(name, policy=policy)
+            _record_trace_op(name, recompute=recompute)
 
-            # Record this op invocation in the current phase, rejecting duplicates.
+            # Record this region invocation in the current phase, rejecting duplicates.
             if name in state.claimed_names:
                 raise RuntimeError(
-                    f"Duplicate torch_remat op name "
+                    f"Duplicate torch_remat region name "
                     f"{_display_name(state.region_state, name)} during "
                     f"{state.phase.name.lower()}"
                 )
             state.claimed_names.add(name)
 
-            if policy is CheckpointPolicy.SAVE:
+            if not recompute:
                 return cast(_R, _run_save_op(state, name, function, args, kwargs))
             return cast(_R, _run_recompute_op(state, name, function, args, kwargs))
 
@@ -492,11 +494,11 @@ def saved_tensors_hooks(
 
 @dataclass
 class _SaveRecord:
-    """Per remat.op information (metadata and tensors) generated during
+    """Per remat.region information (metadata and tensors) generated during
     forward that is needed for recompute.  Note that not every Tensor saved
     between forward and recompute is stored here.
 
-    When you SAVE a remat.op, so that it doesn't reexecute during recompute,
+    When you SAVE a remat.region, so that it doesn't reexecute during recompute,
     we need to record three main pieces of information to actually run
     recompute and backwards later:
 
@@ -537,7 +539,7 @@ class _SaveRecord:
 
     This struct only holds durable state that is needed during recompute; there's also
     some transient state in `_SaveOpForwardScratch` that we use for bookkeeping within
-    the forward execution of a SAVE remat.op only.
+    the forward execution of a SAVE remat.region only.
     """
 
     # Region-relative name for this op.
@@ -638,9 +640,9 @@ def _run_save_op(
         record = region_state.records.get(name)
         if record is None:
             raise RuntimeError(
-                f"No SAVE op record for {_display_name(region_state, name)} during "
+                f"No save record for {_display_name(region_state, name)} during "
                 "recompute; forward and recompute followed different code paths (or the "
-                "op's policy differs between them)"
+                "region's recompute setting differs between them)"
             )
         if record.saved_input_recipes:
             _rederive_saved_inputs(record, region_state, args, kwargs)
@@ -742,8 +744,9 @@ def _run_recompute_op(
     if state.phase is _Phase.RECOMPUTE:
         if name in region_state.records:
             raise RuntimeError(
-                f"Conflicting checkpoint policies for {_display_name(region_state, name)}: "
-                "the forward ran it as SAVE but recompute runs it as RECOMPUTE"
+                f"Conflicting recompute settings for {_display_name(region_state, name)}: "
+                "the forward ran it with recompute=False but recompute runs it with "
+                "recompute=True"
             )
         return _validate_output(function(*args, **kwargs))
 
@@ -947,7 +950,7 @@ class _PersistOutputThunk:
 
     A SAVE op is skipped during recompute, so any consumer that needs its output during
     replay fires this thunk during the forward: a bare consumer via the detection
-    strategy, a ``remat.op`` consumer via the handle, or the eager persist of an
+    strategy, a ``remat.region`` consumer via the handle, or the eager persist of an
     output that is itself saved for backward.
     All consumer kinds share one tape slot, the output's position.
 
@@ -1052,13 +1055,12 @@ def _rederive_saved_inputs(
         captured = leaves_by_path[recipe.path]
         if _is_placeholder(captured):
             raise RuntimeError(
-                f"{_display_name(region_state, record.op_name)} (policy SAVE) saved "
+                f"{_display_name(region_state, record.op_name)} (recompute=False) saved "
                 f"an input ({recipe.name}) for backward that recompute was expected to "
                 "reproduce, but it replays as a placeholder. The saved input is a bare "
-                "(unwrapped) view or derivative of an upstream SAVE op's output, "
-                "which is not reproduced during recompute. Wrap that producer in "
-                "remat.op(..., policy=RECOMPUTE) so its output is real during "
-                "replay."
+                "(unwrapped) view or derivative of an upstream recompute=False region's "
+                "output, which is not reproduced during recompute. Wrap that producer in "
+                "remat.region(..., recompute=True) so its output is real during replay."
             )
         if recipe.view_spec is None:
             value = captured.detach()
@@ -1241,7 +1243,7 @@ def _fabricate_recompute_input(
 
     ``requires_grad`` (captured at save time) must match so the RECOMPUTE op rebuilds
     its backward node and its ``save_for_backward`` packs refill checkpoint's holders.
-    A requires-grad input is always non-leaf here -- a remat.op never yields a
+    A requires-grad input is always non-leaf here -- a remat.region never yields a
     requires-grad *leaf* (see :func:`_reject_grad_leaf`) -- so it gets a fresh
     grad_fn via :class:`_MakeNonLeaf` (which saves nothing, so it adds no checkpoint pack);
     ``is_leaf`` is carried only to assert that invariant.
@@ -1293,7 +1295,7 @@ class _MakeNonLeaf(torch.autograd.Function):
 
 
 _OP_OUTPUT_TYPE_MESSAGE = (
-    "remat.op function must return a Tensor, or a tuple or list of Tensors"
+    "remat.region function must return a Tensor, or a tuple or list of Tensors"
 )
 
 
@@ -1326,10 +1328,10 @@ def _validate_output(
 def _reject_grad_leaf(
     tensor: torch.Tensor, region_and_op: tuple[_CheckpointRegionState, str]
 ) -> None:
-    """Raise if a remat.op returned a requires-grad *leaf* (a graph endpoint).
+    """Raise if a remat.region returned a requires-grad *leaf* (a graph endpoint).
 
     An ``autograd.Function`` or any differentiable op always gives its output a grad_fn, so a
-    requires-grad leaf out of a remat.op means it wrapped a bare allocation (e.g.
+    requires-grad leaf out of a remat.region means it wrapped a bare allocation (e.g.
     ``torch.zeros(..., requires_grad=True)``) rather than a real computation. That has no
     legitimate use inside a checkpoint region -- the value is disconnected from the region's
     inputs -- and it makes recompute's autograd shape ambiguous, so we reject it rather than
@@ -1340,11 +1342,11 @@ def _reject_grad_leaf(
         region_state, op_name = region_and_op
         raise RuntimeError(
             f"{_display_name(region_state, op_name)} returned a leaf tensor that "
-            "requires grad (a requires_grad tensor with no grad_fn). A remat.op "
+            "requires grad (a requires_grad tensor with no grad_fn). A remat.region "
             "must return the result of a real computation; this usually means it "
             "wrapped a bare allocation like torch.zeros(..., requires_grad=True). "
             "Move the allocation outside the checkpoint region (or do not wrap it "
-            "in remat.op)."
+            "in remat.region)."
         )
 
 

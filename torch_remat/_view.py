@@ -13,12 +13,12 @@ autograd function in a SAVE region that saves one of its inputs for backwards.
 If that input comes from a RECOMPUTE region, we don't actually need to save
 the input for backwards: it will show up as a real input during recompute and
 we can just use it directly.  This will save us memory overall.  To do this
-optimization, we have to be able to identify when an input to a remat.op is
+optimization, we have to be able to identify when an input to a remat.region is
 saved for backwards (via saved tensor hooks).  This is not a big deal.
 
 Now, let's suppose that the input wasn't directly saved for backward; instead,
 some *view* of the input was saved for backwards.  Assume this view was
-computed from inside the remat.op region.  We still shouldn't save this view
+computed from inside the remat.region region.  We still shouldn't save this view
 for backwards.  But we can't use the input directly; we have to reapply the
 view to it so that we have a backwards of the correct extent and shape.  We
 need a view replay.  Oh no!
@@ -170,7 +170,7 @@ def _rebuild_saved_view(
         or tuple(base.stride()) != view_spec.base_stride
     ):
         raise RuntimeError(
-            f"{_display_name(region_state, op_name)} (policy SAVE) saved a "
+            f"{_display_name(region_state, op_name)} (recompute=False) saved a "
             "view of an input for backward, but recompute reproduced that input "
             f"with a different layout (expected shape {view_spec.base_shape} "
             f"stride {view_spec.base_stride}, got shape {tuple(base.shape)} "

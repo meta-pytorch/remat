@@ -6,7 +6,7 @@
 
 # pyre-strict
 
-"""Tests for bare-op detection -- consuming a SAVE op's output outside ``remat.op`` --
+"""Tests for bare-op detection -- consuming a SAVE op's output outside ``remat.region`` --
 across all four strategies (the ``__torch_dispatch__`` subclass, the
 ``__torch_function__`` proxy, and the dispatch/function modes): a bare op
 materializes on recompute, views defer, producer responsibility fills ``output.<i>``
@@ -57,10 +57,10 @@ class BareOpTest(expecttest.TestCase):
 
         The SAVE output carries real data in the forward, so the bare (unwrapped)
         consumer just runs on it; touching it durably saves the output so recompute
-        reproduces the real value -- no remat.op needed on the consumer. The two
-        explicit-policy variants (wrap the consumer in a RECOMPUTE op so it ferries the
-        saved value, or give the producer RECOMPUTE so its output is real) produce the
-        same gradient.
+        reproduces the real value -- no remat.region needed on the consumer. The two
+        explicit variants (wrap the consumer in a recompute=True region so it ferries
+        the saved value, or give the producer recompute=True so its output is real)
+        produce the same gradient.
         """
 
         class SavedMul(torch.autograd.Function):
@@ -91,9 +91,9 @@ class BareOpTest(expecttest.TestCase):
 
         # Bare op after a SAVE op: the bare relu consumes the SAVE op's placeholder
         # during recompute and materializes it from the taped output -- works with no
-        # remat.op on the consumer.
+        # remat.region on the consumer.
         def body_bare(x: torch.Tensor) -> torch.Tensor:
-            y = remat.op(SavedMul.apply, "mul", policy=remat.SAVE)(x)
+            y = remat.region(SavedMul.apply, "mul", recompute=False)(x)
             return torch.relu(y)
 
         # Bare consumption of a SAVE output needs the bare-op detection strategy.
@@ -111,8 +111,8 @@ class BareOpTest(expecttest.TestCase):
         x.grad = None
 
         def body_recompute_consumer(x: torch.Tensor) -> torch.Tensor:
-            y = remat.op(SavedMul.apply, "mul", policy=remat.SAVE)(x)
-            return remat.op(ReluOp.apply, "relu", policy=remat.RECOMPUTE)(y)
+            y = remat.region(SavedMul.apply, "mul", recompute=False)(x)
+            return remat.region(ReluOp.apply, "relu", recompute=True)(y)
 
         remat.checkpoint()(body_recompute_consumer)(x).sum().backward()
         self.assertTrue(torch.equal(x.grad, expected_grad))
@@ -121,7 +121,7 @@ class BareOpTest(expecttest.TestCase):
         x.grad = None
 
         def body_recompute_producer(x: torch.Tensor) -> torch.Tensor:
-            y = remat.op(SavedMul.apply, "mul", policy=remat.RECOMPUTE)(x)
+            y = remat.region(SavedMul.apply, "mul", recompute=True)(x)
             return torch.relu(y)
 
         remat.checkpoint()(body_recompute_producer)(x).sum().backward()
@@ -147,7 +147,7 @@ class BareOpTest(expecttest.TestCase):
                 return grad_output * 2
 
         def body(x: torch.Tensor) -> torch.Tensor:
-            y = remat.op(SavedMul.apply, "mul", policy=remat.SAVE)(x)
+            y = remat.region(SavedMul.apply, "mul", recompute=False)(x)
             return torch.relu(y)  # bare consumer of the SAVE output
 
         # Default: bare consumer is intercepted, so it just works.
@@ -165,7 +165,7 @@ class BareOpTest(expecttest.TestCase):
 
         The SAVE output carries real data, so the view and the later compute both just
         run; touching it durably saves the base, and recompute reproduces the base and
-        re-runs the chain -- so a reshape + add + relu written outside remat.op works.
+        re-runs the chain -- so a reshape + add + relu written outside remat.region works.
         """
 
         class SavedMul(torch.autograd.Function):
@@ -180,7 +180,7 @@ class BareOpTest(expecttest.TestCase):
                 return grad_output * 2
 
         def body(x: torch.Tensor) -> torch.Tensor:
-            y = remat.op(SavedMul.apply, "mul", policy=remat.SAVE)(x)
+            y = remat.region(SavedMul.apply, "mul", recompute=False)(x)
             # Bare view (delayed) feeding a bare compute op (materialized).
             return torch.relu(y.reshape(4) + 1.0)
 
@@ -214,7 +214,7 @@ class BareOpTest(expecttest.TestCase):
                 return grad_a * 2 + grad_b * 3
 
         def body(x: torch.Tensor) -> torch.Tensor:
-            a, b = remat.op(SplitScale.apply, "split", policy=remat.SAVE)(x)
+            a, b = remat.region(SplitScale.apply, "split", recompute=False)(x)
             return a + b  # bare add of two SAVE outputs
 
         for strategy in _BARE_OP_STRATEGIES:
@@ -229,7 +229,7 @@ class BareOpTest(expecttest.TestCase):
 
         The forward save stand-in is reached through a one-hop list argument, so both
         outputs are saved and recompute reproduces them -- the residual cat works
-        outside remat.op.
+        outside remat.region.
         """
 
         class SplitScale(torch.autograd.Function):
@@ -246,7 +246,7 @@ class BareOpTest(expecttest.TestCase):
                 return grad_a * 2 + grad_b * 3
 
         def body(x: torch.Tensor) -> torch.Tensor:
-            a, b = remat.op(SplitScale.apply, "split", policy=remat.SAVE)(x)
+            a, b = remat.region(SplitScale.apply, "split", recompute=False)(x)
             return torch.cat([a, b])  # bare op over a list of two SAVE outputs
 
         def reference(x: torch.Tensor) -> torch.Tensor:
@@ -263,7 +263,7 @@ class BareOpTest(expecttest.TestCase):
 
         Producer responsibility: a bare consumer trips the forward save stand-in's
         interception, which durably saves the producer's output slot (so recompute can
-        reproduce it). A remat.op consumer unwraps up front and ferries the value onto
+        reproduce it). A remat.region consumer unwraps up front and ferries the value onto
         its *own* record instead, so the producer keeps no output.<i> slot -- the save
         is selective, not producer-eager for every output.
         """
@@ -288,7 +288,7 @@ class BareOpTest(expecttest.TestCase):
                     "r", detect_bare_ops=strategy
                 )
                 with forward_context:
-                    y = remat.op(Save.apply, "producer", policy=remat.SAVE)(x)
+                    y = remat.region(Save.apply, "producer", recompute=False)(x)
                     torch.relu(
                         y
                     )  # bare touch of the stand-in -> durably saves output.0
@@ -297,17 +297,17 @@ class BareOpTest(expecttest.TestCase):
                     producer = active.region_state.records["producer"]
                     self.assertEqual([0], list(producer.output_slots))
 
-                # remat.op consumer: also the producer's responsibility -- the consumer
+                # remat.region consumer: also the producer's responsibility -- the consumer
                 # triggers the same durable output.0, and holds no tape state itself.
                 forward_context, _ = _checkpoint_context_fn(
                     "r", detect_bare_ops=strategy
                 )
                 with forward_context:
-                    y = remat.op(Save.apply, "producer", policy=remat.SAVE)(x)
-                    remat.op(
+                    y = remat.region(Save.apply, "producer", recompute=False)(x)
+                    remat.region(
                         lambda t: t + 1,
                         "consumer",
-                        policy=remat.RECOMPUTE,
+                        recompute=True,
                     )(y)
                     active = _state.get()
                     assert active is not None
@@ -337,7 +337,7 @@ class BareOpTest(expecttest.TestCase):
                 return grad_output * y
 
         def body(x: torch.Tensor) -> torch.Tensor:
-            y = remat.op(SaveExp.apply, "exp", policy=remat.SAVE)(x)
+            y = remat.region(SaveExp.apply, "exp", recompute=False)(x)
             return y + 1.0  # bare consumer of the SAVE output, no detect_bare_ops
 
         def reference(x: torch.Tensor) -> torch.Tensor:
@@ -385,10 +385,10 @@ class BareOpTest(expecttest.TestCase):
         def region(x: torch.Tensor) -> torch.Tensor:
             # Consume position 0 (the position historically served a placeholder); leave
             # position 1 dead so the whole guarantee rides on position 0's slot filling.
-            first, _second = remat.op(DupProducer.apply, "producer", policy=remat.SAVE)(
-                x
-            )
-            return remat.op(consumer, "consumer", policy=remat.RECOMPUTE)(first)
+            first, _second = remat.region(
+                DupProducer.apply, "producer", recompute=False
+            )(x)
+            return remat.region(consumer, "consumer", recompute=True)(first)
 
         strategies = ("none", *_BARE_OP_STRATEGIES)
 
@@ -424,7 +424,7 @@ class BareOpTest(expecttest.TestCase):
 
         A bare op runs on the real data and returns a plain tensor (one hop), firing
         the producer's durable-save on every touch; the grad-connected unwrap a
-        remat.op uses does not save; an in-place op errors -- it would corrupt the
+        remat.region uses does not save; an in-place op errors -- it would corrupt the
         copy the SAVE op keeps for backward.
         """
 
@@ -451,7 +451,7 @@ class BareOpTest(expecttest.TestCase):
         # Every bare touch fires the (idempotent-in-practice) durable save.
         self.assertGreaterEqual(calls["n"], 3)
 
-        # The remat.op / boundary unwrap is grad-connected and does NOT durable save.
+        # The remat.region / boundary unwrap is grad-connected and does NOT durable save.
         calls["n"] = 0
         plain = _unwrap_save_tensor(save_tensor)
         self.assertEqual(0, calls["n"])
@@ -527,7 +527,7 @@ class BareOpTest(expecttest.TestCase):
         self.assertEqual(real.shape, proxy.shape)
         self.assertEqual(0, calls["n"])
 
-        # The remat.op / boundary unwrap is grad-connected and does NOT durable save.
+        # The remat.region / boundary unwrap is grad-connected and does NOT durable save.
         handle = _save_proxy_handle(proxy)
         unwrapped = handle.unwrap(proxy)
         self.assertEqual(0, calls["n"])
@@ -573,10 +573,10 @@ class BareOpTest(expecttest.TestCase):
                 return grad * ctx.k, None
 
         def region(x: torch.Tensor) -> torch.Tensor:
-            a = remat.op(SaveMul.apply, "a", policy=remat.SAVE)(x, 2.0)
-            b = remat.op(SaveMul.apply, "b", policy=remat.SAVE)(x, 3.0)
+            a = remat.region(SaveMul.apply, "a", recompute=False)(x, 2.0)
+            b = remat.region(SaveMul.apply, "b", recompute=False)(x, 3.0)
             c = a.view_as(b)  # bare binary view: view of `a`, `b` a shape spectator
-            return remat.op(torch.mul, "consume", policy=remat.RECOMPUTE)(c, 5.0)
+            return remat.region(torch.mul, "consume", recompute=True)(c, 5.0)
 
         def reference(x: torch.Tensor) -> torch.Tensor:
             return (x * 2.0) * 5.0
@@ -613,7 +613,7 @@ class BareOpTest(expecttest.TestCase):
         Mirrors the ``__torch_dispatch__`` subclass: SAVE outputs stay plain tensors and the
         installed ``TorchDispatchMode`` fires the producer's durable-save for any op that
         touches one -- views included (no deferral). An in-place op errors before it runs,
-        and detection is suppressed inside a ``remat.op``'s own processing. ``data_ptr`` is a
+        and detection is suppressed inside a ``remat.region``'s own processing. ``data_ptr`` is a
         raw accessor that bypasses ``__torch_dispatch__``, so -- unlike the subclass and the
         function mode -- it is NOT intercepted here.
         """
@@ -648,7 +648,7 @@ class BareOpTest(expecttest.TestCase):
             _ = real.data_ptr()
             self.assertEqual(0, calls["n"])
 
-            # Suppressed inside a remat.op's own processing: no save.
+            # Suppressed inside a remat.region's own processing: no save.
             calls["n"] = 0
             with _suppress_bare_op_detection():
                 _ = torch.sin(real)
@@ -791,7 +791,7 @@ class BareOpTest(expecttest.TestCase):
         torch call. A *view* is deferred -- its outputs are registered in the save-output
         index under the producer's save and no save fires; a real compute, an operator, or
         ``data_ptr`` ("poked hard") fires the save once and returns a plain result. An
-        in-place op errors, and detection is suppressed inside a ``remat.op``.
+        in-place op errors, and detection is suppressed inside a ``remat.region``.
         """
 
         region_state = _CheckpointRegionState()
@@ -845,7 +845,7 @@ class BareOpTest(expecttest.TestCase):
             _ = real.data_ptr()
             self.assertEqual(1, calls["n"])
 
-            # Suppressed inside a remat.op's own processing: no save.
+            # Suppressed inside a remat.region's own processing: no save.
             calls["n"] = 0
             with _suppress_bare_op_detection():
                 _ = torch.sin(real)
@@ -882,8 +882,10 @@ class BareOpTest(expecttest.TestCase):
                 return (grad * 2).t()
 
         def region(x: torch.Tensor) -> torch.Tensor:
-            view = remat.op(SaveTransposeView.apply, "save", policy=remat.SAVE)(x)[0:3]
-            return remat.op(torch.mul, "consume", policy=remat.RECOMPUTE)(view, 3.0)
+            view = remat.region(SaveTransposeView.apply, "save", recompute=False)(x)[
+                0:3
+            ]
+            return remat.region(torch.mul, "consume", recompute=True)(view, 3.0)
 
         def reference(x: torch.Tensor) -> torch.Tensor:
             return (x * 2).t()[0:3] * 3.0
@@ -919,7 +921,9 @@ class BareOpTest(expecttest.TestCase):
 
                 def region(x: torch.Tensor) -> torch.Tensor:
                     nonlocal output_ref
-                    y = remat.op(SaveTransposeView.apply, "save", policy=remat.SAVE)(x)
+                    y = remat.region(SaveTransposeView.apply, "save", recompute=False)(
+                        x
+                    )
                     view = y[0:3]  # bare deferred view, created then dropped unused
                     if not remat.is_recomputing():
                         # Reach the real output (the proxy's inner, or the value itself).
