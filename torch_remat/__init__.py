@@ -14,7 +14,7 @@ from torch_remat._api import (  # noqa: F401
     save_for_backward,
     saved_tensors_hooks,
 )
-from torch_remat._region import is_recomputing  # noqa: F401
+from torch_remat._region import is_recomputing, RecomputeStateHook  # noqa: F401
 from torch_remat._reporting import (  # noqa: F401
     format_current_memory_report,
     print_current_memory_report,

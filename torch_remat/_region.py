@@ -26,7 +26,7 @@ import contextvars
 from dataclasses import dataclass, field
 from enum import Enum
 from types import TracebackType
-from typing import TYPE_CHECKING
+from typing import Any, Protocol, runtime_checkable, TYPE_CHECKING
 
 import torch
 from torch.utils.weak import WeakTensorKeyDictionary
@@ -39,6 +39,45 @@ if TYPE_CHECKING:
     from torch_remat._api import _SaveOpForwardScratch, _SaveRecord
     from torch_remat._bare_op._common import _SaveOutputHandle
     from torch_remat._bare_op._strategy import _BareOpStrategy
+
+
+@runtime_checkable
+class RecomputeStateHook(Protocol):
+    """Snapshot/restore hook keeping external (non-tensor) state aligned across recompute.
+
+    ``preserve_rng_state`` realigns torch's own generators across recompute, but
+    external state -- e.g. farm's global RNG op-counter that seeds dropout and
+    stochastic rounding -- is invisible to it. A ``recompute=False`` (SAVE)
+    region's body runs on the original forward but is skipped on recompute (its
+    outputs are served from the tape), so any such state the body advanced is left
+    behind on recompute and every downstream draw shifts, silently diverging the
+    recompute from the forward.
+
+    A registered hook closes that gap. torch_remat calls :meth:`snapshot` on the
+    forward and :meth:`restore` on recompute at two points:
+
+    * at region entry (snapshot before the body, restore before the replay) --
+      this is the boundary realignment that keeps bare / ``recompute=True`` draws
+      *before* the first SAVE op aligned; and
+    * around each SAVE op (snapshot its exit state on the forward, restore that
+      exact state on recompute where the body is skipped) -- so the skipped op's
+      effect on the state is reproduced.
+
+    ``restore`` is absolute (it reinstates a captured snapshot, not a delta), so
+    the state resyncs at every SAVE boundary and a ``retain_graph`` re-recompute
+    replays identically. RECOMPUTE and bare ops need no hook: they rerun on
+    recompute and advance the state naturally.
+
+    Register hooks via ``checkpoint(..., recompute_state_hooks=...)``.
+    """
+
+    def snapshot(self) -> Any:
+        """Return an opaque snapshot of the external state (called on the forward)."""
+        ...
+
+    def restore(self, state: Any) -> None:
+        """Reinstate a snapshot returned by :meth:`snapshot` (called on recompute)."""
+        ...
 
 
 class _Phase(Enum):
@@ -89,6 +128,16 @@ class _CheckpointRegionState:
     rederived_saved_inputs: dict[str, dict[str, torch.Tensor]] = field(
         default_factory=dict
     )
+
+    # Snapshot/restore hooks for external state (e.g. an RNG op-counter) kept aligned
+    # across recompute. Registered via ``checkpoint(..., recompute_state_hooks=...)``;
+    # see :class:`RecomputeStateHook`. Empty when none are registered.
+    state_hooks: tuple[RecomputeStateHook, ...] = ()
+
+    # Per-hook snapshots taken at region entry on the forward (``state_hooks`` order),
+    # restored at the start of recompute so pre-SAVE-op draws realign to the boundary.
+    # Filled when the FORWARD phase context is entered.
+    entry_snapshots: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -146,6 +195,12 @@ class _CheckpointPhaseContext(contextlib.AbstractContextManager[None]):
     bare-op detection mode (a null context for non-mode strategies); the mode is
     deliberately absent during RECOMPUTE, where SAVE ops are skipped and their
     outputs come from the tape or a placeholder.
+
+    The RECOMPUTE phase also brackets the replay with :class:`RecomputeStateHook`
+    *fork* semantics: it snapshots the outer external state on entry, realigns to
+    the region-entry snapshot, and reinstates the outer state on exit -- so the
+    replay's redraws (e.g. RNG) never leak into the surrounding backward or the next
+    step, matching ``torch.random.fork_rng``.
     """
 
     def __init__(
@@ -157,15 +212,34 @@ class _CheckpointPhaseContext(contextlib.AbstractContextManager[None]):
         self._phase = phase
         self._token: contextvars.Token[_ActiveCheckpointRegion | None] | None = None
         self._mode: contextlib.AbstractContextManager[None] | None = None
+        # Outer-state snapshots taken at RECOMPUTE entry, reinstated at RECOMPUTE exit.
+        self._outer_snapshots: tuple[Any, ...] = ()
 
     def __enter__(self) -> None:
         self._token = _state.set(
             _ActiveCheckpointRegion(region_state=self._region_state, phase=self._phase)
         )
+        region_state = self._region_state
         if self._phase is _Phase.FORWARD:
-            mode = self._region_state.bare_op_strategy.forward_mode(self._region_state)
+            # Snapshot external state at region entry so recompute can realign to it
+            # before replaying the body -- the boundary counterpart to per-SAVE-op
+            # restore. See :class:`RecomputeStateHook`.
+            region_state.entry_snapshots = tuple(
+                hook.snapshot() for hook in region_state.state_hooks
+            )
+            mode = region_state.bare_op_strategy.forward_mode(region_state)
             mode.__enter__()
             self._mode = mode
+        else:  # _Phase.RECOMPUTE
+            # Fork: snapshot the outer state so it can be reinstated once the replay
+            # finishes, then realign to the region-entry snapshot before replaying.
+            self._outer_snapshots = tuple(
+                hook.snapshot() for hook in region_state.state_hooks
+            )
+            for hook, snapshot in zip(
+                region_state.state_hooks, region_state.entry_snapshots
+            ):
+                hook.restore(snapshot)
 
     def __exit__(
         self,
@@ -176,6 +250,14 @@ class _CheckpointPhaseContext(contextlib.AbstractContextManager[None]):
         if self._mode is not None:
             self._mode.__exit__(exc_type, exc_value, traceback)
             self._mode = None
+        if self._phase is _Phase.RECOMPUTE:
+            # Reinstate the outer state captured on entry, completing the fork so the
+            # replay's redraws don't perturb the surrounding stream.
+            for hook, snapshot in zip(
+                self._region_state.state_hooks, self._outer_snapshots
+            ):
+                hook.restore(snapshot)
+            self._outer_snapshots = ()
         if self._token is not None:
             _state.reset(self._token)
             self._token = None
@@ -184,6 +266,7 @@ class _CheckpointPhaseContext(contextlib.AbstractContextManager[None]):
 def _checkpoint_context_fn(
     region_name: str | None = None,
     detect_bare_ops: bool | str = "subclass",
+    recompute_state_hooks: tuple[RecomputeStateHook, ...] = (),
 ) -> tuple[
     contextlib.AbstractContextManager[None], contextlib.AbstractContextManager[None]
 ]:
@@ -196,6 +279,7 @@ def _checkpoint_context_fn(
     region_state = _CheckpointRegionState(
         region_name=region_name,
         bare_op_strategy=_bare_op_strategy(_resolve_detect_bare_ops(detect_bare_ops)),
+        state_hooks=recompute_state_hooks,
     )
     return (
         _CheckpointPhaseContext(region_state, _Phase.FORWARD),

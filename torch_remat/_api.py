@@ -74,6 +74,7 @@ from torch_remat._region import (
     _Phase,
     _save_output_handle,
     _state,
+    RecomputeStateHook,
 )
 from torch_remat._trace import _record_trace_op
 from torch_remat._types import (
@@ -111,9 +112,10 @@ def checkpoint(
     *,
     region_name: str | None = None,
     determinism_check: str = "none",
-    preserve_rng_state: bool = True,
+    preserve_rng_state: bool = False,
     detect_bare_ops: bool | str = "subclass",
     input_saved_tensors_hooks: tuple[PackHook, UnpackHook] | None = None,
+    recompute_state_hooks: tuple[RecomputeStateHook, ...] = (),
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Return a decorator that builds a torch_remat checkpoint wrapper.
 
@@ -140,10 +142,14 @@ def checkpoint(
             compares tensor metadata between the forward and the recompute to
             catch nondeterministic regions. ``"none"`` disables it. Keyword-only.
             Default: ``"none"``.
-        preserve_rng_state (bool, optional): Forwarded verbatim to
-            ``torch.utils.checkpoint.checkpoint``. If ``True``, the forward RNG
-            state is stashed and restored before recompute so RNG-using ops
-            replay identically. Keyword-only. Default: ``True``.
+        preserve_rng_state (bool, optional): Must be ``False``. torch_remat does not
+            preserve torch's RNG state: under selective SAVE-op recompute, a generator
+            drawn inside a skipped SAVE op would desync, and torch's boundary-only
+            stashing would silently paper over that rather than fix it. Passing
+            ``True`` raises, so no caller assumes a guarantee that isn't provided --
+            register a :class:`~torch_remat._region.RecomputeStateHook` via
+            ``recompute_state_hooks`` to snapshot/restore whatever RNG state you rely
+            on instead. Keyword-only. Default: ``False``.
         detect_bare_ops (bool or str, optional): How *bare* (un-``op``-wrapped)
             consumers of a SAVE op's outputs are intercepted, so e.g. a residual
             add or raw Triton kernel works without a :func:`op` wrapper. One of
@@ -160,6 +166,15 @@ def checkpoint(
             must not synchronously free storage the body still reads (defer the free);
             ``unpack_hook`` restores each input when the region is replayed for recompute.
             Keyword-only. Default: ``None``.
+        recompute_state_hooks (tuple, optional): Snapshot/restore hooks (each a
+            :class:`~torch_remat._region.RecomputeStateHook`) that keep external,
+            non-tensor state aligned across recompute -- e.g. a global RNG op-counter
+            seeding dropout / stochastic rounding. ``preserve_rng_state`` only
+            re-seeds torch's own generators; state a skipped SAVE region advanced is
+            otherwise left behind on recompute (the body never reruns), shifting
+            every downstream draw. Each hook is snapshotted at region entry and after
+            every SAVE op on the forward, and restored at the matching points on
+            recompute. Keyword-only. Default: ``()``.
 
     Returns:
         Callable: A decorator that takes the region ``function`` and returns a
@@ -173,6 +188,20 @@ def checkpoint(
         y = remat.checkpoint(region_name="layers.0")(block)(x)
         ```
     """
+
+    if preserve_rng_state:
+        raise NotImplementedError(
+            "torch_remat.checkpoint does not preserve torch's RNG state "
+            "(preserve_rng_state must be False). Under selective SAVE-op recompute a "
+            "generator drawn inside a skipped SAVE op would desync, and boundary-only "
+            "stashing would hide that rather than fix it. If you need it, register a "
+            "RecomputeStateHook via recompute_state_hooks whose snapshot() returns "
+            "(torch.get_rng_state(), torch.cuda.get_rng_state(device)) and whose "
+            "restore(state) calls torch.set_rng_state(state[0]) and "
+            "torch.cuda.set_rng_state(state[1], device) for the device(s) your region "
+            "uses -- the hook then also realigns after each skipped SAVE op, which "
+            "torch's boundary-only stashing does not."
+        )
 
     def decorate(function: Callable[..., Any]) -> Callable[..., Any]:
         def wrapped_function(*inner_args: Any, **inner_kwargs: Any) -> Any:
@@ -199,10 +228,13 @@ def checkpoint(
                     function_args=args,
                     function_kwargs=kwargs,
                     context_fn=lambda: _checkpoint_context_fn(
-                        region_name, detect_bare_ops
+                        region_name, detect_bare_ops, recompute_state_hooks
                     ),
                     determinism_check=determinism_check,
-                    preserve_rng_state=preserve_rng_state,
+                    # torch_remat does not preserve torch RNG (see the guard above);
+                    # keep torch's own stash off so it can't silently do the
+                    # subtly-wrong boundary-only thing.
+                    preserve_rng_state=False,
                 )
 
         return checkpointed_function
@@ -579,6 +611,13 @@ class _SaveRecord:
     # :func:`saved_tensors_hooks` for more details.
     output_slots: dict[int, _OutputSlot] = field(default_factory=dict)
 
+    # --- External-state snapshots taken at this op's exit on the forward
+    # One opaque snapshot per registered ``region_state.state_hooks`` entry (same
+    # order), captured right after the body ran on the forward. Restored when the op
+    # is skipped on recompute so downstream draws stay aligned. Empty when no hooks
+    # are registered. See :class:`RecomputeStateHook`.
+    exit_snapshots: tuple[Any, ...] = ()
+
 
 @dataclass
 class _SaveOpForwardScratch:
@@ -644,6 +683,12 @@ def _run_save_op(
                 "recompute; forward and recompute followed different code paths (or the "
                 "region's recompute setting differs between them)"
             )
+        # The body is skipped on recompute, so restore the external state to the
+        # op's forward exit -- otherwise state it advanced (e.g. an RNG op-counter
+        # seeding downstream dropout / stochastic rounding) is left behind and every
+        # later draw shifts. See :class:`RecomputeStateHook`.
+        for hook, snapshot in zip(region_state.state_hooks, record.exit_snapshots):
+            hook.restore(snapshot)
         if record.saved_input_recipes:
             _rederive_saved_inputs(record, region_state, args, kwargs)
         return _load_saved_outputs(record, region_state)
@@ -718,6 +763,10 @@ def _run_save_op(
             output = function(*args, **kwargs)
     finally:
         _active_save_op.reset(token)
+
+    # Snapshot external state at the op's exit so recompute can restore it where the
+    # body is skipped. See :class:`RecomputeStateHook`.
+    record.exit_snapshots = tuple(hook.snapshot() for hook in region_state.state_hooks)
 
     validated_output = _validate_output(output, reject_leaves_for=(region_state, name))
     _record_output_schema(record, validated_output)
