@@ -329,6 +329,28 @@ def region(
             # Outside a checkpoint region: behave as a plain call.
             return function(*args, **kwargs)
 
+        # Nested inside an enclosing SAVE (recompute=False) op: run inert.
+        # The enclosing SAVE op already retains every activation its body produces
+        # (its saved_tensors_hooks are active here) and is skipped wholesale during
+        # recompute, so this inner region's own machinery -- its record, output
+        # persistence, and especially its saved-input rederive recipes -- is
+        # redundant. Worse, a rederive recipe would be wrong: it assumes the inner
+        # region's inputs are reproduced during recompute, but the enclosing SAVE
+        # skips the ops that produced them, so replay would find only a placeholder.
+        # Running inert lets the inner op's saves ride the enclosing region's hooks
+        # like any other tensor in its body. A nested recompute=True region cannot be
+        # honored (the enclosing SAVE never recomputes), so it is a configuration error.
+        if _active_save_op.get() is not None:
+            if recompute:
+                raise RuntimeError(
+                    f"remat.region {name!r} was called with recompute=True while "
+                    "nested inside a recompute=False (SAVE) region. The enclosing "
+                    "SAVE region is never recomputed, so the inner recompute cannot "
+                    "be honored. Set the inner region to recompute=False, or make "
+                    "the enclosing region recompute=True."
+                )
+            return function(*args, **kwargs)
+
         # Suppress the bare-op detection mode (if any) for this region's own processing,
         # including the wrapped body: the consume/snapshot path already handles the
         # region's saved-output arguments, so the mode must not re-handle them. Known

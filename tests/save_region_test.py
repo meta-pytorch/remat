@@ -883,3 +883,102 @@ blk::span: 12 B
         out = remat.checkpoint(region_name="r")(region)(x)
         with self.assertRaisesRegex(RuntimeError, "different layout"):
             out.backward()
+
+    def test_nested_save_region_inside_save_runs_inert(self) -> None:
+        # A remat.region nested inside an enclosing SAVE (recompute=False) region runs
+        # inert: its saves ride the enclosing region's hooks. This is the MoE dedup
+        # dispatch pattern -- an inner SAVE (the grouped GEMM) consuming a bare op's
+        # output (the dispatched tokens) produced *inside* the outer SAVE. If the inner
+        # region were not inert it would record a rederive recipe for that input and
+        # then fail at backward ("No saved input ... different code paths"): the
+        # enclosing SAVE skips the bare producer on recompute, so the recipe is never
+        # filled.
+        inner_forward_runs = [0]
+
+        class InnerSquare(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
+                if remat.is_recomputing():
+                    raise AssertionError("enclosing SAVE must skip the nested op")
+                inner_forward_runs[0] += 1
+                ctx.save_for_backward(x)  # a bare-op output inside the outer SAVE
+                return x * x
+
+            @staticmethod
+            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+                (x,) = ctx.saved_tensors
+                return grad_output * 2 * x
+
+        def outer_body(x: torch.Tensor) -> torch.Tensor:
+            dispatched = x * 3  # a bare (recompute-by-default) op inside the outer SAVE
+            squared = remat.region(InnerSquare.apply, "inner", recompute=False)(
+                dispatched
+            )
+            return squared + 1  # a trailing bare op (the "combine" analog)
+
+        base = torch.tensor([1.0, 2.0], dtype=torch.float64)
+        x = base.clone().requires_grad_(True)
+        y = remat.checkpoint(region_name="outer_ckpt")(
+            lambda t: remat.region(outer_body, "outer", recompute=False)(t)
+        )(x)
+        y.sum().backward()
+
+        # Inert: the inner op ran once on the forward and never re-ran on recompute
+        # (the enclosing SAVE region is skipped wholesale).
+        self.assertEqual(1, inner_forward_runs[0])
+        # d/dx ((3x)^2 + 1) = 18x
+        self.assertTrue(
+            torch.allclose(x.grad, _ref_grad(lambda t: (t * 3) ** 2 + 1, base))
+        )
+
+    def test_recompute_region_inside_save_region_raises(self) -> None:
+        # A recompute=True region nested inside a SAVE (recompute=False) region cannot
+        # be honored -- the enclosing SAVE never recomputes -- so it is rejected.
+        def outer_body(x: torch.Tensor) -> torch.Tensor:
+            return remat.region(lambda t: t * 2, "inner", recompute=True)(x)
+
+        x = torch.tensor([1.0, 2.0], requires_grad=True)
+        with self.assertRaisesRegex(
+            RuntimeError, "recompute=True.*nested inside a recompute=False"
+        ):
+            remat.checkpoint(region_name="outer_ckpt")(
+                lambda t: remat.region(outer_body, "outer", recompute=False)(t)
+            )(x)
+
+    def test_save_output_register_hook_fires_with_grad(self) -> None:
+        # A backward hook registered on a SAVE region's output must fire with the
+        # gradient w.r.t. that output, even when the output is consumed by a
+        # remat.region that unwraps to the grad-connected inner (bypassing the
+        # subclass wrapper). Regression: activation-gradient (.dx) metrics that
+        # register_hook on a SAVE output were silently dropped (nan) under
+        # whole-layer remat because the hook sat on the wrapper the consumer bypassed.
+        captured: list[torch.Tensor] = []
+
+        class Producer(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
+                ctx.save_for_backward(x)
+                return x * 3
+
+            @staticmethod
+            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+                del ctx
+                return grad_output * 3
+
+        def body(x: torch.Tensor) -> torch.Tensor:
+            y = remat.region(Producer.apply, "producer", recompute=False)(x)
+            y.register_hook(lambda g: captured.append(g.detach().clone()) or g)
+            # Consume via a remat.region, which unwraps y to its grad-connected inner.
+            return remat.region(lambda t: t * 2, "consumer", recompute=True)(y)
+
+        x = torch.tensor([1.0, 2.0], requires_grad=True)
+        remat.checkpoint(region_name="r", detect_bare_ops="subclass")(body)(
+            x
+        ).sum().backward()
+
+        # The hook fired once, with the gradient w.r.t. the SAVE output y = 3x:
+        # d(sum(2 * y))/dy = 2.
+        self.assertEqual(1, len(captured))
+        self.assertTrue(torch.equal(captured[0], torch.tensor([2.0, 2.0])))
+        # End-to-end gradient is still correct: d(sum(2 * 3x))/dx = 6.
+        self.assertTrue(torch.equal(x.grad, torch.tensor([6.0, 6.0])))

@@ -104,6 +104,17 @@ class _SaveTensor(torch.Tensor):
             persist_output()
         return self._inner.data_ptr()
 
+    def register_hook(self, hook: Callable[[torch.Tensor], Any]) -> Any:
+        # Register the backward hook on the grad-connected ``_inner``, not the wrapper.
+        # A remat.region / boundary consumer unwraps to ``_inner`` and backprops there,
+        # bypassing this wrapper entirely; a bare consumer's gradient also reaches
+        # ``_inner`` (wrapper -> _WrapSave -> _inner). A hook left on the wrapper would
+        # therefore never fire for a SAVE output consumed by a region -- so a caller's
+        # gradient hook (e.g. metrics2's activation-gradient .dx probes) would silently
+        # record nothing. Forwarding to ``_inner`` makes the wrapper transparent for
+        # register_hook, matching how it is transparent for every other tensor op.
+        return self._inner.register_hook(hook)
+
 
 class _WrapSave(torch.autograd.Function):
     """Wrap a SAVE op's produced tensor into a grad-connected forward wrapper.
