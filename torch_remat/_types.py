@@ -204,8 +204,9 @@ class _OutputSchema:
     intentionally not preserved.
     """
 
-    # The observed output container: ``None`` for a bare tensor, else ``tuple`` or
-    # ``list``. Recompute rebuilds the placeholders in the same container.
+    # The observed output container: ``None`` for a bare tensor, ``tuple`` / ``list``,
+    # or a ``NamedTuple`` type (kept verbatim so its named fields survive recompute).
+    # Recompute rebuilds the placeholders in this container (see ``rebuild_container``).
     container: type | None
 
     # Per-output specs in return-schema order.

@@ -58,9 +58,11 @@ from torch_remat._placeholder import (
     _TensorMetadata,
 )
 from torch_remat._pytree import (
+    container_type,
     iter_arg_leaves,
     map_arg_leaves,
     PathToken,
+    rebuild_container,
     value_leaves,
 )
 from torch_remat._recompute_boundary import _checkpoint_recompute_boundary
@@ -273,9 +275,11 @@ def region(
 
     Tensor inputs and outputs follow ATen conventions -- a Tensor, or a
     *one-hop* ``tuple`` / ``list`` of Tensors -- deliberately not full pytree
-    (nor ``dict``). Arguments are walked leniently: anything else (a ``dict``, a
-    custom object, deeper nesting) is an opaque leaf handed to ``function``
-    untouched. That leniency has a cost: if an upstream ``recompute=False``
+    (nor ``dict``). A ``NamedTuple`` of Tensors counts as a one-hop tuple and keeps
+    its own type across the region (its named fields survive the round-trip, so a
+    structured return like ``RouterOutput`` can be wrapped directly). Arguments are
+    walked leniently: anything else (a ``dict``, a custom object, deeper nesting) is
+    an opaque leaf handed to ``function`` untouched. That leniency has a cost: if an upstream ``recompute=False``
     region's output is hidden inside such a leaf, remat's argument walk never finds
     it and so never arranges for the producer to persist it. A ``recompute=True``
     consumer of that output then gets the skipped producer's stand-in placeholder
@@ -1012,7 +1016,9 @@ def _prepare_outputs(
         returned.append(value)
     if isinstance(output, torch.Tensor):
         return returned[0]
-    return (list if isinstance(output, list) else tuple)(returned)
+    container = container_type(output)
+    assert container is not None  # output is a one-hop tuple/list here
+    return rebuild_container(container, returned)
 
 
 @dataclass
@@ -1072,9 +1078,9 @@ def _record_output_schema(record: _SaveRecord, output: Output) -> None:
     """Record a SAVE op's boundary output metadata and report labels on ``record``."""
 
     tensors = _output_tensors(output)
-    container: type | None = None
-    if not isinstance(output, torch.Tensor):
-        container = list if isinstance(output, list) else tuple
+    # A NamedTuple output keeps its own type so recompute rebuilds the same named
+    # container; a bare tensor yields None, other tuples/lists collapse to tuple/list.
+    container = container_type(output)
     record.output_schema = _OutputSchema(
         container=container,
         specs=tuple(
@@ -1206,7 +1212,7 @@ def _load_saved_outputs(
 
     if schema.container is None:
         return outputs[0]
-    return schema.container(outputs)
+    return rebuild_container(schema.container, outputs)
 
 
 def _load_output_slot(

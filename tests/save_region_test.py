@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import gc
 import weakref
-from typing import Any, cast
+from typing import Any, cast, NamedTuple
 
 import expecttest
 import torch
@@ -490,6 +490,43 @@ blk::span: 12 B
         # Recorded on the original forward and again on recompute (where the SAVE
         # op replays as placeholders): both must rebuild a list, not a tuple.
         self.assertEqual(seen_container, [list, list])
+
+    def test_save_op_returns_namedtuple_output(self) -> None:
+        """A SAVE op may return a NamedTuple; recompute rebuilds the same named type.
+
+        This is the ``RouterOutput`` shape: a structured, all-Tensor return wrapped
+        directly in a region. Its type must survive the round-trip on both the
+        original forward and the tape replay so callers keep field access.
+        """
+
+        class Pair(NamedTuple):
+            double: torch.Tensor
+            triple: torch.Tensor
+
+        seen_container: list[type] = []
+
+        def body(x: torch.Tensor) -> torch.Tensor:
+            pair = remat.region(
+                lambda t: Pair(double=t * 2, triple=t * 3),
+                "split",
+                recompute=False,
+            )(x)
+            seen_container.append(type(pair))
+            # Named-field access must work on the forward value and the recompute
+            # reconstruction alike; both fields are SAVE outputs ferried on recompute.
+            return remat.region(torch.add, "add", recompute=True)(
+                pair.double, pair.triple
+            )
+
+        x = torch.tensor([1.0, 2.0], requires_grad=True)
+        out = remat.checkpoint()(body)(x)
+        out.sum().backward()
+
+        self.assertTrue(torch.equal(out.detach(), torch.tensor([5.0, 10.0])))
+        self.assertTrue(torch.equal(x.grad, torch.tensor([5.0, 5.0])))
+        # Rebuilt as the NamedTuple type on the original forward and again on
+        # recompute (where the SAVE op replays from the tape), not a plain tuple.
+        self.assertEqual(seen_container, [Pair, Pair])
 
     def test_multi_op_save_region(self) -> None:
         base = torch.randn(5, dtype=torch.float64)

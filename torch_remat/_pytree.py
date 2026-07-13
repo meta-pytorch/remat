@@ -17,7 +17,10 @@ what we support is:
 * A **value** is a leaf, or *one* hop of ``list`` / ``tuple`` whose elements are
   leaves. This is the shape of an ATen operator's arguments and results
   (``Tensor``, ``Tensor[]``, ``(Tensor, Tensor)``) and of a ``remat.region`` call's
-  return.
+  return. A ``NamedTuple`` counts as a one-hop ``tuple`` and, unlike a plain or
+  ``structseq`` tuple, keeps its own type across a map-and-rebuild (see
+  :func:`container_type`) so a structured return like ``RouterOutput`` survives the
+  round-trip with its named fields intact.
 * A call's **arguments** are ``args`` (positional) plus ``kwargs`` (keyword),
   where each argument is a value. This is what a ``remat.region``-wrapped callable and
   ``__torch_dispatch__`` receive.
@@ -54,18 +57,49 @@ def value_leaves(value: object) -> tuple[object, ...]:
     return (value,)
 
 
+def container_type(value: object) -> type | None:
+    """Return the type to rebuild one-hop ``value`` with, or ``None`` for a leaf.
+
+    A ``list`` stays ``list`` and a ``NamedTuple`` keeps its own type -- so its named
+    fields survive a map-and-rebuild -- while every other tuple (a plain ``tuple`` or
+    a ``structseq`` such as ``torch.return_types.*``) collapses to a plain ``tuple``.
+    A ``NamedTuple`` is told apart by its ``_fields`` attribute, which neither a plain
+    ``tuple`` nor a ``structseq`` carries.
+    """
+
+    if isinstance(value, list):
+        return list
+    if isinstance(value, tuple):
+        return type(value) if hasattr(value, "_fields") else tuple
+    return None
+
+
+def rebuild_container(container: type, items: list[object]) -> object:
+    """Build a one-hop ``container`` from already-mapped ``items``.
+
+    A ``NamedTuple`` is built via ``_make`` (its constructor takes the fields
+    positionally, not one iterable); ``list`` / ``tuple`` take the iterable directly.
+    ``container`` is what :func:`container_type` returned for the original value.
+    """
+
+    make = getattr(container, "_make", None)
+    if make is not None:
+        return make(items)
+    return container(items)
+
+
 def map_value(fn: Callable[[object], object], value: object) -> object:
     """Map ``fn`` over the leaves of one value, rebuilding the same container.
 
-    ``fn`` is applied to every leaf (tensor or not). Containers are rebuilt as plain
-    ``list`` / ``tuple`` -- subclasses such as ``torch.return_types`` collapse to a
-    plain ``tuple``, matching how op output schemas are recorded.
+    ``fn`` is applied to every leaf (tensor or not). The container is rebuilt per
+    :func:`container_type`: a ``NamedTuple`` keeps its type, other tuples collapse to
+    a plain ``tuple``, matching how op output schemas are recorded.
     """
 
-    if isinstance(value, (list, tuple)):
-        items = [fn(item) for item in value]
-        return tuple(items) if isinstance(value, tuple) else items
-    return fn(value)
+    container = container_type(value)
+    if container is None:
+        return fn(value)
+    return rebuild_container(container, [fn(leaf) for leaf in value_leaves(value)])
 
 
 def iter_arg_leaves(
@@ -133,7 +167,10 @@ def _map_arg(
 ) -> object:
     """Map ``fn`` over one argument's leaves, rebuilding the container."""
 
-    if isinstance(value, (list, tuple)):
-        items = [fn((*prefix, index), item) for index, item in enumerate(value)]
-        return tuple(items) if isinstance(value, tuple) else items
-    return fn(prefix, value)
+    container = container_type(value)
+    if container is None:
+        return fn(prefix, value)
+    items = [
+        fn((*prefix, index), leaf) for index, leaf in enumerate(value_leaves(value))
+    ]
+    return rebuild_container(container, items)
