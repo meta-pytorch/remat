@@ -676,6 +676,25 @@ class _SaveOpForwardScratch:
 # --------------------------------------------------------------------------
 
 
+def _detach_for_user_hook(tensor: torch.Tensor) -> torch.Tensor:
+    """Detach a saved tensor for a user pack hook, retaining parameter-ness.
+
+    remat hands user saved-tensor hooks a *detached* tensor (same storage/version) so
+    an identity pack doesn't close the gc-invisible Node<->payload cycle. But
+    ``tensor.detach()`` on an ``nn.Parameter`` yields a plain ``Tensor``, dropping the
+    type that hooks rely on to classify what they were handed -- e.g. activation
+    offload leaves FSDP-managed weights alone via ``isinstance(t, nn.Parameter)``.
+    Without the re-wrap, an unsharded FSDP param saved by a SAVE op is mistaken for an
+    activation, offloaded, and races FSDP's reshard-after-forward that frees its
+    storage. The re-wrap shares the same storage/version as the detached tensor, so the
+    cycle break and FSDP's in-place storage revival on the backward re-gather still hold.
+    """
+    detached = tensor.detach()
+    if isinstance(tensor, torch.nn.Parameter):
+        return torch.nn.Parameter(detached, requires_grad=False)
+    return detached
+
+
 def _run_save_op(
     state: _ActiveCheckpointRegion,
     name: str,
@@ -766,7 +785,7 @@ def _run_save_op(
         hooks = _active_saved_tensors_hooks.get()
         if hooks is not None:
             pack_hook, unpack_hook = hooks
-            return _SavedHookData(pack_hook(tensor.detach()), unpack_hook)
+            return _SavedHookData(pack_hook(_detach_for_user_hook(tensor)), unpack_hook)
 
         # Default (identity hook): the tensor stays a normal autograd saved tensor.
         return _default_pack(record, scratch, tensor, name)

@@ -342,3 +342,62 @@ compute block.0.mid [recompute] (recompute)
         self.assertEqual(1, input_unpacks[0])
         # grad of sum(x^2) is 2x -- the round-tripped input fed forward and recompute.
         self.assertTrue(torch.equal(leaf.grad, torch.tensor([4.0, 6.0])))
+
+    def test_saved_tensors_hooks_retain_parameter_ness(self) -> None:
+        # A SAVE op that saves an nn.Parameter for backward (e.g. a linear weight for
+        # its wgrad) must hand that tensor to the user pack hook AS an nn.Parameter.
+        # remat detaches saved tensors before the hook (to break the Node<->payload
+        # cycle); a plain detach() drops the Parameter type, so an activation-offload
+        # engine that skips FSDP-managed weights via isinstance(t, nn.Parameter) would
+        # mistake the unsharded weight for an activation, offload it, and race FSDP's
+        # reshard-after-forward that frees its storage. The saved non-parameter
+        # activation must still arrive as a plain Tensor.
+        packed_is_param: list[bool] = []
+
+        def pack(tensor: torch.Tensor) -> object:
+            packed_is_param.append(isinstance(tensor, torch.nn.Parameter))
+            return tensor
+
+        def unpack(packed: object) -> torch.Tensor:
+            return cast(torch.Tensor, packed)
+
+        # Mirror the real attn qkv_proj SAVE op: a custom autograd Function whose
+        # forward does ctx.save_for_backward(activation, weight) with the weight an
+        # nn.Parameter captured from the enclosing module (not a region input).
+        # An internal activation is saved alongside it as a plain-Tensor control.
+        weight = torch.nn.Parameter(torch.randn(3, 3))
+
+        class Linear(torch.autograd.Function):
+            @staticmethod
+            def forward(
+                ctx: Any, x: torch.Tensor, w: torch.nn.Parameter
+            ) -> torch.Tensor:
+                act = x * 2  # an internal, non-parameter save
+                ctx.save_for_backward(act, w)
+                return act @ w.t()
+
+            @staticmethod
+            def backward(
+                ctx: Any, grad_output: torch.Tensor
+            ) -> tuple[torch.Tensor, None]:
+                (act, w) = ctx.saved_tensors
+                del act
+                return (grad_output @ w) * 2, None
+
+        def body(x: torch.Tensor) -> torch.Tensor:
+            def fn(inp: torch.Tensor) -> torch.Tensor:
+                return Linear.apply(inp, weight)
+
+            return remat.region(fn, "linear", recompute=False)(x)
+
+        x = torch.randn(4, 3, requires_grad=True)
+        with remat.saved_tensors_hooks(pack, unpack):
+            y = remat.checkpoint()(body)(x)
+            y.sum().backward()
+
+        # Two body saves reach pack: the activation (plain Tensor) then the weight
+        # (nn.Parameter, preserved across remat's detach). Without the fix the weight
+        # would arrive as a plain Tensor -> [False, False].
+        self.assertEqual([False, True], packed_is_param)
+        # Grad still flows through the parameter-wrapped saved weight.
+        self.assertIsNotNone(x.grad)
