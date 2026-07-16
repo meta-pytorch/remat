@@ -140,37 +140,38 @@ def _placeholder_message(tensor: torch.Tensor) -> str:
     raise AssertionError("tensor is not a placeholder")
 
 
-def _placeholder_message_text(source: str, op_display_name: str) -> str:
+def _placeholder_message_text(
+    source: str,
+    op_display_name: str,
+) -> str:
     """Build the diagnostic carried by a skipped saved region's placeholder output.
 
     The failure it describes is config-dependent and only surfaces during the
     recompute pass (inside backward), so the message has to stand on its own --
-    the traceback points into checkpoint recompute, not the user's code.
+    the traceback points into checkpoint recompute, not the user's code. It names the
+    producing region so the reader knows which output stood in as a placeholder.
     """
 
-    return (
-        f"{source} is a placeholder for the output of remat.region '{op_display_name}' "
-        "(recompute=False): a saved region is skipped during recompute, so its output "
-        "is not recomputed -- only a metadata placeholder stands in, and something "
-        "read its data.\n"
+    lines = [
+        f"{source} is a placeholder for the output of remat.region "
+        f"'{op_display_name}' (recompute=False): a saved region is skipped during "
+        "recompute, so its output is not recomputed -- only a metadata placeholder "
+        "stands in, and something read its data.",
         "A saved region's output is real during recompute only if some consumer made "
-        "the producer durably save it: a remat.region consumer does this automatically, "
-        "as does a bare consumer when detect_bare_ops is enabled. With detect_bare_ops "
-        "disabled, a plain bare/unwrapped op -- a view then .contiguous(), a residual "
-        "add, anything not wrapped in remat.region -- does not, and hits this "
-        "placeholder instead.\n"
+        "the producer durably save it. A remat.region consumer (including one that "
+        "receives a bare view of the output) does this automatically. A bare, unwrapped "
+        "op -- a residual add, a view then .contiguous(), a raw kernel, anything not "
+        "wrapped in remat.region -- cannot be detected, and hits this placeholder "
+        "instead.",
         f"This depends on recompute: it appears only because '{op_display_name}' has "
         "recompute=False; the same code works with recompute=True (its output is then "
-        "real). That is why a region can pass with everything recompute=True and fail "
-        "once a region is switched to recompute=False.\n"
-        "Fix one of:\n"
-        "  (1) wrap the consuming op in remat.region(..., recompute=True) so it loads "
-        "the saved value during recompute (e.g. make a residual add a recompute=True "
-        "region);\n"
-        "  (2) move the consuming op into a remat.region (do the reshape/add "
-        "inside the producing or consuming region);\n"
-        f"  (3) give '{op_display_name}' recompute=True."
-    )
+        "real).",
+        "To fix it, call remat.recompute_needs_tensor(t) on the output tensor, right "
+        "before the bare op that reads it, to force the producer to durably save it. "
+        "Placing the call at the consumer means the output is saved only when that code "
+        "path actually runs, so you can never over-save.",
+    ]
+    return "\n".join(lines)
 
 
 def _null_storage(nbytes: int, device: torch.device) -> torch.UntypedStorage:

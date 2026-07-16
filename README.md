@@ -23,14 +23,16 @@ Broadly speaking, here is how you use `torch_remat`:
   `recompute=True` to recompute.  Driving `recompute` from a config flag is the
   natural way to toggle an op between saving and recomputing.
 
-By default, `torch_remat` detects that an output of a `SAVE` region has passed
-to a `RECOMPUTE` region by wrapping all outputs from `SAVE` regions into a
-tensor subclass that acts like a normal tensor, except it helps us tell if
-the tensor is used in a subsequent `RECOMPUTE` region.  If your code is
-not compatible with tensor subclasses, you can turn this off via
-`detect_bare_ops=False` (you must then explicitly annotate all downstream
-consumers with an explicit `remat.region`), or try another `detect_bare_ops`
-strategy (described in the [Detect bare ops](#detect-bare-ops) section.)
+`torch_remat` detects that an output of a `SAVE` region has passed to a
+`RECOMPUTE` region by keeping a per-region index of `SAVE` outputs keyed by
+storage: when a `remat.region` consumes such an output (or a bare view of it),
+the producer is made to durably save it. A *bare* op (something not wrapped in
+`remat.region` — a residual add, a `.reshape`, a raw kernel) cannot be detected;
+if a `SAVE` region's output flows into one, call `remat.recompute_needs_tensor(t)`
+on the output right before the bare op so the producer persists it (see the
+[recompute_needs_tensor](#recompute_needs_tensor) section). Otherwise a bare
+consumer meets a placeholder during recompute and raises with a message pointing
+back at the producing region.
 
 How does this compare to existing PyTorch checkpointing APIs?
 
@@ -157,15 +159,14 @@ introduce two new mechanisms to make this work:
    `remat.saved_tensors_hooks(...)` — e.g. to offload `SAVE` activations — since
    the identity hook would otherwise shadow PyTorch's own `saved_tensors_hooks`.
 
-2. We register each output of a `SAVE` region in a per-region **save-output index**
-   that marks it as needing to be saved if it flows into a `RECOMPUTE` region. A
-   `RECOMPUTE` `remat.region` looks the value up in the index and ferries it onto a
-   special remat-specific tape (by the way, this is why you need to apply `remat.region`
-   to both `SAVE` and `RECOMPUTE` regions, not just `RECOMPUTE`.) A *bare* op that
-   touches a SAVE output instead makes the **producer** save the value on the tape
-   (producer responsibility), via one of the `torch_remat._bare_op` strategies (by
-   default the `_SaveTensor` subclass, unless disabled with `detect_bare_ops=False`).
-   See "SAVE outputs: forward vs recompute".
+2. We register each output of a `SAVE` region in a per-region **save-output index**,
+   keyed by storage, that marks it as needing to be saved if it flows into a
+   `RECOMPUTE` region. A `RECOMPUTE` `remat.region` looks the value up in the index —
+   by storage, so a bare view of the output resolves too — and makes the **producer**
+   save it on a special remat-specific tape. A *bare* op (not wrapped in
+   `remat.region`) cannot be detected; to feed a SAVE output into one, call
+   `remat.recompute_needs_tensor(t)` on the output right before the bare op so
+   the producer persists it. See "SAVE outputs: forward vs recompute".
 
 For any intermediate tensor, this is how it is made available during recompute:
 
@@ -179,108 +180,66 @@ For any intermediate tensor, this is how it is made available during recompute:
   or ferried on the remat tape if it came from another `SAVE` region. This avoids
   retaining a `RECOMPUTE` region's output merely because a downstream `SAVE` op
   saved it for backward.
-* Output of a `SAVE` op: identified via the region's save-output index (by tensor
-  identity, not type). A `RECOMPUTE` op consumer ferries the real value through the
-  remat tape. A *bare* (unwrapped) op consumer is intercepted by default (the
-  **producer** then persists the value the first time it is touched); under
-  `checkpoint(..., detect_bare_ops=False)` it is not intercepted and instead meets a
-  placeholder during recompute and raises. In recompute the output is the real
-  persisted value, or a storage-free placeholder when none was saved (see "SAVE
-  outputs: forward vs recompute").
+* Output of a `SAVE` op: identified via the region's save-output index (by storage,
+  not type). A `RECOMPUTE` op consumer (or one receiving a bare view of the output)
+  makes the **producer** persist the value on the remat tape. A *bare* op consumer
+  cannot be detected: call `remat.recompute_needs_tensor(t)` on the output right before
+  it so the producer persists the value; otherwise it meets a placeholder during
+  recompute and raises. In recompute the output is the real persisted value, or a
+  storage-free placeholder when none was saved (see "SAVE outputs: forward vs recompute").
 
 ## SAVE outputs: forward vs recompute
 
-Every `SAVE` output is registered in a per-region **save-output index** keyed by tensor
-identity (not type), recording how to persist and unwrap it. The ferry (a
-`remat.region` consumer), the SAVE-input snapshot, and the region boundary all consult the
-index, so none of them depends on the output's representation — which is chosen per
-region:
+A `SAVE` op returns its outputs as **plain tensors** — there is no wrapper subclass or
+proxy. Every output is registered in a per-region **save-output index** keyed by
+**storage**, whose value is a *persist-output thunk* that, when fired, records the output
+on the remat tape so recompute can reproduce it. Because the index is keyed by storage
+(not tensor identity, not type), both the output itself and any bare view sharing its
+storage resolve to the same producer thunk, and the mechanism works uniformly for any
+tensor type (`DTensor`, etc.).
 
-- **Opt out** (`detect_bare_ops=False`): a `SAVE` op returns its outputs as **plain
-  tensors**. A `remat.region` consumer is ferried via the index; a *bare* (unwrapped)
-  consumer is not intercepted, so during recompute it meets a storage-free placeholder
-  and raises an actionable error telling you to wrap it in `remat.region` (or re-enable
-  bare-op detection). This is the tight prod path — no tensor subclass, and it works
-  uniformly for any tensor type (`DTensor`, etc.).
+Every output is registered in the index. Who fires its thunk depends on the consumer:
 
-- **Default** (`detect_bare_ops=True`, i.e. `"subclass"`): outputs are wrapped in
-  `_SaveTensor` (a *wrapper* subclass in `torch_remat._bare_op._subclass`, holding the
-  real output as `_inner` and grad-connected to the producer). A bare op consuming it
-  trips `__torch_dispatch__`, which fires the **producer's** persist-output (recording the
-  value so recompute can reproduce it) and runs the op on the unwrapped inner — one hop,
-  every output plain. `data_ptr()` is overridden to persist then return the inner's
-  real pointer, so raw Triton/cutedsl kernels on a `SAVE` output also work. It is the
-  default because it costs only O(SAVE outputs) rather than intercepting every op (as the
-  modes do), sees `data_ptr()`, and is a real tensor so all torch/Python protocols work;
-  opt out with `detect_bare_ops=False` if your tensors aren't subclass-compatible.
+- A **`remat.region` consumer** (a `RECOMPUTE` op, or a `SAVE` op receiving another SAVE
+  op's output) — including one that receives a **bare view** of the output — looks the
+  value up in the index on the forward and fires the producer's thunk. This is
+  on-demand: an output no `remat.region` consumes is not persisted for this reason.
 
-- **`checkpoint(..., detect_bare_ops="proxy")`**: outputs are wrapped in
-  `_SaveProxy` (a `__torch_function__` object in `torch_remat._bare_op._proxy`,
-  `fx.Proxy`-style), an alternative to the subclass. Because it is **not** a tensor it
-  never enters the autograd graph — the moment an op touches it, it unwraps to the
-  grad-connected `_inner` and the op runs on that, so gradient flows
-  producer → `_inner` → consumer with no `_WrapSave` bridge needed. A *view* op (its
-  result aliases the producer output's storage — `reshape`, slice, `transpose`) returns a
-  **new proxy** and *defers* the save, so a bare view later ferried by a `remat.region` never
-  forces the producer to keep a slot; any other op ("poked hard" — a real compute, an
-  operator, `data_ptr()`, `item()`) fires the persist-output once and returns the plain
-  result. The cost of not being a tensor is that operator dunders (`+`, `@`, `[]` …) and
-  method access are installed manually and routed through one dispatcher.
+- An output that is **itself saved for backward** is already resident (autograd keeps it
+  on the original forward graph), so it is persisted eagerly at region exit for free.
 
-- **`checkpoint(..., detect_bare_ops="dispatch_mode" | "function_mode")`**: the *mode*
-  analogues of the subclass and proxy. SAVE outputs stay **plain tensors** (indexed exactly
-  like the opt-out path); instead of a per-output wrapper, a `TorchDispatchMode` /
-  `TorchFunctionMode` is installed for the duration of the original forward and fires the
-  producer's persist-output when an op touches a SAVE output. Because there is no subclass on
-  the graph, there is nothing to unwrap — the op just runs on its already-plain arguments
-  (redispatch is trivial), which is the main appeal. The trade-off is that a mode intercepts
-  **every** op in the region, so remat's own per-op processing (ferry, snapshot, boundary)
-  runs under a suppression flag so it is not mistaken for a bare consumer. `dispatch_mode`
-  mirrors the subclass (fires on every touch, views included) but **cannot see
-  `data_ptr()`** — a raw-pointer kernel bypasses `__torch_dispatch__`; `function_mode`
-  mirrors the proxy (defers on views, registering them back into the save-output index) and
-  **does** see `data_ptr()` through `__torch_function__`.
+- **`remat.recompute_needs_tensor(t)`** fires the thunk explicitly for `t` (or any bare
+  view of it, resolved by storage). Placed right before a **bare** op consumer, it is what
+  makes that consumer work — a bare op cannot be detected, so without it the output would
+  not be saved. Because the call sits on the consumer side, the output is persisted only
+  when that code path runs: you can never over-save.
 
-  For the common case — a *bare* op consuming a SAVE output passed to it as an argument — all
-  four intercepting strategies produce identical observable behavior (gradients, tape slots);
-  they differ only in overhead and in the `data_ptr` reach noted above. They are **not**
-  identical for a SAVE output consumed *inside* a `remat.region` body via **closure capture**
-  (read from the enclosing scope rather than passed as an argument). remat runs the entire
-  `remat.region` body — user code included — under `_suppress_bare_op_detection` on the theory that
-  everything inside an `op` is explicitly handled; but only the op's *arguments* are handled by
-  the consume/snapshot path, not values it reaches through a closure. The wrapper strategies
-  (`subclass`, `proxy`) still catch such a value because a wrapped output trips interception on
-  *any* touch, regardless of the suppression flag (which they never read), so the producer
-  persists it and recompute succeeds. The mode strategies (`dispatch_mode`,
-  `function_mode`) honor the suppression flag, so the closure-captured touch is invisible, the
-  producer never saves, and the value meets a placeholder during recompute and **raises**. Pass
-  such a value as an argument to the `remat.region` (so the consume path handles it) rather than
-  capturing it, or use a wrapper strategy.
+A bare consumer of an output that nothing persisted meets a placeholder during recompute
+and raises, with a message that names the producing region and tells you to call
+`remat.recompute_needs_tensor(t)` (or regionize the consumer).
 
-In **recompute** a skipped `SAVE` op returns each output from its persisted value,
-or a storage-free `_PlaceholderTensor` when none was saved — it was dead, or consumed
-only by a ferrying `remat.region` (which substitutes its value by argument position before
-any op runs). A placeholder supports metadata/view ops (a view of a placeholder is
+In **recompute** a skipped `SAVE` op returns each output from its persisted value, or a
+storage-free `_PlaceholderTensor` when none was saved — it was dead, or consumed only by a
+`remat.region` (whose consume path made the producer persist it, so replay actually serves
+the real value). A placeholder supports metadata/view ops (a view of a placeholder is
 another placeholder) but raises if its data is actually read.
 
 This is **producer responsibility**: the consumer does no bookkeeping; it just uses the
-tensor, and the producer decides what to keep. A `remat.region` consumer unwraps via the
-index up front (grad-connected — the wrapper's `_inner`, or the plain tensor itself) and
-ferries the value on its own record, so it does *not* trigger the producer's
-persist-output thunk.
+tensor, and the producer decides what to keep.
 
 Consequences:
 
-- Only `SAVE` outputs actually touched by a bare op are kept resident (they show up as
-  `output.<i>` rows in `remat.format_current_memory_report()`, attributed to the
-  producing op). An output consumed only by `remat.region`s is ferried and does **not**
-  create an `output.<i>` row; an output consumed by nothing costs nothing.
+- Only `SAVE` outputs actually needed (consumed by a `remat.region`, saved for backward,
+  or explicitly marked with `remat.recompute_needs_tensor`) are kept resident; they show up
+  as `output.<i>` rows in `remat.format_current_memory_report()`, attributed to the
+  producing op. An output consumed by nothing costs nothing.
 
-One thing remains an **error** (even with `detect_bare_ops`):
+One thing remains an **error**:
 
-- **In-place / mutating ops** on a `SAVE` output — mutating it would corrupt both the
-  persisted value and the copy autograd kept for the op's backward. Wrap the
-  mutation in a `remat.region` (or apply it before the value leaves the producing op).
+- **In-place / mutating ops** on a persisted `SAVE` output — mutating it would corrupt both
+  the persisted value and the copy autograd kept for the op's backward. remat's version
+  counter catches this at backward. Wrap the mutation in a `remat.region` (or apply it
+  before the value leaves the producing op).
 
 ## Developer notes
 
@@ -296,27 +255,44 @@ Not supported yet. This is the eager implementation; `torch.compile` support
 (translating remat policies into min-cut-partitioner annotations) is a separate
 change.
 
-## Detect bare ops
+## recompute_needs_tensor
 
-`detect_bare_ops` selects the bare-op detection strategy. For a bare op consuming a SAVE
-output passed to it as an argument, the four intercepting strategies produce identical
-observable behavior (gradients, tape slots) and differ only in overhead and `data_ptr`
-reach; `False` disables interception:
+`remat.recompute_needs_tensor(*tensors)` forces a `SAVE` region's output to be durably
+persisted for recompute. It exists because a *bare* op (anything not wrapped in
+`remat.region` — a residual add, a `.reshape`, a raw kernel) consuming a `SAVE` output
+cannot be detected, so the output would not be saved and the consumer would read a
+placeholder during recompute.
 
-| value | mechanism | `data_ptr()` kernels | notes |
-|---|---|---|---|
-| `False` | none — plain tensors | n/a | tightest prod path; bare consumers raise |
-| `True` / `"subclass"` (default) | `_SaveTensor` wrapper subclass | ✅ seen | fires on every touch, views included |
-| `"proxy"` | `_SaveProxy` `__torch_function__` object | ✅ seen | defers on views (a bare view forces no save) |
-| `"dispatch_mode"` | `TorchDispatchMode` (plain tensors) | ❌ bypassed | mode-based analogue of the subclass |
-| `"function_mode"` | `TorchFunctionMode` (plain tensors) | ✅ seen | mode-based analogue of the proxy; defers on views |
+Call it on the output tensor, placed **right before the bare op that consumes it**:
 
-The wrapper strategies (`subclass`, `proxy`) and the mode strategies (`dispatch_mode`,
-`function_mode`) diverge on one corner: a SAVE output consumed *inside* a `remat.region` body via
-**closure capture** (rather than passed as an argument) is caught by the wrappers but missed by
-the modes — the modes are suppressed for the whole `remat.region` body, and only the op's arguments
-are otherwise handled, so under a mode the value hits a placeholder during recompute and raises.
-See "SAVE outputs: forward vs recompute" for the full mechanics of each strategy.
+```python
+y = remat.region(my_op, "my_op", recompute=False)(x)
+remat.recompute_needs_tensor(y)   # persist y for the bare consumer below
+z = torch.relu(y)                 # bare op — reads real data during recompute
+```
+
+Each tensor is resolved to its producer **by storage**, so passing the output itself or
+any bare view of it works. Because the call sits on the *consumer* side, the output is
+persisted only when this code path actually runs — you can never over-save (unlike
+declaring persistence on the producer, which pays even in configs where the consumer is
+absent).
+
+It is always safe to call: on a tensor that is not a `SAVE` region's output (an ordinary
+recomputed tensor, a region input), on a `recompute=True` region's output (which is real
+during recompute anyway), or outside any checkpoint region, it is a no-op. So model code
+may call it unconditionally, whether or not it is being checkpointed and regardless of the
+producer's `recompute` setting.
+
+The typical workflow: write the model without any annotations; if a run raises a
+placeholder error during recompute, the message names the producing region and tells you
+to call `remat.recompute_needs_tensor(t)` on the output, right before the bare op that
+reads it, to force the producer to save it.
+
+Wrapping the consuming op in `remat.region(..., recompute=True)` is an equivalent
+alternative — remat then detects the crossing and saves the output on demand — worth
+preferring when the consumer is naturally a region boundary anyway (e.g. a shared-expert
+combine add). Both live on the consumer, so both persist the output only when the consumer
+is present.
 
 
 ## Diagnostics
@@ -338,6 +314,18 @@ TODO: we should describe this more
 * Subtlety: we save outputs for recompute; timing is different
 * Subtlety: when to trigger onload (do it on is recompute, not as an autograd
   function)
+* Subtlety: **deferred SAVE-output saves and `capture_context`.** A SAVE region's
+  output is packed only when a consumer claims it (a `remat.region`, or an explicit
+  `remat.recompute_needs_tensor`), so that `pack` can fire *after* the producing region's
+  `saved_tensors_hooks` scope has exited — later, at the consumer. remat still packs it
+  with the hooks that were installed *where the output was produced* (snapshotted at region
+  exit), so an offloader gets a consistent view. But the *ambient* state your `pack` reads
+  (e.g. "the current chunk") is gone by then. Pass `capture_context` to
+  `saved_tensors_hooks`: remat calls it in-window (where the output is produced) and hands
+  its result to `pack(tensor, context)`. Bind your offload target there — e.g.
+  `capture_context=self.cur_forward_chunk` and `pack=lambda t, chunk: chunk.tensor_push(t)`
+  — and a deferred save routes to the right chunk even though it runs at the consumer. Hooks
+  that don't set `capture_context` are called `pack(tensor)` as before.
 
 ## License
 

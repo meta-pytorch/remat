@@ -75,7 +75,9 @@ from torch_remat._region import (
     _display_name,
     _Phase,
     _save_output_handle,
+    _save_output_persist,
     _state,
+    PersistOutputThunk,
     RecomputeStateHook,
 )
 from torch_remat._trace import _record_trace_op
@@ -88,7 +90,9 @@ from torch_remat._types import (
     _SavedInputRecipe,
     _SavedInputRef,
     _SavedTensor,
+    CaptureContext,
     PackHook,
+    PackHookWithContext,
     UnpackHook,
 )
 from torch_remat._view import (
@@ -115,7 +119,7 @@ def checkpoint(
     region_name: str | None = None,
     determinism_check: str = "none",
     preserve_rng_state: bool = False,
-    detect_bare_ops: bool | str = "subclass",
+    detect_bare_ops: bool | str | None = None,
     input_saved_tensors_hooks: tuple[PackHook, UnpackHook] | None = None,
     recompute_state_hooks: tuple[RecomputeStateHook, ...] = (),
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
@@ -152,15 +156,16 @@ def checkpoint(
             register a :class:`~torch_remat._region.RecomputeStateHook` via
             ``recompute_state_hooks`` to snapshot/restore whatever RNG state you rely
             on instead. Keyword-only. Default: ``False``.
-        detect_bare_ops (bool or str, optional): How *bare* (un-``op``-wrapped)
-            consumers of a SAVE op's outputs are intercepted, so e.g. a residual
-            add or raw Triton kernel works without a :func:`op` wrapper. One of
-            ``True`` / ``"subclass"`` (wrap outputs in a tensor subclass),
-            ``"proxy"`` (wrap in a proxy object), ``"dispatch_mode"``,
-            ``"function_mode"`` (intercept via a torch mode), or ``False`` to opt
-            out -- a bare consumer then raises during recompute. See
-            :mod:`torch_remat._bare_op._strategy` for the trade-offs, and the
-            README for the full comparison. Keyword-only. Default: ``"subclass"``.
+        detect_bare_ops (bool, str, or None, optional): Legacy selector for how *bare*
+            (un-``op``-wrapped) consumers of a SAVE op's outputs are intercepted. The
+            default ``None`` selects the explicit mechanism (bare consumers are not
+            auto-detected; you make one work with :func:`recompute_needs_tensor` right
+            before it, or by regionizing it) and is the recommended path. Any explicit
+            value keeps the legacy bare-op detection strategy: ``True`` / ``"subclass"``
+            (wrap outputs in a tensor subclass), ``"proxy"`` (wrap in a proxy object),
+            ``"dispatch_mode"``, ``"function_mode"`` (intercept via a torch mode), or
+            ``False`` to opt out. The legacy strategies are being removed; prefer
+            ``None``. Keyword-only. Default: ``None``.
         input_saved_tensors_hooks (tuple, optional): A ``(pack_hook, unpack_hook)`` pair
             (same signature as ``torch.autograd.graph.saved_tensors_hooks``) applied to the
             region's *input* tensors -- e.g. to offload a large residual stream to CPU.
@@ -310,6 +315,15 @@ def region(
             output is made that producer's responsibility to persist. Keyword-only,
             required.
 
+    A SAVE region's output is registered so any ``remat.region`` consumer -- receiving
+    the output or a bare view of it -- triggers the save on demand, and an output also
+    saved for backward is persisted for free. A **bare** (un-``remat.region``-wrapped)
+    consumer cannot be detected, so during recompute it reads the skipped op's
+    placeholder and raises; make one work by calling :func:`recompute_needs_tensor` on
+    the output right before it, or by wrapping the consumer in a ``remat.region``. (Both
+    are consulted only under the default ``checkpoint(detect_bare_ops=None)``; a legacy
+    bare-op strategy auto-detects instead.)
+
     Returns:
         Callable: A wrapper with the same signature as ``function``. Called
         outside an active checkpoint region it simply forwards to ``function``.
@@ -373,10 +387,59 @@ def region(
             state.claimed_names.add(name)
 
             if not recompute:
-                return cast(_R, _run_save_op(state, name, function, args, kwargs))
+                return cast(
+                    _R,
+                    _run_save_op(
+                        state,
+                        name,
+                        function,
+                        args,
+                        kwargs,
+                    ),
+                )
             return cast(_R, _run_recompute_op(state, name, function, args, kwargs))
 
     return wrapper
+
+
+def recompute_needs_tensor(*tensors: torch.Tensor) -> None:
+    """Force a SAVE region's output(s) to be durably saved for recompute.
+
+    Call this on a SAVE region's output tensor -- placed right before the *bare*
+    (un-``remat.region``-wrapped) op that consumes it -- to make the producing region
+    persist that output, so the bare consumer reads real data during recompute instead
+    of a placeholder. It is the explicit counterpart to what a ``remat.region`` consumer
+    does automatically.
+
+    Because the call sits on the *consumer* side, the output is persisted only when this
+    code path actually runs: put it just before the consumer and you can never over-save
+    (unlike declaring persistence on the producer, which pays even in configs where the
+    consumer is absent). Each tensor is resolved to its producer by storage, so passing
+    the output itself or any bare view of it works.
+
+    Safe to call anywhere: outside a checkpoint forward, or on a tensor that is not a
+    SAVE region's output (an ordinary recomputed tensor, a region input), it is a no-op
+    -- so model code that calls it works whether or not it is being checkpointed, and
+    whether or not the producer happens to be a SAVE region this run.
+
+    Args:
+        *tensors (Tensor): SAVE region outputs (or tensors sharing an output's storage)
+            to persist. Non-tensor arguments raise.
+    """
+
+    state = _state.get()
+    for tensor in tensors:
+        if not isinstance(tensor, torch.Tensor):
+            raise RuntimeError(
+                "remat.recompute_needs_tensor() expects Tensor arguments"
+            )
+        # Only the original forward populates the tape; on recompute the producer has
+        # already persisted (or not), and outside a region there is nothing to persist.
+        if state is None or state.phase is not _Phase.FORWARD:
+            continue
+        persist = _save_output_persist(state.region_state, tensor)
+        if persist is not None:
+            persist()
 
 
 def save_for_backward(
@@ -441,13 +504,54 @@ def save_for_backward(
     ctx.save_for_backward(*saved.values())
 
 
+@dataclass(frozen=True)
+class _SavedTensorsHooks:
+    """The remat saved-tensor hooks currently installed (see :func:`saved_tensors_hooks`).
+
+    ``pack`` / ``unpack`` are the usual pair. ``capture_context`` is optional: when set,
+    remat calls it *in-window* (where the tensor is produced) to snapshot context and
+    passes the result to ``pack`` as a second argument -- so a *deferred* SAVE-output save
+    still packs against the context live at its producer, even though the pack fires later
+    at the consumer. When it is ``None``, ``pack`` is called with the tensor alone.
+    """
+
+    pack: PackHook | PackHookWithContext
+    unpack: UnpackHook
+    capture_context: CaptureContext | None = None
+
+
 # Task-local so concurrent forwards don't clobber each other's hooks. Only the
 # store (forward) side reads this; the load side uses the unpack hook bound to
 # each slot at pack time, so we never rely on this contextvar propagating into
 # a separate backward/recompute thread.
-_active_saved_tensors_hooks: contextvars.ContextVar[
-    tuple[PackHook, UnpackHook] | None
-] = contextvars.ContextVar("torch_remat_saved_tensors_hooks", default=None)
+_active_saved_tensors_hooks: contextvars.ContextVar[_SavedTensorsHooks | None] = (
+    contextvars.ContextVar("torch_remat_saved_tensors_hooks", default=None)
+)
+
+
+def _capture_context(hooks: _SavedTensorsHooks) -> object:
+    """Snapshot the hook's context in-window, or ``None`` if it declares none."""
+    return hooks.capture_context() if hooks.capture_context is not None else None
+
+
+def _run_pack(
+    hooks: _SavedTensorsHooks,
+    tensor: torch.Tensor,
+    context: object,
+    is_saved_output: bool,
+) -> object:
+    """Invoke a pack hook, passing the captured ``context`` only if it takes one.
+
+    ``is_saved_output`` tells a context-aware hook which kind of entry it is packing --
+    a save-for-backward tensor (``False``) or a persisted SAVE-region output (``True``) --
+    so it can apply a per-kind policy (see :data:`PackHookWithContext`). A plain
+    context-free pack hook does not receive it.
+    """
+    if hooks.capture_context is not None:
+        return cast(PackHookWithContext, hooks.pack)(
+            tensor, context, is_saved_output=is_saved_output
+        )
+    return cast(PackHook, hooks.pack)(tensor)
 
 
 # LIFO stack of reset tokens for the tokenless _push/_pop mutators below, so
@@ -461,18 +565,22 @@ _saved_tensors_hooks_tokens: contextvars.ContextVar[tuple[contextvars.Token, ...
 
 
 def _push_saved_tensors_hooks(
-    pack_hook: PackHook,
+    pack_hook: PackHook | PackHookWithContext,
     unpack_hook: UnpackHook,
+    capture_context: CaptureContext | None = None,
 ) -> None:
-    """Raw mutator: install ``(pack_hook, unpack_hook)`` until a matching
-    :func:`_pop_saved_tensors_hooks`.
+    """Raw mutator: install the hooks until a matching :func:`_pop_saved_tensors_hooks`.
 
     Prefer the :func:`saved_tensors_hooks` context manager. This exists for
     callers whose install and uninstall span two methods (e.g. a manager's
     ``__enter__`` / ``__exit__``) and so cannot hold a single ``with`` block.
     Calls must nest LIFO -- each ``_pop`` undoes the most recent ``_push``.
+
+    See :func:`saved_tensors_hooks` for ``capture_context``.
     """
-    token = _active_saved_tensors_hooks.set((pack_hook, unpack_hook))
+    token = _active_saved_tensors_hooks.set(
+        _SavedTensorsHooks(pack_hook, unpack_hook, capture_context)
+    )
     _saved_tensors_hooks_tokens.set(_saved_tensors_hooks_tokens.get() + (token,))
 
 
@@ -490,8 +598,10 @@ def _pop_saved_tensors_hooks() -> None:
 
 @contextlib.contextmanager
 def saved_tensors_hooks(
-    pack_hook: PackHook,
+    pack_hook: PackHook | PackHookWithContext,
     unpack_hook: UnpackHook,
+    *,
+    capture_context: CaptureContext | None = None,
 ) -> Iterator[None]:
     """Apply hooks that trigger when tensors are saved in forwards for load in
     recompute/backward.
@@ -533,12 +643,24 @@ def saved_tensors_hooks(
             payload ``pack_hook`` returned and reconstructing the tensor. Bound
             per-save, so it fires with the payload it packed even after the
             ``with`` block has exited.
+        capture_context (Callable[[], Any], optional): If given, called *in-window* --
+            where the saved tensor is produced -- to snapshot whatever context the pack
+            needs, and its result is passed to ``pack_hook`` as a second argument
+            (``pack_hook(tensor, context)``). This exists for **deferred** SAVE-output
+            saves: a SAVE region's output may not be packed until a later consumer claims
+            it (that is how remat avoids saving outputs nothing needs), by which point this
+            ``with`` block has exited. Ordinary saved-for-backward tensors and the region's
+            outputs both capture the context where the region ran, so a pack that fires
+            later still sees the context that was live at the producer -- e.g. an offloader
+            can bind its current chunk here and push to it even from the consumer. When
+            ``None`` (default), ``pack_hook`` is called with the tensor alone; existing
+            two-argument-free hooks are unaffected. Keyword-only.
 
     Yields:
         None: The hooks apply to saves that occur within the ``with`` block.
     """
 
-    _push_saved_tensors_hooks(pack_hook, unpack_hook)
+    _push_saved_tensors_hooks(pack_hook, unpack_hook, capture_context)
     try:
         yield
     finally:
@@ -743,7 +865,9 @@ def _run_save_op(
     assert name not in region_state.records, (
         f"torch_remat internal error: a SAVE record for {name!r} already exists"
     )
-    record = _SaveRecord(op_name=name)
+    record = _SaveRecord(
+        op_name=name,
+    )
     region_state.records[name] = record
     scratch = _SaveOpForwardScratch()
 
@@ -784,8 +908,15 @@ def _run_save_op(
         # leaks the graph if dropped without backward.
         hooks = _active_saved_tensors_hooks.get()
         if hooks is not None:
-            pack_hook, unpack_hook = hooks
-            return _SavedHookData(pack_hook(_detach_for_user_hook(tensor)), unpack_hook)
+            # This save is in-window (autograd calls pack during the body), so capture the
+            # context now and hand it straight to pack.
+            packed = _run_pack(
+                hooks,
+                _detach_for_user_hook(tensor),
+                _capture_context(hooks),
+                is_saved_output=False,
+            )
+            return _SavedHookData(packed, hooks.unpack)
 
         # Default (identity hook): the tensor stays a normal autograd saved tensor.
         return _default_pack(record, scratch, tensor, name)
@@ -844,11 +975,24 @@ def _run_recompute_op(
             )
         return _validate_output(function(*args, **kwargs))
 
-    # Forward. Any SAVE-output input must trigger its producer's persist-output thunk.
-    # A wrapping strategy (subclass / proxy) additionally hands the body a carrier we
-    # must unwrap to the grad-connected real, rebuilding the arg pytree; a plain-output
-    # strategy leaves SAVE outputs as real tensors, so we only walk for the
-    # persist-output side effect and pass args through.
+    if region_state.uses_persist_index:
+        # Forward. Any input that is (a view of) an upstream SAVE op's output must
+        # trigger that producer's persist-output thunk, so the skipped producer
+        # reproduces it on replay. The lookup is by storage, so a bare view of a SAVE
+        # output resolves too.
+        for _token, leaf in iter_arg_leaves(args, kwargs):
+            persist = _save_output_persist(region_state, leaf)
+            if persist is not None:
+                persist()
+        return _validate_output(
+            function(*args, **kwargs), reject_leaves_for=(region_state, name)
+        )
+
+    # Legacy bare-op path. Any SAVE-output input must trigger its producer's
+    # persist-output thunk. A wrapping strategy (subclass / proxy) additionally hands
+    # the body a carrier we must unwrap to the grad-connected real, rebuilding the arg
+    # pytree; a plain-output strategy leaves SAVE outputs as real tensors, so we only
+    # walk for the persist-output side effect and pass args through.
     if region_state.bare_op_strategy.wraps_outputs:
 
         def consume(_token: PathToken, leaf: object) -> object:
@@ -898,6 +1042,25 @@ def _unwrap_and_snapshot_inputs(
     """
 
     _assert_phase(_Phase.FORWARD)
+
+    if region_state.uses_persist_index:
+        new_infos: list[_InputInfo] = []
+        for token, leaf in iter_arg_leaves(args, kwargs):
+            is_stub = _save_output_persist(region_state, leaf) is not None
+            if isinstance(leaf, torch.Tensor) and not _is_placeholder(leaf):
+                new_infos.append(
+                    _InputInfo(
+                        path=token,
+                        storage_ref=weakref.ref(leaf.untyped_storage()),
+                        dtype=leaf.dtype,
+                        shape=tuple(leaf.shape),
+                        stride=tuple(leaf.stride()),
+                        storage_offset=leaf.storage_offset(),
+                        version=leaf._version,
+                        is_stub=is_stub,
+                    )
+                )
+        return args, kwargs, new_infos
 
     wraps_outputs = region_state.bare_op_strategy.wraps_outputs
     infos: list[_InputInfo] = []
@@ -997,6 +1160,9 @@ def _prepare_outputs(
     during recompute even without an opt-in strategy.
     """
 
+    if region_state.uses_persist_index:
+        return _register_save_outputs(region_state, record, scratch, output)
+
     strategy = region_state.bare_op_strategy
 
     def make(index: int, real: torch.Tensor) -> tuple[Any, _SaveOutputHandle | None]:
@@ -1040,15 +1206,77 @@ def _prepare_outputs(
     return rebuild_container(container, returned)
 
 
+def _register_save_outputs(
+    region_state: _CheckpointRegionState,
+    record: _SaveRecord,
+    scratch: _SaveOpForwardScratch,
+    output: Output,
+) -> Output:
+    """Register a SAVE op's outputs in the region's storage-keyed persist index.
+
+    Every output is registered under a persist thunk keyed by storage, so a downstream
+    consumer -- a ``remat.region`` (or a bare view of the output, resolved by storage),
+    or an explicit :func:`recompute_needs_tensor` call -- can trigger the durable save on
+    demand. Outputs are plain tensors, so the container is returned unchanged.
+
+    An output that is *itself* saved for backward (its storage is in
+    ``scratch.saved_identity_storages``) is persisted eagerly at region exit: it is
+    resident for backward anyway, so this costs no extra memory and lets a bare consumer
+    of it work during recompute with no annotation.
+
+    We run here at region exit, in-window under any installed saved-tensor hooks, so we
+    snapshot them (and the context they capture) into each thunk. A thunk may fire later
+    at the consumer, after the hook scope has exited; packing against the snapshot lets an
+    offloader still route a deferred SAVE output to the chunk it captured here.
+    """
+
+    tensors = _output_tensors(output)
+    hooks = _active_saved_tensors_hooks.get()
+    context = _capture_context(hooks) if hooks is not None else None
+    for index, real in enumerate(tensors):
+        storage = StorageWeakRef(real.untyped_storage())
+        # Weak ref + lazy snapshot (see _PersistOutputThunk), so a SAVE output nothing
+        # consumes is never pinned alive by its own persist-output thunk.
+        persist = _PersistOutputThunk(
+            record=record,
+            slot_index=index,
+            output_ref=weakref.ref(real),
+            hooks=hooks,
+            context=context,
+        )
+        # Two output positions sharing one storage (``return y, y``, or a returned view)
+        # collapse onto one key; merge so consuming either fires both tape slots.
+        existing = region_state.save_output_persist_index.get(storage)
+        region_state.save_output_persist_index[storage] = (
+            persist if existing is None else _merge_persist(existing, persist)
+        )
+        if storage in scratch.saved_identity_storages:
+            persist()  # saved for backward, so resident anyway -- persist eagerly
+    return output
+
+
+def _merge_persist(
+    first: PersistOutputThunk, second: PersistOutputThunk
+) -> PersistOutputThunk:
+    """Combine two persist thunks for outputs that share one storage (each owns a slot)."""
+
+    def merged() -> None:
+        first()
+        second()
+
+    return merged
+
+
 @dataclass
 class _PersistOutputThunk:
     """Callable that records one SAVE output on the tape, once (producer responsibility).
 
     A SAVE op is skipped during recompute, so any consumer that needs its output during
-    replay fires this thunk during the forward: a bare consumer via the detection
-    strategy, a ``remat.region`` consumer via the handle, or the eager persist of an
-    output that is itself saved for backward.
-    All consumer kinds share one tape slot, the output's position.
+    replay fires this thunk during the forward: a ``remat.region`` consumer (or an
+    explicit :func:`recompute_needs_tensor` call) resolving the output by storage, a bare
+    consumer via the legacy detection strategy, or the eager persist of an output that is
+    itself saved for backward. All consumer kinds share one tape slot, the output's
+    position.
 
     The output is referenced *weakly* and snapshotted (detached) only when called:
     every consumer holds the output live at the moment it fires this, and until then
@@ -1056,13 +1284,21 @@ class _PersistOutputThunk:
     rather than kept resident to backward. A dead weakref means no consumer, so the
     call is a no-op.
 
-    When a remat saved-tensor hook is installed, the persisted value is packed through
-    it (offload); otherwise it is held resident.
+    The saved-tensor hooks (and any context they capture) are snapshotted at *region
+    exit*, where this thunk is built (see :func:`_register_save_outputs`), not read when
+    the thunk fires. The output belongs to the hook scope that produced it, so it is
+    packed by those hooks even when a later consumer fires this after that scope has exited
+    -- which is what lets an offloader pack a deferred SAVE output into the chunk it
+    captured in-window. When no hook was installed, the persisted value is held resident.
     """
 
     record: _SaveRecord
     slot_index: int
     output_ref: weakref.ReferenceType[torch.Tensor]
+    # Snapshotted at region exit (in-window), so a deferred fire still packs against the
+    # producer's hooks and context. ``None`` when no remat saved-tensor hook was installed.
+    hooks: _SavedTensorsHooks | None = None
+    context: object = None
 
     def __call__(self) -> None:
         if self.slot_index in self.record.output_slots:
@@ -1071,16 +1307,17 @@ class _PersistOutputThunk:
         if real is None:
             return
         detached = real.detach()
-        hooks = _active_saved_tensors_hooks.get()
-        if hooks is not None:
+        if self.hooks is not None:
             # Bind the matching unpack hook to the slot so replay reloads via the pair
-            # that packed it, not whatever hooks are active at load time.
-            pack_hook, unpack_hook = hooks
+            # that packed it, not whatever hooks are active at load time. Pack against the
+            # context captured in-window, not whatever is active now.
             self.record.output_slots[self.slot_index] = _OutputSlot(
                 tensor=None,
                 version=None,
-                packed=pack_hook(detached),
-                unpack_hook=unpack_hook,
+                packed=_run_pack(
+                    self.hooks, detached, self.context, is_saved_output=True
+                ),
+                unpack_hook=self.hooks.unpack,
                 requires_grad=real.requires_grad,
                 is_leaf=real.is_leaf,
             )

@@ -21,7 +21,7 @@ from typing import Any, cast
 import expecttest
 import torch
 import torch_remat as remat
-from remat_test_helpers import _BARE_OP_STRATEGIES, assert_reclaimed_without_gc
+from remat_test_helpers import assert_reclaimed_without_gc
 from torch_remat._region import (
     _checkpoint_context_fn,
     _state,
@@ -104,9 +104,7 @@ class LifetimeTest(expecttest.TestCase):
         was_enabled = gc.isenabled()
         gc.disable()  # isolate refcount reclamation from cyclic collection
         try:
-            y = remat.checkpoint(detect_bare_ops=False)(region)(
-                torch.tensor([1.0, 2.0], requires_grad=True)
-            )
+            y = remat.checkpoint()(region)(torch.tensor([1.0, 2.0], requires_grad=True))
             ref = saved_output_ref
             assert ref is not None
             self.assertIsNotNone(ref())  # graph alive -> saved output still resident
@@ -151,7 +149,7 @@ class LifetimeTest(expecttest.TestCase):
                 )(x)
 
             with remat.saved_tensors_hooks(lambda t: t, lambda t: t):
-                y = remat.checkpoint(detect_bare_ops=False)(region)(
+                y = remat.checkpoint()(region)(
                     torch.tensor([1.0, 2.0], requires_grad=True)
                 )
             assert saved_output_ref is not None
@@ -195,7 +193,7 @@ class LifetimeTest(expecttest.TestCase):
                 )(x)
 
             with remat.saved_tensors_hooks(pack, lambda index: stash[cast(int, index)]):
-                y = remat.checkpoint(detect_bare_ops=False)(region)(
+                y = remat.checkpoint()(region)(
                     torch.tensor([1.0, 2.0], requires_grad=True)
                 )
             assert saved_output_ref is not None
@@ -363,27 +361,22 @@ class LifetimeTest(expecttest.TestCase):
 
         # Introspect the forward: the stub input lands on the autograd-owned
         # attribution index, not on the consumer's tape.
-        for strategy in _BARE_OP_STRATEGIES:
-            with self.subTest(strategy=strategy):
-                forward_context, _ = _checkpoint_context_fn(
-                    "r", detect_bare_ops=strategy
-                )
-                with forward_context:
-                    # Keep the output (and thus the autograd graph) alive so the
-                    # weakly-held attribution below is not collected before we read it.
-                    out = consumes_save(torch.tensor([1.0, 2.0], requires_grad=True))
-                    active = _state.get()
-                    assert active is not None
-                    consumer_record = active.region_state.records["consumer"]
-                    # The stub input is autograd-owned (weak attribution), not diverted;
-                    # so the consumer records no saved-input recipe, and its own output
-                    # has no bare consumer (the region output is unwrapped at the boundary,
-                    # not materialized), so no output.<i> slot is created either.
-                    self.assertEqual([], list(consumer_record.saved_input_recipes))
-                    self.assertEqual([], list(consumer_record.output_slots))
-                    self.assertEqual(1, len(consumer_record.saved_tensor_names))
-                    self.assertEqual({}, active.region_state.rederived_saved_inputs)
-                    del out
+        forward_context, _ = _checkpoint_context_fn("r")
+        with forward_context:
+            # Keep the output (and thus the autograd graph) alive so the
+            # weakly-held attribution below is not collected before we read it.
+            out = consumes_save(torch.tensor([1.0, 2.0], requires_grad=True))
+            active = _state.get()
+            assert active is not None
+            consumer_record = active.region_state.records["consumer"]
+            # The stub input is autograd-owned (weak attribution), not diverted;
+            # so the consumer records no saved-input recipe, and its own output
+            # has no bare consumer, so no output.<i> slot is created either.
+            self.assertEqual([], list(consumer_record.saved_input_recipes))
+            self.assertEqual([], list(consumer_record.output_slots))
+            self.assertEqual(1, len(consumer_record.saved_tensor_names))
+            self.assertEqual({}, active.region_state.rederived_saved_inputs)
+            del out
 
         # And it produces correct gradients end to end.
         x = torch.tensor([1.0, 2.0], requires_grad=True)
@@ -427,17 +420,13 @@ class LifetimeTest(expecttest.TestCase):
 
         # Introspect the forward: the producer holds the single durably saved output.0,
         # regardless of how each RECOMPUTE consumer received it (positional / list / kwarg).
-        for strategy in _BARE_OP_STRATEGIES:
-            with self.subTest(strategy=strategy):
-                forward_context, _ = _checkpoint_context_fn(
-                    "r", detect_bare_ops=strategy
-                )
-                with forward_context:
-                    region(torch.tensor([1.0, 2.0], requires_grad=True))
-                    active = _state.get()
-                    assert active is not None
-                    records = active.region_state.records
-                    self.assertEqual([0], list(records["producer"].output_slots))
+        forward_context, _ = _checkpoint_context_fn("r")
+        with forward_context:
+            region(torch.tensor([1.0, 2.0], requires_grad=True))
+            active = _state.get()
+            assert active is not None
+            records = active.region_state.records
+            self.assertEqual([0], list(records["producer"].output_slots))
 
         # And it still round-trips through recompute at backward: each consumer computes
         # 2*(3x) = 6x, so d/dx sum(a+b+c) = 18 per element.
@@ -496,54 +485,41 @@ class LifetimeTest(expecttest.TestCase):
     def test_save_op_dead_output_is_freed_after_forward(self) -> None:
         # A SAVE op output that nothing consumes -- not fed downstream, not saved for
         # backward, not returned as the region output -- must not stay resident from
-        # forward to backward. The region's weak-keyed save-output index holds each
-        # output's handle as the *value* of its own weak entry, so the handle must not
-        # strong-reference the key: neither via an unwrap that closes over the output nor
-        # via a durable-save that eagerly snapshots (and so pins the storage of) the
-        # output. Otherwise a large dead auxiliary output (e.g. an unused attention LSE)
-        # silently costs its full size across the whole peak-memory window an activation
-        # checkpointing library exists to shrink. Checked for the no-detect path
-        # and every bare-op strategy; before the fix only "proxy" freed the output.
-        for strategy in (False, *_BARE_OP_STRATEGIES):
-            with self.subTest(strategy=strategy):
-                aux_ref: weakref.ReferenceType[torch.Tensor] | None = None
+        # forward to backward. The region's storage-keyed save-output index holds each
+        # output's persist thunk, which references the output only weakly, so an output
+        # nothing consumes is not pinned. Otherwise a large dead auxiliary output (e.g. an
+        # unused attention LSE) silently costs its full size across the whole peak-memory
+        # window an activation checkpointing library exists to shrink.
+        aux_ref: weakref.ReferenceType[torch.Tensor] | None = None
 
-                class TwoOutputSave(torch.autograd.Function):
-                    @staticmethod
-                    def forward(
-                        ctx: Any, x: torch.Tensor
-                    ) -> tuple[torch.Tensor, torch.Tensor]:
-                        del ctx
-                        return x * 2, x * 3  # second output is an unused auxiliary
+        class TwoOutputSave(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx: Any, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                del ctx
+                return x * 2, x * 3  # second output is an unused auxiliary
 
-                    @staticmethod
-                    def backward(
-                        ctx: Any, grad_main: torch.Tensor, grad_aux: torch.Tensor
-                    ) -> torch.Tensor:
-                        del ctx, grad_aux
-                        return grad_main * 2
+            @staticmethod
+            def backward(
+                ctx: Any, grad_main: torch.Tensor, grad_aux: torch.Tensor
+            ) -> torch.Tensor:
+                del ctx, grad_aux
+                return grad_main * 2
 
-                def region(x: torch.Tensor) -> torch.Tensor:
-                    nonlocal aux_ref
-                    main, aux = remat.region(
-                        TwoOutputSave.apply, "twoout", recompute=False
-                    )(x)
-                    if not remat.is_recomputing():
-                        # Weakref the real produced tensor (the wrapper's inner for the
-                        # subclass / proxy strategies; the value itself otherwise).
-                        aux_ref = weakref.ref(getattr(aux, "_inner", aux))
-                    return main  # aux is consumed by nothing
+        def region(x: torch.Tensor) -> torch.Tensor:
+            nonlocal aux_ref
+            main, aux = remat.region(TwoOutputSave.apply, "twoout", recompute=False)(x)
+            if not remat.is_recomputing():
+                aux_ref = weakref.ref(aux)
+            return main  # aux is consumed by nothing
 
-                x = torch.ones(1024, requires_grad=True)
-                out = remat.checkpoint(region_name="r", detect_bare_ops=strategy)(
-                    region
-                )(x)
+        x = torch.ones(1024, requires_grad=True)
+        out = remat.checkpoint(region_name="r")(region)(x)
 
-                ref = aux_ref
-                assert ref is not None
-                gc.collect()
-                # The dead auxiliary output was not pinned by the save-output index.
-                self.assertIsNone(ref())
+        ref = aux_ref
+        assert ref is not None
+        gc.collect()
+        # The dead auxiliary output was not pinned by the save-output index.
+        self.assertIsNone(ref())
 
-                out.sum().backward()
-                self.assertTrue(torch.equal(x.grad, torch.full((1024,), 2.0)))
+        out.sum().backward()
+        self.assertTrue(torch.equal(x.grad, torch.full((1024,), 2.0)))

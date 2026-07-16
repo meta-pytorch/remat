@@ -26,9 +26,10 @@ import contextvars
 from dataclasses import dataclass, field
 from enum import Enum
 from types import TracebackType
-from typing import Any, Protocol, runtime_checkable, TYPE_CHECKING
+from typing import Any, Callable, Protocol, runtime_checkable, TYPE_CHECKING
 
 import torch
+from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils.weak import WeakTensorKeyDictionary
 from torch_remat._bare_op._strategy import (
     _bare_op_strategy,
@@ -39,6 +40,11 @@ if TYPE_CHECKING:
     from torch_remat._api import _SaveOpForwardScratch, _SaveRecord
     from torch_remat._bare_op._common import _SaveOutputHandle
     from torch_remat._bare_op._strategy import _BareOpStrategy
+
+# A thunk that records one SAVE output's value on the remat tape so recompute can
+# reproduce it. Idempotent per output slot: the first consumer fires it, later ones
+# are no-ops. Stored as the value of a region's storage-keyed save-output index.
+PersistOutputThunk = Callable[[], None]
 
 
 @runtime_checkable
@@ -115,9 +121,27 @@ class _CheckpointRegionState:
     # Identity-keyed index of this region's SAVE outputs -> ``_SaveOutputHandle``. The
     # single, type-agnostic source of "this tensor is a SAVE output", so consumers
     # never test the output's type and the detection strategy stays swappable. Weak,
-    # so it never keeps an output alive.
+    # so it never keeps an output alive. (Legacy bare-op path only.)
     save_output_index: WeakTensorKeyDictionary = field(
         default_factory=WeakTensorKeyDictionary
+    )
+
+    # Whether this region uses the explicit persist-index mechanism (the
+    # ``save_output_persist_index`` below) instead of the legacy ``detect_bare_ops``
+    # strategy path (``bare_op_strategy`` / ``save_output_index``). Selected once at
+    # region creation from ``checkpoint``'s ``detect_bare_ops`` (``None`` -> new path).
+    uses_persist_index: bool = False
+
+    # Storage-keyed index of this region's SAVE outputs -> persist thunk. Keyed by
+    # ``StorageWeakRef`` (not tensor identity) so a *bare view* of a SAVE output --
+    # a distinct tensor sharing the same storage -- still resolves to its producer,
+    # which is how a consumer (a ``remat.region``, or an explicit
+    # ``remat.recompute_needs_tensor`` call) of such a view triggers the save. The
+    # weak-ref key never keeps the output's storage alive; a dead entry is a small,
+    # region-scoped bookkeeping remnant (bounded by the region's output count). Used
+    # only when ``uses_persist_index`` is set.
+    save_output_persist_index: dict[StorageWeakRef, PersistOutputThunk] = field(
+        default_factory=dict
     )
 
     # Recompute-scoped buffer of materialized saved-input values, keyed op_name ->
@@ -265,7 +289,7 @@ class _CheckpointPhaseContext(contextlib.AbstractContextManager[None]):
 
 def _checkpoint_context_fn(
     region_name: str | None = None,
-    detect_bare_ops: bool | str = "subclass",
+    detect_bare_ops: bool | str | None = None,
     recompute_state_hooks: tuple[RecomputeStateHook, ...] = (),
 ) -> tuple[
     contextlib.AbstractContextManager[None], contextlib.AbstractContextManager[None]
@@ -274,11 +298,20 @@ def _checkpoint_context_fn(
 
     Both contexts share one region state so op records from the original forward
     can be replayed by relative op name during recomputation.
+
+    ``detect_bare_ops=None`` (the default) selects the explicit persist-index
+    mechanism (a bare consumer is made to work by an explicit
+    ``remat.recompute_needs_tensor`` call, or by regionizing the consumer); any
+    explicit value keeps the legacy bare-op detection strategy path.
     """
 
+    uses_persist_index = detect_bare_ops is None
     region_state = _CheckpointRegionState(
         region_name=region_name,
-        bare_op_strategy=_bare_op_strategy(_resolve_detect_bare_ops(detect_bare_ops)),
+        uses_persist_index=uses_persist_index,
+        bare_op_strategy=_bare_op_strategy(
+            "none" if uses_persist_index else _resolve_detect_bare_ops(detect_bare_ops)
+        ),
         state_hooks=recompute_state_hooks,
     )
     return (
@@ -312,6 +345,24 @@ def _save_output_handle(
         return typed
     if isinstance(leaf, torch.Tensor):
         return region_state.save_output_index.get(leaf)
+    return None
+
+
+def _save_output_persist(
+    region_state: _CheckpointRegionState, leaf: object
+) -> PersistOutputThunk | None:
+    """Return a leaf's producer persist thunk, or None if it is not a SAVE output.
+
+    The single "is this (a view of) a SAVE output" test: a tensor leaf is looked up
+    in the region's persist index by its storage, so both the SAVE output itself and
+    any bare view sharing its storage resolve to the producer. A non-tensor leaf, or a
+    tensor whose storage is not a SAVE output's, returns None.
+    """
+
+    if isinstance(leaf, torch.Tensor):
+        return region_state.save_output_persist_index.get(
+            StorageWeakRef(leaf.untyped_storage())
+        )
     return None
 
 
