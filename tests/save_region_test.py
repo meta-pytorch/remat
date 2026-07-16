@@ -384,7 +384,7 @@ class SaveRegionTest(expecttest.TestCase):
                 """\
 blk: 12 B resident in 1 storage(s)
 blk::span: 12 B
-       12 B  live                   (3,)       float32  cpu""",
+  12 B  live  (3,)  float32""",
             )
             self.assertEqual((3,), tuple(out.shape))
 
