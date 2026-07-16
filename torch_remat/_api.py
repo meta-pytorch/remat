@@ -55,6 +55,8 @@ from torch_remat._placeholder import (
 from torch_remat._pytree import (
     container_type,
     iter_arg_leaves,
+    map_arg_leaves,
+    PathToken,
     rebuild_container,
     value_leaves,
 )
@@ -124,6 +126,11 @@ def checkpoint(
     Everything inside the region recomputes by default; annotate calls with
     :func:`region` (``recompute=False``) to keep their activations and skip
     recompute instead.
+
+    Region inputs are liveness-tracked (see "Region inputs are liveness-tracked" in the
+    README): an input consumed only by ``recompute=False`` regions is never read during
+    recompute, so it is dropped rather than pinned for the whole backward. This is bypassed
+    (checkpoint saves every input, as before) when ``input_saved_tensors_hooks`` is set.
 
     Region arguments are forwarded unchanged (``torch.utils.checkpoint`` handles
     them), but the region *output* must be a Tensor or a one-hop ``tuple`` /
@@ -196,28 +203,43 @@ def checkpoint(
             output = function(*inner_args, **inner_kwargs)
             return _checkpoint_recompute_boundary(output)
 
+        def context_fn() -> tuple[
+            contextlib.AbstractContextManager[None],
+            contextlib.AbstractContextManager[None],
+        ]:
+            return _checkpoint_context_fn(region_name, recompute_state_hooks)
+
         @wraps(function)
         def checkpointed_function(*args: Any, **kwargs: Any) -> Any:
-            # We install these around the WHOLE region but they fire only for the region
-            # inputs: torch.utils.checkpoint saves the inputs (via _make_saved_tensor) at
-            # region entry, then enters its own saved_tensors_hooks for recompute which
-            # shadows ours for every save in the body -- only the input save, before
-            # checkpoint's hook is installed, reaches ours. Can't scope tighter than the
-            # whole region: checkpoint's hook nests inside and stays across the body, so
-            # popping ours earlier would break the hook stack's LIFO order.
-            input_hooks_ctx: contextlib.AbstractContextManager[Any] = (
-                torch.autograd.graph.saved_tensors_hooks(*input_saved_tensors_hooks)
-                if input_saved_tensors_hooks is not None
-                else contextlib.nullcontext()
-            )
-            with input_hooks_ctx:
+            # A region input consumed only by recompute=False regions (or nothing) is
+            # never read during recompute, so pinning it for the whole backward is waste.
+            # Route inputs through a synthetic SAVE op (:class:`_InputLivenessBridge`) so
+            # the producer-responsibility machinery keeps exactly the inputs a consumer
+            # touches and drops the rest.
+            if input_saved_tensors_hooks is None:
+                return _run_with_input_liveness(
+                    wrapped_function,
+                    args,
+                    kwargs,
+                    context_fn=context_fn,
+                    determinism_check=determinism_check,
+                )
+
+            # Input offload hooks are set, so fall back to letting checkpoint save every
+            # input (composing per-input liveness with input offload is future work). The
+            # hooks fire only for the region inputs: torch.utils.checkpoint saves the
+            # inputs (via _make_saved_tensor) at region entry, then enters its own
+            # saved_tensors_hooks for recompute which shadows ours for every save in the
+            # body -- only the input save, before checkpoint's hook is installed, reaches
+            # ours. Can't scope tighter than the whole region: checkpoint's hook nests
+            # inside and stays across the body, so popping ours earlier would break the
+            # hook stack's LIFO order.
+            with torch.autograd.graph.saved_tensors_hooks(*input_saved_tensors_hooks):
                 return _torch_checkpoint_with_forward_exception_cleanup(
                     wrapped_function,
                     function_args=args,
                     function_kwargs=kwargs,
-                    context_fn=lambda: _checkpoint_context_fn(
-                        region_name, recompute_state_hooks
-                    ),
+                    context_fn=context_fn,
                     determinism_check=determinism_check,
                     # torch_remat does not preserve torch RNG (see the guard above);
                     # keep torch's own stash off so it can't silently do the
@@ -413,6 +435,181 @@ def recompute_needs_tensor(*tensors: torch.Tensor) -> None:
         persist = _save_output_persist(state.region_state, tensor)
         if persist is not None:
             persist()
+
+
+# --------------------------------------------------------------------------
+# Region-input liveness
+# --------------------------------------------------------------------------
+
+# Region-relative name of the synthetic SAVE op that carries a region's routed inputs.
+# Angle-bracketed so it cannot collide with a user region name and reads as internal in
+# traces and memory reports.
+_REGION_INPUTS_OP_NAME = "<region_inputs>"
+
+
+def _identity_flat(*tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    """Identity body of the synthetic SAVE op carrying a region's routed inputs.
+
+    Returns its inputs unchanged as a flat tuple; the enclosing ``recompute=False`` region
+    persists only the ones a consumer touches, so an input nothing consumes costs nothing.
+    Never called during recompute -- the op is skipped and its outputs come from the tape.
+    """
+
+    return tensors
+
+
+@dataclass(frozen=True)
+class _RoutedInput:
+    """Skeleton marker for an input leaf routed through the synthetic SAVE op.
+
+    ``index`` is its position in the op's flat output tuple, resolved back to the served
+    value (real if persisted, a placeholder otherwise) when the call is reassembled.
+    """
+
+    index: int
+
+
+@dataclass(frozen=True)
+class _KeptInput:
+    """Skeleton marker for an input leaf fed directly, bypassing the synthetic op.
+
+    A requires-grad *leaf* (e.g. a ``Parameter``) cannot pass through a ``remat.region`` --
+    a region may not yield a requires-grad leaf (see :func:`_reject_grad_leaf`) -- and is
+    owned elsewhere anyway, so holding a strong reference to feed it back on recompute costs
+    no extra memory.
+    """
+
+    tensor: torch.Tensor
+
+
+class _InputLivenessBridge:
+    """Route a checkpoint region's inputs through one synthetic SAVE op.
+
+    The region's inputs become the outputs of a single ``recompute=False`` op, so the
+    existing producer-responsibility path decides each input's fate with no new machinery:
+    an input a RECOMPUTE region consumes (or one flagged via :func:`recompute_needs_tensor`)
+    fires the op's persist thunk and is served real during recompute; an input consumed only
+    by SAVE regions (or nothing) is never persisted and is served a storage-free placeholder,
+    so it is not pinned to backward. checkpoint itself is handed zero region inputs, so it
+    neither saves them via ``_make_saved_tensor`` nor closes over them in its recompute
+    thunk; this bridge owns capturing them on the forward and feeding them on recompute.
+
+    A requires-grad *leaf* input bypasses the op (see :class:`_KeptInput`), and non-tensor
+    leaves (including opaque containers remat does not traverse) are carried verbatim.
+    """
+
+    def __init__(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+        self._args: tuple[Any, ...] | None = args
+        self._kwargs: dict[str, Any] | None = kwargs
+        # Tensor-free structure of the call, built on the forward and reused on recompute.
+        # Routed tensors appear only as _RoutedInput indices, so it pins none of them.
+        self._skeleton: tuple[tuple[Any, ...], dict[str, Any]] | None = None
+        self._num_routed = 0
+
+    def run_forward(self, body: Callable[..., Any]) -> Any:
+        """Capture inputs, run them through the synthetic op, and run the region body."""
+
+        routed: list[torch.Tensor] = []
+
+        def capture(_token: PathToken, leaf: object) -> object:
+            if isinstance(leaf, torch.Tensor) and not _is_placeholder(leaf):
+                if leaf.requires_grad and leaf.is_leaf:
+                    return _KeptInput(leaf)
+                index = len(routed)
+                routed.append(leaf)
+                return _RoutedInput(index)
+            return leaf
+
+        assert self._args is not None and self._kwargs is not None
+        self._skeleton = map_arg_leaves(capture, self._args, self._kwargs)
+        self._num_routed = len(routed)
+        saved = self._run_region(tuple(routed))
+        args, kwargs = self._reassemble(saved)
+        return body(*args, **kwargs)
+
+    def run_recompute(self, body: Callable[..., Any]) -> Any:
+        """Feed inputs from the tape (real or placeholder) and rerun the region body."""
+
+        # The synthetic op is skipped on recompute and serves its outputs from the tape,
+        # ignoring its arguments; pass positional stand-ins only to keep its arity and
+        # duplicate-name bookkeeping identical to the forward.
+        saved = self._run_region((None,) * self._num_routed)
+        args, kwargs = self._reassemble(saved)
+        return body(*args, **kwargs)
+
+    def release(self) -> None:
+        """Drop strong references to the forward inputs once the forward has returned.
+
+        An input no consumer persisted is then freed instead of living to backward; a
+        persisted one survives on its tape slot, and a :class:`_KeptInput` on the skeleton.
+        """
+
+        self._args = None
+        self._kwargs = None
+
+    def _run_region(self, routed: tuple[Any, ...]) -> tuple[torch.Tensor, ...]:
+        if not routed:
+            return ()
+        saved = region(_identity_flat, _REGION_INPUTS_OP_NAME, recompute=False)(*routed)
+        return cast("tuple[torch.Tensor, ...]", saved)
+
+    def _reassemble(
+        self, saved: tuple[torch.Tensor, ...]
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        assert self._skeleton is not None
+
+        def fill(_token: PathToken, leaf: object) -> object:
+            if isinstance(leaf, _RoutedInput):
+                return saved[leaf.index]
+            if isinstance(leaf, _KeptInput):
+                return leaf.tensor
+            return leaf
+
+        skel_args, skel_kwargs = self._skeleton
+        return map_arg_leaves(fill, skel_args, skel_kwargs)
+
+
+def _run_with_input_liveness(
+    body: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    context_fn: Callable[
+        [],
+        tuple[
+            contextlib.AbstractContextManager[None],
+            contextlib.AbstractContextManager[None],
+        ],
+    ],
+    determinism_check: str,
+) -> Any:
+    """Run ``body`` under checkpoint with per-input liveness (see :class:`_InputLivenessBridge`).
+
+    checkpoint is driven with zero region inputs so it pins none of them; a phase-dispatching
+    wrapper captures them on the forward and feeds them on recompute, then the bridge is
+    released so any input no consumer kept is freed when the forward returns.
+    """
+
+    bridge = _InputLivenessBridge(args, kwargs)
+
+    def region_body() -> Any:
+        state = _state.get()
+        assert state is not None, "No active torch_remat checkpoint region"
+        if state.phase is _Phase.FORWARD:
+            return bridge.run_forward(body)
+        return bridge.run_recompute(body)
+
+    try:
+        return _torch_checkpoint_with_forward_exception_cleanup(
+            region_body,
+            function_args=(),
+            function_kwargs={},
+            context_fn=context_fn,
+            determinism_check=determinism_check,
+            preserve_rng_state=False,
+        )
+    finally:
+        bridge.release()
 
 
 def save_for_backward(

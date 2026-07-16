@@ -170,7 +170,12 @@ introduce two new mechanisms to make this work:
 
 For any intermediate tensor, this is how it is made available during recompute:
 
-* Input to the overall region: provided by checkpoint (always available)
+* Input to the overall region: treated like a `SAVE` op's output (see "Region inputs
+  are liveness-tracked"). Kept and served real during recompute if a `RECOMPUTE` region
+  consumes it (or a bare consumer flags it with `recompute_needs_tensor`); served a
+  storage-free placeholder if only `SAVE` regions (which are skipped) consume it, so a
+  dead-into-`SAVE` input is not pinned. With `input_saved_tensors_hooks` set it falls back
+  to checkpoint saving every input (always available).
 * Output of a `RECOMPUTE` op: recomputed
 * Saved-for-backward of a `RECOMPUTE` op: recomputed
 * Saved-for-backward of a `SAVE` op, when it is an *internally produced* tensor:
@@ -240,6 +245,37 @@ One thing remains an **error**:
   the persisted value and the copy autograd kept for the op's backward. remat's version
   counter catches this at backward. Wrap the mutation in a `remat.region` (or apply it
   before the value leaves the producing op).
+
+## Region inputs are liveness-tracked
+
+Non-reentrant checkpoint pins **every** region input for the whole backward: it saves each
+one at region entry and closes over it for the recompute rerun, with no notion of whether
+recompute actually reads it. But an input consumed only by `SAVE` (`recompute=False`)
+regions is never read during recompute — those regions are skipped and serve their outputs
+from the tape — so pinning it is pure waste (a transformer block that saves its whole
+attention/MLP output but only *recomputes* from a normed copy leaves the raw residual input
+resident for nothing).
+
+`torch_remat` closes this by treating the region's inputs as the outputs of one synthetic
+`SAVE` op at the region boundary, reusing the exact producer-responsibility machinery above:
+
+- checkpoint is driven with **zero** region inputs, so it neither saves them via
+  `_make_saved_tensor` nor closes over them — the library owns capturing them on the forward
+  and feeding them on recompute.
+- Each input is registered in the save-output persist index with a persist thunk. A
+  `RECOMPUTE` region consuming it fires that thunk (the input is kept and served real during
+  recompute); an input only `SAVE` regions consume is never persisted and is served a
+  storage-free placeholder — and since its only consumers are skipped, the placeholder is
+  never read. A kept input shows up as a `<region_inputs>` op with `output.<i>` rows in
+  `format_current_memory_report()`; a dropped one shows nothing.
+- A requires-grad **leaf** input (e.g. a `Parameter`) bypasses the synthetic op — a
+  `remat.region` may not yield a requires-grad leaf, and a leaf is owned elsewhere anyway, so
+  it is fed directly at no extra memory.
+
+An input consumed by a *bare* op is not detected automatically (same as any SAVE output);
+flag it with `recompute_needs_tensor` to keep it. When `input_saved_tensors_hooks` is set the
+whole mechanism is bypassed (composing per-input liveness with input offload is future work)
+and checkpoint saves every input, exactly as before.
 
 ## Developer notes
 
