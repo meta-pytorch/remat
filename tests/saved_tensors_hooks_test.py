@@ -401,3 +401,55 @@ compute block.0.mid [recompute] (recompute)
         self.assertEqual([False, True], packed_is_param)
         # Grad still flows through the parameter-wrapped saved weight.
         self.assertIsNotNone(x.grad)
+
+    def test_capture_context_binds_producer_context_for_deferred_output_save(
+        self,
+    ) -> None:
+        # capture_context runs in-window -- where the SAVE output is produced -- and its
+        # result is handed to pack as a second arg. A SAVE output whose pack is DEFERRED to
+        # a bare consumer (fired by remat.recompute_needs_tensor after the hook scope has
+        # exited) must still pack against the context captured at the producer, not what is
+        # live at the consumer. This is the offload case: the pack ("which chunk") binds the
+        # producer's context even though it runs late.
+        packed_with: list[int] = []
+        packed_is_output: list[bool] = []
+        # A mutable "current chunk id" the model advances after the region, mimicking an
+        # offloader whose per-region context is gone by the time the consumer fires.
+        current_chunk = {"id": 7}
+
+        def capture_context() -> int:
+            return current_chunk["id"]
+
+        def pack(
+            tensor: torch.Tensor, chunk_id: object, *, is_saved_output: bool
+        ) -> object:
+            packed_with.append(cast(int, chunk_id))
+            packed_is_output.append(is_saved_output)
+            return (tensor.detach(), chunk_id)
+
+        def unpack(payload: object) -> torch.Tensor:
+            tensor, _chunk_id = cast("tuple[torch.Tensor, int]", payload)
+            return tensor
+
+        def body(x: torch.Tensor) -> torch.Tensor:
+            with remat.saved_tensors_hooks(
+                pack, unpack, capture_context=capture_context
+            ):
+                # `mul` saves nothing for backward, so its output is kept only if a consumer
+                # asks -- i.e. the pack is deferred, not eager at region exit.
+                y = remat.region(lambda t: t * 2, "mul", recompute=False)(x)
+            # The producer's hook scope has exited and its context has moved on...
+            current_chunk["id"] = 999
+            # ...but this deferred save must still pack against chunk 7, captured in-window.
+            remat.recompute_needs_tensor(y)
+            return torch.relu(y)  # bare consumer, reads y during recompute
+
+        x = torch.tensor([1.0, -1.0], requires_grad=True)
+        remat.checkpoint()(body)(x).sum().backward()
+        # Packed once, with the context captured at the producer (7), not the later 999.
+        self.assertEqual([7], packed_with)
+        # ...and pack was told this entry is a persisted SAVE-region output, not a
+        # save-for-backward tensor, so a policy hook can treat it differently.
+        self.assertEqual([True], packed_is_output)
+        # d/dx relu(2x) = 2 where 2x > 0.
+        self.assertTrue(torch.equal(x.grad, torch.tensor([2.0, 0.0])))

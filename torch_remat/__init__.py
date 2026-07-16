@@ -10,6 +10,7 @@ from torch_remat._api import (  # noqa: F401
     _pop_saved_tensors_hooks,
     _push_saved_tensors_hooks,
     checkpoint,
+    recompute_needs_tensor,
     region,
     save_for_backward,
     saved_tensors_hooks,

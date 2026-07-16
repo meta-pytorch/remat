@@ -8,10 +8,9 @@
 
 """Shared, non-test helpers for the torch_remat API test suite. Not collected by pytest
 (the filename does not match ``*_test.py``). Holds the byte-report parsing and
-column-sum invariant, the placeholder assertion, the ``_ref_grad`` reference, the
-``_BARE_OP_STRATEGIES`` matrix, and the two worked activation-offload engines (the
-fine-grained wedge and the coarse bulk offloader) that the saved-tensors-hooks tests
-drive."""
+column-sum invariant, the placeholder assertion, the ``_ref_grad`` reference, and the
+two worked activation-offload engines (the fine-grained wedge and the coarse bulk
+offloader) that the saved-tensors-hooks tests drive."""
 
 from __future__ import annotations
 
@@ -33,26 +32,6 @@ def _numel(shape: tuple[int, ...]) -> int:
     for size in shape:
         numel *= size
     return numel
-
-
-# The four opt-in bare-op detection strategies. Behavioral bare-op tests run under all
-# of them via ``self.subTest(strategy=...)``: the ``__torch_dispatch__`` tensor subclass
-# (:mod:`torch_remat._bare_op._subclass`), the ``__torch_function__`` proxy
-# (:mod:`torch_remat._bare_op._proxy`), and their mode analogues -- the ``TorchDispatchMode``
-# (``"dispatch_mode"``) and ``TorchFunctionMode`` (``"function_mode"``,
-# :mod:`torch_remat._bare_op._function_mode`). For a bare op consuming a SAVE output passed to
-# it as an argument -- what these behavioral tests exercise -- all four produce identical
-# observable behavior (gradients, tape slots); their internals are covered separately. They are
-# NOT identical for a SAVE output consumed *inside* a ``remat.region`` body via closure capture: the
-# wrapper strategies (subclass, proxy) catch it, the modes (which are suppressed for the whole
-# ``remat.region`` body) miss it and raise a placeholder error during recompute. See the
-# ``_suppress_bare_op_detection`` note in :mod:`torch_remat._bare_op._common`.
-_BARE_OP_STRATEGIES: tuple[str, ...] = (
-    "subclass",
-    "proxy",
-    "dispatch_mode",
-    "function_mode",
-)
 
 
 # Shared execution trace for the wedge test below. The ops and the toy offloader
