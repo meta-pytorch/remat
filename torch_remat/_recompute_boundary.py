@@ -31,9 +31,7 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-from torch_remat._bare_op._common import _suppress_bare_op_detection
 from torch_remat._pytree import map_value
-from torch_remat._region import _save_output_handle, _state
 
 
 class _TriggerCheckpointRecompute(torch.autograd.Function):
@@ -57,31 +55,19 @@ class _TriggerCheckpointRecompute(torch.autograd.Function):
 
 
 def _checkpoint_recompute_boundary(output: Any) -> Any:
-    """Force non-reentrant checkpoint replay before nested custom backprop.
+    """Force non-reentrant checkpoint replay before nested custom backprop."""
 
-    Runs under bare-op suppression: the boundary's own unwrap-and-view of each SAVE
-    output is remat bookkeeping, not a bare consumer, so a mode strategy must not
-    durably save the final output because of it.
-    """
-
-    with _suppress_bare_op_detection():
-        return map_value(_trigger_boundary, output)
+    return map_value(_trigger_boundary, output)
 
 
 def _trigger_boundary(leaf: object) -> object:
-    """Install the checkpoint-recompute trigger on one region-output tensor leaf."""
+    """Install the checkpoint-recompute trigger on one region-output tensor leaf.
 
-    state = _state.get()
-    handle = (
-        _save_output_handle(state.region_state, leaf) if state is not None else None
-    )
-    if handle is not None:
-        # In the original forward the region output may be the last SAVE op's output.
-        # Hand the caller the grad-connected real; the value rides the boundary
-        # trigger, not the producer's output slot. On recompute the return value is
-        # discarded, so a placeholder there is fine -- the trigger only views the leaf
-        # and saves a zero-element tensor.
-        leaf = handle.unwrap(leaf)
+    A region output is a plain tensor (SAVE outputs are no longer wrapped), so the
+    trigger just views the leaf. On the original forward the value rides the boundary
+    trigger; on recompute the return value is discarded, so a placeholder here is fine.
+    """
+
     if not isinstance(leaf, torch.Tensor):
         raise RuntimeError(
             "torch_remat checkpoint function must return a Tensor, or one hop of "
