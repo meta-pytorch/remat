@@ -69,7 +69,7 @@ class MemoryReportTest(expecttest.TestCase):
                 """\
 layers.0: 8 B resident in 1 storage(s)
 layers.0::producer: 8 B
-        8 B  output.0               (2,)       float32  cpu""",
+  8 B  output at idx 0  (2,)  float32""",
             )
 
     def test_memory_report_folds_exact_alias_save_and_output(self) -> None:
@@ -103,8 +103,8 @@ layers.0::producer: 8 B
                 """\
 layers.0: 16 B resident in 2 storage(s)
 layers.0::sq: 16 B
-        8 B  y = output.0           (2,)       float32  cpu
-        8 B  gf                     (2,)       float32  cpu""",
+  8 B  y (output at idx 0)  (2,)  float32
+  8 B  gf                   (2,)  float32""",
             )
             self.assertEqual((2,), tuple(out.shape))
 
@@ -139,9 +139,9 @@ layers.0::sq: 16 B
                 """\
 layers.0: 96 B resident in 1 storage(s)
 layers.0::attn: 96 B
-       96 B  base of q, k                      float32  cpu      ! held for 64 B of 96 B
-          - q          view (2, 4)     spans 32 B
-          - k          view (2, 4)     spans 32 B""",
+  96 B  base of q, k    float32  ! held for 64 B of 96 B
+    - q  view (2, 4)  spans 32 B
+    - k  view (2, 4)  spans 32 B""",
             )
             self.assertEqual((2, 3), tuple(out.shape))
 
@@ -173,7 +173,7 @@ layers.0::attn: 96 B
                 """\
 layers.0: 40 B resident in 1 storage(s)
 layers.0::op: 40 B
-       40 B  v                      (4,)       float32  cpu      ! held for 16 B of 40 B""",
+  40 B  v  (4,)  float32  ! held for 16 B of 40 B""",
             )
             self.assertEqual((3,), tuple(out.shape))
 
@@ -238,8 +238,8 @@ layers.0: 0 B resident in 0 storage(s)
                 """\
 blk: 16 B resident in 1 storage(s)
 blk::op: 16 B
-       16 B  a = output.0           (4,)       float32  cpu
-          - av         view (2, 2)     spans 16 B""",
+  16 B  a (output at idx 0)  (4,)  float32
+    - av                   view (2, 2)  spans 16 B""",
             )
             self.assertEqual((4,), tuple(out.shape))
         # The differently-shaped view is a child, never folded into the ``=`` chain.
@@ -353,7 +353,7 @@ blk: 0 B resident in 0 storage(s)
                 """\
 layers.0: 28 B resident in 2 storage(s)
 layers.0::attn.softmax: 28 B
-       12 B  lse                    (3,)       float32  cpu
-       16 B  probs                  (4,)       float32  cpu""",
+  12 B  lse    (3,)  float32
+  16 B  probs  (4,)  float32""",
             )
             self.assertEqual((1,), tuple(out.shape))

@@ -33,7 +33,12 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass, field
-from typing import TextIO
+from typing import Callable, Iterable, NamedTuple, TextIO
+
+# An optional per-tensor annotator: given a saved tensor, return a short label (e.g. its
+# allocation site) to append to that storage's row, or None. Lets a caller enrich the report
+# from a memory snapshot without torch_remat knowing about snapshots.
+Annotate = Callable[["torch.Tensor"], "str | None"]
 
 import torch
 from torch_remat._api import (
@@ -78,12 +83,48 @@ class _Storage:
     values: list[_Value] = field(default_factory=list)
 
 
-def format_current_memory_report() -> str:
+class _ViewChild(NamedTuple):
+    """A view pinned under a storage, rendered as a child row beneath its base."""
+
+    name: str
+    shape: str
+    spans: str
+
+
+@dataclass
+class _StorageRow:
+    """One storage's rendered fields, pre-layout, so a caller can align columns.
+
+    Split from rendering so the report can compute per-region column widths in one pass
+    and emit vertically-aligned rows in a second. ``device`` is intentionally absent from
+    the rendered columns -- one training process owns one device, so it is noise.
+    """
+
+    nbytes: int
+    byte_str: str
+    name: str
+    shape: str
+    dtype: str
+    flag: str
+    annot: str
+    # A "base of <views>" row whose name is a list of every pinning view -- often long. It is
+    # excluded from the name-column width so one outlier doesn't pad every normal row; it just
+    # overflows its own column.
+    wide_name: bool = False
+    # View children pinned under this storage.
+    children: list[_ViewChild] = field(default_factory=list)
+
+
+def format_current_memory_report(annotate: Annotate | None = None) -> str:
     """Return a memory report for the currently active checkpoint region.
 
     Must be called from inside a checkpoint region (typically within the region
     ``function``, guarded by ``not remat.is_recomputing()`` so it runs on the
     original forward only).
+
+    Args:
+        annotate: Optional per-tensor labeller (see :data:`Annotate`); its result is
+            appended to each storage's row. Default: ``None``.
 
     Returns:
         str: The multi-line report, tallying the tensors each SAVE op keeps
@@ -100,10 +141,12 @@ def format_current_memory_report() -> str:
     """
 
     state = _expect_state()
-    return _format_memory_report(state.region_state)
+    return _format_memory_report(state.region_state, annotate)
 
 
-def print_current_memory_report(file: TextIO | None = None) -> None:
+def print_current_memory_report(
+    file: TextIO | None = None, annotate: Annotate | None = None
+) -> None:
     """Print a memory report for the currently active checkpoint region.
 
     Must be called from inside a checkpoint region (see
@@ -113,6 +156,7 @@ def print_current_memory_report(file: TextIO | None = None) -> None:
         file (TextIO, optional): Destination stream; the report and a trailing
             newline are written to it. When ``None``, writes to ``sys.stdout``.
             Default: ``None``.
+        annotate: Optional per-tensor labeller (see :data:`Annotate`).
 
     Raises:
         RuntimeError: If no checkpoint region is currently active.
@@ -125,12 +169,25 @@ def print_current_memory_report(file: TextIO | None = None) -> None:
     """
 
     output_file = sys.stdout if file is None else file
-    output_file.write(format_current_memory_report())
+    output_file.write(format_current_memory_report(annotate))
     output_file.write("\n")
 
 
-def _format_memory_report(region_state: _CheckpointRegionState) -> str:
-    """Format a storage-oriented memory report for one checkpoint region."""
+def _format_memory_report(
+    region_state: _CheckpointRegionState,
+    annotate: Annotate | None = None,
+    exclude_keys: frozenset[tuple[torch.device, int]] = frozenset(),
+) -> str:
+    """Format a storage-oriented memory report for one checkpoint region.
+
+    Columns are aligned vertically: rows are built once as :class:`_StorageRow`, the
+    per-region column widths are measured, then rows are rendered padded to those widths.
+
+    ``exclude_keys`` are storages already attributed to an earlier region by the whole-model
+    report (:func:`torch_remat.format_saved_tensors_report`); they are dropped from this
+    region's rows, subtotals, and total so a storage shared across regions is billed exactly
+    once. Empty (the default) for a standalone single-region report.
+    """
 
     region = (
         region_state.region_name
@@ -138,32 +195,39 @@ def _format_memory_report(region_state: _CheckpointRegionState) -> str:
         else "<unnamed>"
     )
 
-    # Collect every op's storages up front so the header total dedupes storages shared
-    # across ops (counted once), while each op subtotal sums the storages it references.
-    op_sections: list[tuple[str, list[_Storage]]] = []
+    # Collect every op's rows up front so the header total dedupes storages shared across
+    # ops (counted once), each op subtotal sums the storages it references, and column
+    # widths can be measured across the whole region before rendering. Storages in
+    # ``exclude_keys`` are billed to an earlier region and skipped here entirely.
+    op_sections: list[tuple[str, list[_StorageRow]]] = []
     seen_storage: set[tuple[torch.device, int]] = set()
+    excluded_any = False
     total_bytes = 0
     for record in region_state.records.values():
-        storages = _collect_storages(record)
-        if not storages:
-            continue
-        op_sections.append(
-            (_display_name(region_state, record.op_name), list(storages.values()))
-        )
-        for key, storage in storages.items():
+        rows: list[_StorageRow] = []
+        for key, storage in _collect_storages(record).items():
+            if key in exclude_keys:
+                excluded_any = True
+                continue
+            rows.append(_storage_row(storage, annotate))
             if key not in seen_storage:
                 seen_storage.add(key)
                 total_bytes += storage.nbytes
+        if not rows:
+            continue
+        op_sections.append((_display_name(region_state, record.op_name), rows))
+
+    widths = _column_widths(row for _, rows in op_sections for row in rows)
 
     lines = [
         f"{region}: {_format_bytes(total_bytes)} resident in "
         f"{len(seen_storage)} storage(s)"
     ]
-    for op_name, storages in op_sections:
-        op_bytes = sum(s.nbytes for s in storages)
+    for op_name, rows in op_sections:
+        op_bytes = sum(row.nbytes for row in rows)
         lines.append(f"{op_name}: {_format_bytes(op_bytes)}")
-        for storage in storages:
-            lines.extend(_format_storage(storage))
+        for row in rows:
+            lines.extend(_render_storage_row(row, widths))
 
     footer = _format_not_resident(region_state)
     lines.extend(footer)
@@ -176,10 +240,15 @@ def _format_memory_report(region_state: _CheckpointRegionState) -> str:
         record.output_schema is not None for record in region_state.records.values()
     )
     if completed and total_bytes == 0 and not footer:
-        lines.append(
-            "  ! region output no longer alive -- saved tensors already released; "
-            "report reflects that"
-        )
+        if excluded_any:
+            lines.append(
+                "  (resident storages all billed to an earlier region -- counted there)"
+            )
+        else:
+            lines.append(
+                "  ! region output no longer alive -- saved tensors already released; "
+                "report reflects that"
+            )
     return "\n".join(lines)
 
 
@@ -238,8 +307,8 @@ def _find_value(storage: _Storage, tensor: torch.Tensor) -> _Value | None:
     return None
 
 
-def _format_storage(storage: _Storage) -> list[str]:
-    """Render one storage: a byte-bearing row for the storage plus any view children.
+def _storage_row(storage: _Storage, annotate: Annotate | None) -> _StorageRow:
+    """Extract one storage's fields (unpadded) for later aligned rendering.
 
     The byte figure lives on this row and nowhere else. A storage always has at least one
     named value, so the row is always named after one -- there is no "unnamed" case:
@@ -274,25 +343,74 @@ def _format_storage(storage: _Storage) -> list[str]:
     )
     flag = ""
     if used < storage.nbytes:
-        flag = f"   ! held for {_format_bytes(used)} of {_format_bytes(storage.nbytes)}"
+        flag = f"  ! held for {_format_bytes(used)} of {_format_bytes(storage.nbytes)}"
 
     if row_value is not None:
-        name_col = " = ".join(_order_names(row_value.names))
+        name = _format_value_name(row_value.names)
         shape = f"{tuple(row_value.tensor.shape)}"
+        repr_tensor: torch.Tensor | None = row_value.tensor
     else:
-        name_col = "base of " + ", ".join(_order_names(v.names)[0] for v in children)
+        name = "base of " + ", ".join(_order_names(v.names)[0] for v in children)
         shape = ""
+        repr_tensor = children[0].tensor if children else None
 
-    lines: list[str] = [
-        f"  {_format_bytes(storage.nbytes):>9}  {name_col:<22} {shape:<10} {dtype:<8} "
-        f"{str(storage.device):<6}{flag}".rstrip()
+    annot = ""
+    if annotate is not None and repr_tensor is not None:
+        site = annotate(repr_tensor)
+        if site:
+            annot = f"  {site}"
+
+    child_rows = [
+        _ViewChild(
+            name=_format_value_name(view.names),
+            shape=f"{tuple(view.tensor.shape)}",
+            spans=_format_bytes(view.covered),
+        )
+        for view in children
     ]
-    for view in children:
-        view_name = " = ".join(_order_names(view.names))
-        view_shape = f"{tuple(view.tensor.shape)}"
+    return _StorageRow(
+        nbytes=storage.nbytes,
+        byte_str=_format_bytes(storage.nbytes),
+        name=name,
+        shape=shape,
+        dtype=dtype,
+        flag=flag,
+        annot=annot,
+        wide_name=row_value is None,
+        children=child_rows,
+    )
+
+
+def _column_widths(rows: Iterable[_StorageRow]) -> tuple[int, int, int, int]:
+    """Max width of each aligned column (bytes, name, shape, dtype) across ``rows``.
+
+    The name width ignores ``wide_name`` rows (long ``base of ...`` callouts) so a single
+    outlier doesn't pad every normal row; those rows overflow their own name column instead.
+    """
+
+    rows = list(rows)
+    byte_w = max((len(row.byte_str) for row in rows), default=0)
+    name_w = max((len(row.name) for row in rows if not row.wide_name), default=0)
+    shape_w = max((len(row.shape) for row in rows), default=0)
+    dtype_w = max((len(row.dtype) for row in rows), default=0)
+    return byte_w, name_w, shape_w, dtype_w
+
+
+def _render_storage_row(
+    row: _StorageRow, widths: tuple[int, int, int, int]
+) -> list[str]:
+    """Render one storage row (and its view children) padded to the given column widths."""
+
+    byte_w, name_w, shape_w, dtype_w = widths
+    main = (
+        f"  {row.byte_str:>{byte_w}}  {row.name:<{name_w}}  "
+        f"{row.shape:<{shape_w}}  {row.dtype:<{dtype_w}}{row.flag}{row.annot}"
+    ).rstrip()
+    lines = [main]
+    for child in row.children:
         lines.append(
-            f"          - {view_name:<10} view {view_shape:<10} "
-            f"spans {_format_bytes(view.covered)}".rstrip()
+            f"    - {child.name:<{name_w}}  view {child.shape:<{shape_w}}  "
+            f"spans {child.spans}".rstrip()
         )
     return lines
 
@@ -330,6 +448,29 @@ def _order_names(names: list[str]) -> list[str]:
     saves = [n for n in names if not n.startswith("output.")]
     slots = sorted(n for n in names if n.startswith("output."))
     return saves + slots
+
+
+def _format_value_name(names: list[str]) -> str:
+    """Render a value's folded names for a report row.
+
+    Programmer save names (from ``remat.save_for_backward``) join with ``=`` to show they are
+    aliases of one value. A durable ``output.<i>`` slot is a *role*, not a save name, so it is
+    shown parenthesised -- ``y (output at idx 0)`` -- rather than ``y = output.0``, which reads
+    like an assignment. A value with only slot names (no programmer save) renders as the bare
+    role.
+    """
+
+    saves = [n for n in names if not n.startswith("output.")]
+    slots = sorted(n for n in names if n.startswith("output."))
+    role = ""
+    if slots:
+        idxs = ", ".join(n[len("output.") :] for n in slots)
+        role = f"output at idx {idxs}"
+    if saves and role:
+        return f"{' = '.join(saves)} ({role})"
+    if saves:
+        return " = ".join(saves)
+    return role
 
 
 def _storage_key(tensor: torch.Tensor) -> tuple[torch.device, int] | None:

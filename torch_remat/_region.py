@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import weakref
 from dataclasses import dataclass, field
 from enum import Enum
 from types import TracebackType
@@ -46,7 +47,7 @@ class RecomputeStateHook(Protocol):
     """Snapshot/restore hook keeping external (non-tensor) state aligned across recompute.
 
     ``preserve_rng_state`` realigns torch's own generators across recompute, but
-    external state -- e.g. farm's global RNG op-counter that seeds dropout and
+    external state -- e.g. a caller's global RNG op-counter that seeds dropout and
     stochastic rounding -- is invisible to it. A ``recompute=False`` (SAVE)
     region's body runs on the original forward but is skipped on recompute (its
     outputs are served from the tape), so any such state the body advanced is left
@@ -94,7 +95,11 @@ class _Phase(Enum):
     RECOMPUTE = 1
 
 
-@dataclass
+# eq=False: region states are identity objects (they hold dicts/tensors, value-equality
+# is meaningless) -- and identity semantics also make them hashable and weakly keyable,
+# which the live-region registry below relies on. The default ``@dataclass`` would set
+# ``__hash__ = None`` and make instances unusable as WeakSet members.
+@dataclass(eq=False)
 class _CheckpointRegionState:
     """State for one checkpointed region shared by forward and recomputation."""
 
@@ -156,6 +161,26 @@ _state: contextvars.ContextVar[_ActiveCheckpointRegion | None] = contextvars.Con
     "torch_remat_state",
     default=None,
 )
+
+
+# Weak registry of checkpoint regions whose forward has run and whose backward graph is
+# not yet freed -- i.e. the regions live at the pre-backward high-water mark. A region is
+# added at creation (:func:`_checkpoint_context_fn`) and drops out on its own once the
+# state is reclaimed: the state is kept alive only by the checkpoint frame that drives
+# recompute, so membership tracks exactly "forward done, backward pending" without pinning
+# anything. This is what lets a whole-model saved-for-backward report enumerate every
+# transformer block's tape at once, none of which is the currently *active* region.
+_live_regions: "weakref.WeakSet[_CheckpointRegionState]" = weakref.WeakSet()
+
+
+def _iter_live_regions() -> list[_CheckpointRegionState]:
+    """Return the currently-live checkpoint region states (order unspecified).
+
+    "Live" means the region's forward has executed and its backward subgraph has not yet
+    been released. Callers wanting a stable order should sort (e.g. by ``region_name``).
+    """
+
+    return list(_live_regions)
 
 
 def is_recomputing() -> bool:
@@ -231,6 +256,14 @@ class _CheckpointPhaseContext(contextlib.AbstractContextManager[None]):
             mode.__enter__()
             self._mode = mode
         else:  # _Phase.RECOMPUTE
+            # Recompute means backward is now consuming this region, so it leaves the
+            # "live at the pre-backward high-water mark" set. Deregister deterministically
+            # here rather than waiting for the weakref to drop: torch checkpoint's frame can
+            # hold the region state in a reference cycle (its recompute closure captures this
+            # context), so relying on reclamation would leave already-consumed regions in the
+            # registry until a cyclic gc pass -- stale entries a cross-step report would count.
+            # The WeakSet still backstops any region that never recomputes.
+            _live_regions.discard(region_state)
             # Fork: snapshot the outer state so it can be reinstated once the replay
             # finishes, then realign to the region-entry snapshot before replaying.
             self._outer_snapshots = tuple(
@@ -281,6 +314,7 @@ def _checkpoint_context_fn(
         bare_op_strategy=_bare_op_strategy(_resolve_detect_bare_ops(detect_bare_ops)),
         state_hooks=recompute_state_hooks,
     )
+    _live_regions.add(region_state)
     return (
         _CheckpointPhaseContext(region_state, _Phase.FORWARD),
         _CheckpointPhaseContext(region_state, _Phase.RECOMPUTE),
