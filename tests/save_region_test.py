@@ -21,10 +21,7 @@ from typing import Any, cast, NamedTuple
 import expecttest
 import torch
 import torch_remat as remat
-from remat_test_helpers import (
-    _BARE_OP_STRATEGIES,
-    _ref_grad,
-)
+from remat_test_helpers import _ref_grad
 from torch_remat._region import _checkpoint_context_fn
 
 
@@ -204,10 +201,10 @@ class SaveRegionTest(expecttest.TestCase):
 
     def test_save_op_saving_bare_view_of_stub_materializes(self) -> None:
         # A SAVE op saving an input that is a *bare* view of an upstream SAVE op's
-        # output. The bare view trips the forward save subclass's dispatch, which
-        # durably saves the producer's output and returns a real (plain) view; the
-        # consuming SAVE op then tapes that view as a saved input reproduced on
-        # replay -- it just works, producing the correct gradient.
+        # output. The consuming SAVE op resolves the view by storage to the producer's
+        # SAVE output, so it is a stub input (not reproduced by replay) and is retained
+        # like any other save on the autograd graph -- it just works, producing the
+        # correct gradient.
         class ProducerSave(torch.autograd.Function):
             @staticmethod
             def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
@@ -235,15 +232,10 @@ class SaveRegionTest(expecttest.TestCase):
             v = y.view_as(y)  # bare metadata view of a SAVE output
             return remat.region(SaveInput.apply, "consumer", recompute=False)(v)
 
-        # The bare view of a SAVE output needs the bare-op detection strategy.
-        for strategy in _BARE_OP_STRATEGIES:
-            with self.subTest(strategy=strategy):
-                x = torch.tensor([1.0, 2.0], requires_grad=True)
-                remat.checkpoint(region_name="r", detect_bare_ops=strategy)(region)(
-                    x
-                ).sum().backward()
-                # d/dx (3x)^2 = 18x
-                self.assertTrue(torch.equal(x.grad, torch.tensor([18.0, 36.0])))
+        x = torch.tensor([1.0, 2.0], requires_grad=True)
+        remat.checkpoint(region_name="r")(region)(x).sum().backward()
+        # d/dx (3x)^2 = 18x
+        self.assertTrue(torch.equal(x.grad, torch.tensor([18.0, 36.0])))
 
     def test_save_op_recomputed_input_is_not_offloaded(self) -> None:
         # With remat offload hooks active, a SAVE op that saves a RECOMPUTE-sourced
@@ -984,11 +976,10 @@ blk::span: 12 B
 
     def test_save_output_register_hook_fires_with_grad(self) -> None:
         # A backward hook registered on a SAVE region's output must fire with the
-        # gradient w.r.t. that output, even when the output is consumed by a
-        # remat.region that unwraps to the grad-connected inner (bypassing the
-        # subclass wrapper). Regression: activation-gradient (.dx) metrics that
-        # register_hook on a SAVE output were silently dropped (nan) under
-        # whole-layer remat because the hook sat on the wrapper the consumer bypassed.
+        # gradient w.r.t. that output when the output is consumed by a remat.region.
+        # SAVE outputs are plain tensors, so the hook rides the output's own grad_fn
+        # normally. Regression: activation-gradient (.dx) metrics that register_hook on
+        # a SAVE output were silently dropped (nan) under whole-layer remat.
         captured: list[torch.Tensor] = []
 
         class Producer(torch.autograd.Function):
@@ -1005,13 +996,11 @@ blk::span: 12 B
         def body(x: torch.Tensor) -> torch.Tensor:
             y = remat.region(Producer.apply, "producer", recompute=False)(x)
             y.register_hook(lambda g: captured.append(g.detach().clone()) or g)
-            # Consume via a remat.region, which unwraps y to its grad-connected inner.
+            # Consume via a remat.region.
             return remat.region(lambda t: t * 2, "consumer", recompute=True)(y)
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
-        remat.checkpoint(region_name="r", detect_bare_ops="subclass")(body)(
-            x
-        ).sum().backward()
+        remat.checkpoint(region_name="r")(body)(x).sum().backward()
 
         # The hook fired once, with the gradient w.r.t. the SAVE output y = 3x:
         # d(sum(2 * y))/dy = 2.
