@@ -211,16 +211,17 @@ inner_backward_after_unpack""",
         with self.assertRaisesRegex(RuntimeError, "must return a Tensor"):
             remat.checkpoint()(lambda value: (value, None))(x)
 
-    def test_checkpoint_boundary_collapses_tuple_subclass(self) -> None:
-        # _pytree treats one hop of any tuple/list of tensors alike; a tuple
-        # subclass (namedtuple, torch.return_types, ...) collapses to a plain tuple.
+    def test_checkpoint_boundary_preserves_tuple_subclass(self) -> None:
+        # _pytree keeps a one-hop container's own type across the round-trip, so a
+        # tuple subclass constructible from one iterable (namedtuple,
+        # torch.return_types, ...) is rebuilt as itself, not collapsed to plain tuple.
         class TensorTuple(tuple):
             pass
 
         x = torch.ones(1, requires_grad=True)
         output = remat.checkpoint()(lambda value: TensorTuple((value * 2,)))(x)
 
-        self.assertIs(type(output), tuple)
+        self.assertIs(type(output), TensorTuple)
         output[0].sum().backward()
         self.assertTrue(torch.equal(x.grad, torch.full_like(x, 2)))
 

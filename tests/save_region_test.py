@@ -520,6 +520,42 @@ blk::span: 12 B
         # recompute (where the SAVE op replays from the tape), not a plain tuple.
         self.assertEqual(seen_container, [Pair, Pair])
 
+    def test_save_op_returns_structseq_output(self) -> None:
+        """A SAVE op may return a structseq (torch.return_types.*); recompute rebuilds it.
+
+        Unlike a NamedTuple, a structseq exposes no ``_fields``, but it is still
+        constructible from one iterable, so its type must survive the round-trip on the
+        original forward and the tape replay -- the same guarantee an ATen op that
+        returns ``torch.return_types.max`` relies on.
+        """
+
+        structseq_type = type(torch.max(torch.zeros(1), dim=0))
+        seen_container: list[type] = []
+
+        def body(x: torch.Tensor) -> torch.Tensor:
+            pair = remat.region(
+                lambda t: structseq_type([t * 2, t * 3]),
+                "split",
+                recompute=False,
+            )(x)
+            seen_container.append(type(pair))
+            # structseq field access (``.values`` / ``.indices``) must work on the
+            # forward value and the recompute reconstruction alike; both fields are
+            # SAVE outputs ferried on recompute.
+            return remat.region(torch.add, "add", recompute=True)(
+                pair.values, pair.indices
+            )
+
+        x = torch.tensor([1.0, 2.0], requires_grad=True)
+        out = remat.checkpoint()(body)(x)
+        out.sum().backward()
+
+        self.assertTrue(torch.equal(out.detach(), torch.tensor([5.0, 10.0])))
+        self.assertTrue(torch.equal(x.grad, torch.tensor([5.0, 5.0])))
+        # Rebuilt as the structseq type on the original forward and again on recompute,
+        # not collapsed to a plain tuple.
+        self.assertEqual(seen_container, [structseq_type, structseq_type])
+
     def test_multi_op_save_region(self) -> None:
         base = torch.randn(5, dtype=torch.float64)
 

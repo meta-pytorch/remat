@@ -17,9 +17,9 @@ what we support is:
 * A **value** is a leaf, or *one* hop of ``list`` / ``tuple`` whose elements are
   leaves. This is the shape of an ATen operator's arguments and results
   (``Tensor``, ``Tensor[]``, ``(Tensor, Tensor)``) and of a ``remat.region`` call's
-  return. A ``NamedTuple`` counts as a one-hop ``tuple`` and, unlike a plain or
-  ``structseq`` tuple, keeps its own type across a map-and-rebuild (see
-  :func:`container_type`) so a structured return like ``RouterOutput`` survives the
+  return. The container's own type is kept across a map-and-rebuild (see
+  :func:`container_type`), so a structured one-hop return -- a ``NamedTuple`` like
+  ``RouterOutput`` or a ``structseq`` like ``torch.return_types.max`` -- survives the
   round-trip with its named fields intact.
 * A call's **arguments** are ``args`` (positional) plus ``kwargs`` (keyword),
   where each argument is a value. This is what a ``remat.region``-wrapped callable and
@@ -60,26 +60,27 @@ def value_leaves(value: object) -> tuple[object, ...]:
 def container_type(value: object) -> type | None:
     """Return the type to rebuild one-hop ``value`` with, or ``None`` for a leaf.
 
-    A ``list`` stays ``list`` and a ``NamedTuple`` keeps its own type -- so its named
-    fields survive a map-and-rebuild -- while every other tuple (a plain ``tuple`` or
-    a ``structseq`` such as ``torch.return_types.*``) collapses to a plain ``tuple``.
-    A ``NamedTuple`` is told apart by its ``_fields`` attribute, which neither a plain
-    ``tuple`` nor a ``structseq`` carries.
+    The value's own type is kept, so a one-hop container round-trips a map-and-rebuild
+    as itself: a plain ``list`` / ``tuple`` unchanged, and a structured container -- a
+    ``NamedTuple`` (e.g. ``RouterOutput``) or a ``structseq`` (``torch.return_types.*``)
+    -- with its named fields intact. :func:`rebuild_container` knows how to reconstruct
+    each; a subclass is preserved only if it is likewise constructible from one iterable.
     """
 
-    if isinstance(value, list):
-        return list
-    if isinstance(value, tuple):
-        return type(value) if hasattr(value, "_fields") else tuple
+    if isinstance(value, (list, tuple)):
+        return type(value)
     return None
 
 
 def rebuild_container(container: type, items: list[object]) -> object:
     """Build a one-hop ``container`` from already-mapped ``items``.
 
-    A ``NamedTuple`` is built via ``_make`` (its constructor takes the fields
-    positionally, not one iterable); ``list`` / ``tuple`` take the iterable directly.
-    ``container`` is what :func:`container_type` returned for the original value.
+    ``container`` is what :func:`container_type` returned for the original value. A
+    ``NamedTuple`` is built via ``_make`` -- the documented namedtuple constructor
+    (underscore-prefixed only to avoid clashing with user field names) that takes the
+    fields as one iterable rather than positionally. Every other one-hop container --
+    ``list``, ``tuple``, a ``structseq``, or a subclass of these -- is built by calling
+    its type with the iterable directly.
     """
 
     make = getattr(container, "_make", None)
@@ -92,8 +93,8 @@ def map_value(fn: Callable[[object], object], value: object) -> object:
     """Map ``fn`` over the leaves of one value, rebuilding the same container.
 
     ``fn`` is applied to every leaf (tensor or not). The container is rebuilt per
-    :func:`container_type`: a ``NamedTuple`` keeps its type, other tuples collapse to
-    a plain ``tuple``, matching how op output schemas are recorded.
+    :func:`container_type`, keeping the value's own type (``list``, ``tuple``,
+    ``NamedTuple``, ``structseq``, ...), matching how op output schemas are recorded.
     """
 
     container = container_type(value)
@@ -124,8 +125,9 @@ def map_arg_leaves(
 ) -> tuple[tuple[object, ...], dict[str, object]]:
     """Map ``fn`` over a call's argument leaves, rebuilding ``args`` and ``kwargs``.
 
-    ``fn`` receives ``(path, leaf)`` and returns the replacement leaf. Containers are
-    rebuilt as plain ``list`` / ``tuple``.
+    ``fn`` receives ``(path, leaf)`` and returns the replacement leaf. Each container
+    is rebuilt with its own type preserved (see :func:`container_type`), matching
+    :func:`map_value`.
     """
 
     new_args = tuple(_map_arg(fn, arg, (index,)) for index, arg in enumerate(args))

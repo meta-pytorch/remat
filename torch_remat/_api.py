@@ -1334,8 +1334,8 @@ def _record_output_schema(record: _SaveRecord, output: Output) -> None:
     """Record a SAVE op's boundary output metadata and report labels on ``record``."""
 
     tensors = _output_tensors(output)
-    # A NamedTuple output keeps its own type so recompute rebuilds the same named
-    # container; a bare tensor yields None, other tuples/lists collapse to tuple/list.
+    # The output container's own type is kept (a bare tensor yields None), so recompute
+    # rebuilds the same container -- a NamedTuple's / return_types' named fields survive.
     container = container_type(output)
     record.output_schema = _OutputSchema(
         container=container,
@@ -1450,10 +1450,7 @@ def _load_saved_outputs(
             )
             continue
 
-        source = (
-            f"{display_name}."
-            f"{_output_name(index, is_sequence=schema.container is not None)}"
-        )
+        source = f"{display_name}.{_output_name(index, container=schema.container)}"
         placeholder = _make_placeholder_tensor(
             spec.metadata,
             _placeholder_message_text(source, display_name),
@@ -1693,11 +1690,19 @@ def _output_tensors(output: Output) -> tuple[torch.Tensor, ...]:
     return cast("tuple[torch.Tensor, ...]", value_leaves(output))
 
 
-def _output_name(index: int, *, is_sequence: bool) -> str:
-    """Return the canonical report name for one output position."""
+def _output_name(index: int, *, container: type | None) -> str:
+    """Return the canonical report name for one output position.
 
-    if not is_sequence:
+    A bare-tensor output (no container) is ``out``. A sequence output is its field
+    name when the container carries one -- a ``NamedTuple`` exposes ``_fields``, so a
+    label reads ``split.double`` rather than ``split.0`` -- else its position index.
+    """
+
+    if container is None:
         return "out"
+    fields = getattr(container, "_fields", None)
+    if fields is not None and index < len(fields):
+        return fields[index]
     return str(index)
 
 

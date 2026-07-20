@@ -125,6 +125,11 @@ Nesting a recognized container inside another (e.g. a list of lists of Tensor)
 is *not* supported and raises `TypeError` early — we traverse exactly one hop of
 `tuple`/`list`, no deeper.
 
+The container's *own* type is preserved across the round-trip: a `NamedTuple` (e.g.
+`RouterOutput`), a `structseq` (`torch.return_types.*`), or any `tuple`/`list`
+subclass constructible from a single iterable comes back as itself, with named-field
+access intact — not collapsed to a plain `tuple`/`list`.
+
 Similar to `autograd.Function`, it is permissible to pass Tensor via structures
 that are *opaque* to these semantics — a `dict`, or a custom object we don't
 recognize as a container (not a `tuple`/`list`), which we treat as a single leaf

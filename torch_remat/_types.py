@@ -232,8 +232,9 @@ class _OutputSchema:
     intentionally not preserved.
     """
 
-    # The observed output container: ``None`` for a bare tensor, ``tuple`` / ``list``,
-    # or a ``NamedTuple`` type (kept verbatim so its named fields survive recompute).
+    # The observed output container's own type, kept verbatim: ``None`` for a bare
+    # tensor, else the value's type -- ``tuple`` / ``list``, a ``NamedTuple``, or a
+    # ``structseq`` (``torch.return_types.*``) -- so its named fields survive recompute.
     # Recompute rebuilds the placeholders in this container (see ``rebuild_container``).
     container: type | None
 
