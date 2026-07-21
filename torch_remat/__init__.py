@@ -14,6 +14,7 @@ from torch_remat._api import (  # noqa: F401
     _pop_saved_tensors_hooks,
     _push_saved_tensors_hooks,
     checkpoint,
+    current_saved_tensor_info,
     recompute_needs_tensor,
     region,
     save_for_backward,
@@ -34,3 +35,4 @@ from torch_remat._saved_report import (  # noqa: F401
     print_saved_tensors_report,
 )
 from torch_remat._trace import collect_trace, trace_scope  # noqa: F401
+from torch_remat._types import SavedTensorInfo, SavedTensorKind  # noqa: F401

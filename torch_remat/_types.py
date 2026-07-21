@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import weakref
 from dataclasses import dataclass
-from typing import Callable, Protocol, TypeAlias
+from enum import auto, Enum
+from typing import Callable, TypeAlias
 
 import torch
 from torch_remat._placeholder import _TensorMetadata
@@ -31,31 +32,40 @@ UnpackHook: TypeAlias = Callable[[object], torch.Tensor]
 
 # Optional companion to a pack hook (see :func:`torch_remat.saved_tensors_hooks`'s
 # ``capture_context``). Called *in-window*, where a saved tensor is produced, to snapshot
-# whatever context the pack needs (e.g. an offloader's current chunk); its result is
-# handed to the pack hook as a second argument. This is what lets a *deferred* SAVE-output
-# save -- one whose pack fires later, at the consumer, after the producing region's hook
-# scope has exited -- still pack against the context that was live where the output was
-# born. When it is ``None`` the pack hook is called with the tensor alone (the default).
+# whatever context the pack needs (e.g. an offloader's current chunk). The captured value
+# is available from :func:`torch_remat.current_saved_tensor_info` while the one-argument
+# pack hook runs. This lets a *deferred* SAVE-output save -- one whose pack fires later, at
+# the consumer -- still observe the context that was live where the output was born.
 CaptureContext: TypeAlias = Callable[[], object]
 
 
-# A pack hook that also receives the captured context, used in place of ``PackHook`` when a
-# ``capture_context`` is registered. ``is_saved_output`` tells the hook which kind of tape
-# entry it is packing: ``False`` for an ordinary save-for-backward tensor, ``True`` for a
-# SAVE-region *output* being persisted so a recompute consumer can read it. The two have
-# different lifetimes -- a saved-for-backward tensor is needed only late in the op's backward,
-# whereas a persisted output seeds the *start* of the region's recompute -- so a hook (e.g. an
-# activation offloader) can apply a different policy to each (offload the former, keep the
-# latter resident) instead of treating every packed tensor the same.
-#
-# A ``Protocol`` rather than a ``Callable`` alias so the parameters carry names, and so
-# ``is_saved_output`` is keyword-only: a bare positional ``bool`` at the call site would be
-# opaque. ``tensor`` / ``context`` are positional-only, leaving implementations free to name
-# them as they like (the offloader calls its context ``chunk``).
-class PackHookWithContext(Protocol):
-    def __call__(
-        self, tensor: torch.Tensor, context: object, /, *, is_saved_output: bool
-    ) -> object: ...
+class SavedTensorKind(Enum):
+    """Why remat is packing a tensor for a later load."""
+
+    BACKWARD = auto()
+    SAVE_OUTPUT = auto()
+
+
+@dataclass(frozen=True)
+class SavedTensorInfo:
+    """Metadata for the tensor whose remat pack hook is currently running.
+
+    Obtain this from :func:`torch_remat.current_saved_tensor_info`; it is valid only
+    during a pack-hook invocation.
+
+    Attributes:
+        kind: Why the tensor is being packed. ``BACKWARD`` denotes an ordinary
+            saved-for-backward tensor. ``SAVE_OUTPUT`` denotes a ``recompute=False``
+            region output persisted as an input to later recomputation.
+        context: The value returned by the hook's ``capture_context`` callback where
+            the tensor was produced, or ``None`` when no callback was supplied. In
+            particular, a deferred ``SAVE_OUTPUT`` pack receives its producer-time
+            context even if a later consumer triggers the pack after the producer's
+            hook scope has exited.
+    """
+
+    kind: SavedTensorKind
+    context: object = None
 
 
 @dataclass

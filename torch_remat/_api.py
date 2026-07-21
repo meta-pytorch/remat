@@ -92,7 +92,8 @@ from torch_remat._types import (
     _SavedTensor,
     CaptureContext,
     PackHook,
-    PackHookWithContext,
+    SavedTensorInfo,
+    SavedTensorKind,
     UnpackHook,
 )
 from torch_remat._view import (
@@ -508,14 +509,14 @@ def save_for_backward(
 class _SavedTensorsHooks:
     """The remat saved-tensor hooks currently installed (see :func:`saved_tensors_hooks`).
 
-    ``pack`` / ``unpack`` are the usual pair. ``capture_context`` is optional: when set,
-    remat calls it *in-window* (where the tensor is produced) to snapshot context and
-    passes the result to ``pack`` as a second argument -- so a *deferred* SAVE-output save
-    still packs against the context live at its producer, even though the pack fires later
-    at the consumer. When it is ``None``, ``pack`` is called with the tensor alone.
+    ``pack`` / ``unpack`` use the same one-argument signatures as PyTorch's hooks.
+    ``capture_context`` is optional: when set, remat calls it *in-window* (where the tensor
+    is produced) and exposes its result through :func:`current_saved_tensor_info` while
+    ``pack`` runs. A deferred SAVE-output pack therefore still observes its producer's
+    context even when it fires later at the consumer.
     """
 
-    pack: PackHook | PackHookWithContext
+    pack: PackHook
     unpack: UnpackHook
     capture_context: CaptureContext | None = None
 
@@ -528,6 +529,27 @@ _active_saved_tensors_hooks: contextvars.ContextVar[_SavedTensorsHooks | None] =
     contextvars.ContextVar("torch_remat_saved_tensors_hooks", default=None)
 )
 
+_active_saved_tensor_info: contextvars.ContextVar[SavedTensorInfo | None] = (
+    contextvars.ContextVar("torch_remat_saved_tensor_info", default=None)
+)
+
+
+def current_saved_tensor_info() -> SavedTensorInfo:
+    """Return metadata for the saved tensor whose pack hook is currently running.
+
+    The accessor keeps pack hooks signature-compatible with
+    :class:`torch.autograd.graph.saved_tensors_hooks` while exposing remat-specific
+    information. It is valid only during a pack-hook invocation.
+    """
+
+    info = _active_saved_tensor_info.get()
+    if info is None:
+        raise RuntimeError(
+            "current_saved_tensor_info() may only be called from a remat "
+            "saved-tensor pack hook"
+        )
+    return info
+
 
 def _capture_context(hooks: _SavedTensorsHooks) -> object:
     """Snapshot the hook's context in-window, or ``None`` if it declares none."""
@@ -538,20 +560,15 @@ def _run_pack(
     hooks: _SavedTensorsHooks,
     tensor: torch.Tensor,
     context: object,
-    is_saved_output: bool,
+    kind: SavedTensorKind,
 ) -> object:
-    """Invoke a pack hook, passing the captured ``context`` only if it takes one.
+    """Invoke an upstream-shaped pack hook under remat-specific metadata."""
 
-    ``is_saved_output`` tells a context-aware hook which kind of entry it is packing --
-    a save-for-backward tensor (``False``) or a persisted SAVE-region output (``True``) --
-    so it can apply a per-kind policy (see :data:`PackHookWithContext`). A plain
-    context-free pack hook does not receive it.
-    """
-    if hooks.capture_context is not None:
-        return cast(PackHookWithContext, hooks.pack)(
-            tensor, context, is_saved_output=is_saved_output
-        )
-    return cast(PackHook, hooks.pack)(tensor)
+    token = _active_saved_tensor_info.set(SavedTensorInfo(kind=kind, context=context))
+    try:
+        return hooks.pack(tensor)
+    finally:
+        _active_saved_tensor_info.reset(token)
 
 
 # LIFO stack of reset tokens for the tokenless _push/_pop mutators below, so
@@ -565,7 +582,7 @@ _saved_tensors_hooks_tokens: contextvars.ContextVar[tuple[contextvars.Token, ...
 
 
 def _push_saved_tensors_hooks(
-    pack_hook: PackHook | PackHookWithContext,
+    pack_hook: PackHook,
     unpack_hook: UnpackHook,
     capture_context: CaptureContext | None = None,
 ) -> None:
@@ -598,7 +615,7 @@ def _pop_saved_tensors_hooks() -> None:
 
 @contextlib.contextmanager
 def saved_tensors_hooks(
-    pack_hook: PackHook | PackHookWithContext,
+    pack_hook: PackHook,
     unpack_hook: UnpackHook,
     *,
     capture_context: CaptureContext | None = None,
@@ -645,16 +662,15 @@ def saved_tensors_hooks(
             ``with`` block has exited.
         capture_context (Callable[[], Any], optional): If given, called *in-window* --
             where the saved tensor is produced -- to snapshot whatever context the pack
-            needs, and its result is passed to ``pack_hook`` as a second argument
-            (``pack_hook(tensor, context)``). This exists for **deferred** SAVE-output
-            saves: a SAVE region's output may not be packed until a later consumer claims
-            it (that is how remat avoids saving outputs nothing needs), by which point this
-            ``with`` block has exited. Ordinary saved-for-backward tensors and the region's
-            outputs both capture the context where the region ran, so a pack that fires
-            later still sees the context that was live at the producer -- e.g. an offloader
-            can bind its current chunk here and push to it even from the consumer. When
-            ``None`` (default), ``pack_hook`` is called with the tensor alone; existing
-            two-argument-free hooks are unaffected. Keyword-only.
+            needs. Its result is available from :func:`current_saved_tensor_info` while the
+            one-argument ``pack_hook(tensor)`` runs. This exists for **deferred**
+            SAVE-output saves: a SAVE region's output may not be packed until a later
+            consumer claims it (that is how remat avoids saving outputs nothing needs), by
+            which point this ``with`` block has exited. Ordinary saved-for-backward tensors
+            and the region's outputs both capture the context where the region ran, so a
+            pack that fires later still sees the context that was live at the producer --
+            e.g. an offloader can bind its current chunk here and push to it even from the
+            consumer. Keyword-only.
 
     Yields:
         None: The hooks apply to saves that occur within the ``with`` block.
@@ -914,7 +930,7 @@ def _run_save_op(
                 hooks,
                 _detach_for_user_hook(tensor),
                 _capture_context(hooks),
-                is_saved_output=False,
+                SavedTensorKind.BACKWARD,
             )
             return _SavedHookData(packed, hooks.unpack)
 
@@ -1315,7 +1331,10 @@ class _PersistOutputThunk:
                 tensor=None,
                 version=None,
                 packed=_run_pack(
-                    self.hooks, detached, self.context, is_saved_output=True
+                    self.hooks,
+                    detached,
+                    self.context,
+                    SavedTensorKind.SAVE_OUTPUT,
                 ),
                 unpack_hook=self.hooks.unpack,
                 requires_grad=real.requires_grad,

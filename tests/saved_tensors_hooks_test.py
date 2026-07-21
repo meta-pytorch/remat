@@ -37,11 +37,13 @@ class SavedTensorsHooksTest(expecttest.TestCase):
         # pack must NOT fire again during recompute. A custom pack/unpack pair that
         # round-trips through a Python list must leave gradients unchanged.
         pack_shapes: list[tuple[int, ...]] = []
+        pack_kinds: list[remat.SavedTensorKind] = []
         unpack_tags: list[str] = []
         stash: list[torch.Tensor] = []
 
         def pack(tensor: torch.Tensor) -> object:
             pack_shapes.append(tuple(tensor.shape))
+            pack_kinds.append(remat.current_saved_tensor_info().kind)
             index = len(stash)
             stash.append(tensor.detach().clone())
             return ("stashed", index)
@@ -82,6 +84,7 @@ class SavedTensorsHooksTest(expecttest.TestCase):
 
         # pack fires for x and y in the original forward only (not on recompute).
         self.assertEqual(2, len(pack_shapes))
+        self.assertEqual([remat.SavedTensorKind.BACKWARD] * 2, pack_kinds)
         # unpack fires for x and y when backward reads them back.
         self.assertEqual(["stashed", "stashed"], unpack_tags)
         # The custom pack/unpack round-trip leaves the gradient unchanged.
@@ -406,13 +409,13 @@ compute block.0.mid [recompute] (recompute)
         self,
     ) -> None:
         # capture_context runs in-window -- where the SAVE output is produced -- and its
-        # result is handed to pack as a second arg. A SAVE output whose pack is DEFERRED to
-        # a bare consumer (fired by remat.recompute_needs_tensor after the hook scope has
-        # exited) must still pack against the context captured at the producer, not what is
-        # live at the consumer. This is the offload case: the pack ("which chunk") binds the
-        # producer's context even though it runs late.
+        # result is exposed through current_saved_tensor_info. A SAVE output whose pack is
+        # DEFERRED to a bare consumer (fired by remat.recompute_needs_tensor after the hook
+        # scope has exited) must still pack against the context captured at the producer,
+        # not what is live at the consumer. This is the offload case: the pack ("which
+        # chunk") binds the producer's context even though it runs late.
         packed_with: list[int] = []
-        packed_is_output: list[bool] = []
+        packed_kinds: list[remat.SavedTensorKind] = []
         # A mutable "current chunk id" the model advances after the region, mimicking an
         # offloader whose per-region context is gone by the time the consumer fires.
         current_chunk = {"id": 7}
@@ -420,12 +423,11 @@ compute block.0.mid [recompute] (recompute)
         def capture_context() -> int:
             return current_chunk["id"]
 
-        def pack(
-            tensor: torch.Tensor, chunk_id: object, *, is_saved_output: bool
-        ) -> object:
-            packed_with.append(cast(int, chunk_id))
-            packed_is_output.append(is_saved_output)
-            return (tensor.detach(), chunk_id)
+        def pack(tensor: torch.Tensor) -> object:
+            info = remat.current_saved_tensor_info()
+            packed_with.append(cast(int, info.context))
+            packed_kinds.append(info.kind)
+            return (tensor.detach(), info.context)
 
         def unpack(payload: object) -> torch.Tensor:
             tensor, _chunk_id = cast("tuple[torch.Tensor, int]", payload)
@@ -450,6 +452,6 @@ compute block.0.mid [recompute] (recompute)
         self.assertEqual([7], packed_with)
         # ...and pack was told this entry is a persisted SAVE-region output, not a
         # save-for-backward tensor, so a policy hook can treat it differently.
-        self.assertEqual([True], packed_is_output)
+        self.assertEqual([remat.SavedTensorKind.SAVE_OUTPUT], packed_kinds)
         # d/dx relu(2x) = 2 where 2x > 0.
         self.assertTrue(torch.equal(x.grad, torch.tensor([2.0, 0.0])))

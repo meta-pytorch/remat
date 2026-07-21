@@ -327,11 +327,10 @@ TODO: we should describe this more
   with the hooks that were installed *where the output was produced* (snapshotted at region
   exit), so an offloader gets a consistent view. But the *ambient* state your `pack` reads
   (e.g. "the current chunk") is gone by then. Pass `capture_context` to
-  `saved_tensors_hooks`: remat calls it in-window (where the output is produced) and hands
-  its result to `pack(tensor, context)`. Bind your offload target there — e.g.
-  `capture_context=self.cur_forward_chunk` and `pack=lambda t, chunk: chunk.tensor_push(t)`
-  — and a deferred save routes to the right chunk even though it runs at the consumer. Hooks
-  that don't set `capture_context` are called `pack(tensor)` as before.
+  `saved_tensors_hooks`: remat calls it in-window (where the output is produced) and exposes
+  its result through `remat.current_saved_tensor_info()` while the upstream-shaped
+  `pack(tensor)` hook runs. Bind your offload target there and a deferred save routes to the
+  right chunk even though it runs at the consumer.
 
 ## License
 
