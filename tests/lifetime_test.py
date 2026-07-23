@@ -21,11 +21,94 @@ from typing import Any, cast
 import expecttest
 import torch
 import torch_remat as remat
-from remat_test_helpers import assert_reclaimed_without_gc
+from remat_test_helpers import _ref_grad, assert_reclaimed_without_gc
 from torch_remat._region import (
     _checkpoint_context_fn,
     _state,
 )
+
+
+def _make_exp_save_op(saves: str) -> type[torch.autograd.Function]:
+    """An op computing exp(x) that saves for backward per ``saves``: an internal
+    (a distinct exp(x)), its own output, or its input. exp keeps all three roles
+    correct with the same op -- the internal/output saves already hold the grad
+    factor exp(x); the input save re-applies exp."""
+
+    class Op(torch.autograd.Function):
+        runs: int = 0
+
+        @staticmethod
+        def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
+            Op.runs += 1
+            out = torch.exp(x)
+            saved = {"internal": torch.exp(x), "output": out, "input": x}[saves]
+            ctx.save_for_backward(saved)
+            ctx.saves = saves
+            return out
+
+        @staticmethod
+        def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+            (saved,) = ctx.saved_tensors
+            factor = saved.exp() if ctx.saves == "input" else saved
+            return grad_output * factor
+
+    return Op
+
+
+def _make_recompute_doubler() -> type[torch.autograd.Function]:
+    """A RECOMPUTE producer: doubles its input, counting its forward runs."""
+
+    class Doubler(torch.autograd.Function):
+        runs: int = 0
+
+        @staticmethod
+        def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
+            Doubler.runs += 1
+            del ctx
+            return x * 2
+
+        @staticmethod
+        def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+            del ctx
+            return grad_output * 2
+
+    return Doubler
+
+
+def _make_taxonomy_op() -> type[torch.autograd.Function]:
+    """An op that saves an internal (3w) and its input (w) and emits a dead
+    auxiliary output (w + 7), recording a weakref to the internal on the forward."""
+
+    class Op(torch.autograd.Function):
+        internal_ref: weakref.ReferenceType[torch.Tensor] | None = None
+
+        @staticmethod
+        def forward(ctx: Any, w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            internal = w * 3
+            if not remat.is_recomputing():
+                Op.internal_ref = weakref.ref(internal)
+            aux = w + 7  # dead auxiliary output
+            out = internal * w  # 3 * w**2
+            ctx.save_for_backward(internal, w)
+            return out, aux
+
+        @staticmethod
+        def backward(
+            ctx: Any, grad_out: torch.Tensor, grad_aux: torch.Tensor
+        ) -> torch.Tensor:
+            (internal, w) = ctx.saved_tensors
+            del grad_aux
+            return grad_out * (internal + 3 * w)  # d(3 w**2)/dw = 6w
+
+    return Op
+
+
+def _exp_exp_times3(t: torch.Tensor) -> torch.Tensor:
+    return torch.exp(torch.exp(t)) * 3  # A = exp, B = exp, tail = * 3
+
+
+def _twelve_t_squared(t: torch.Tensor) -> torch.Tensor:
+    return 3 * (t * 2) ** 2  # producer w = 2t, op out = 3 w**2 -> 12 t**2
 
 
 class LifetimeTest(expecttest.TestCase):
@@ -523,3 +606,327 @@ class LifetimeTest(expecttest.TestCase):
 
         out.sum().backward()
         self.assertTrue(torch.equal(x.grad, torch.full((1024,), 2.0)))
+
+    def test_interior_recompute_output_freed_but_escaping_output_retained(
+        self,
+    ) -> None:
+        # Two recompute=True regions chained in ONE checkpoint scope. The first region's
+        # output stays INTERIOR (consumed by the second region), so it is freed after the
+        # forward and recomputed on the backward replay. The second region's output is
+        # also a recompute=True output, but it ESCAPES the scope (it is returned), so its
+        # value survives the forward and is directly readable with no recompute. Escaping
+        # the ckpt scope, not the recompute flag, is what decides retention.
+        interior_ref: weakref.ReferenceType[torch.Tensor] | None = None
+
+        class Stage0(torch.autograd.Function):  # produces the interior output
+            runs: int = 0
+
+            @staticmethod
+            def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
+                Stage0.runs += 1
+                ctx.save_for_backward(x * 2)  # d(x*x)/dx = 2x
+                return x * x
+
+            @staticmethod
+            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+                (grad_factor,) = ctx.saved_tensors
+                return grad_output * grad_factor
+
+        class Stage1(torch.autograd.Function):  # produces the escaping output
+            runs: int = 0
+
+            @staticmethod
+            def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
+                Stage1.runs += 1
+                ctx.save_for_backward(x * 2)
+                return x * x
+
+            @staticmethod
+            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+                (grad_factor,) = ctx.saved_tensors
+                return grad_output * grad_factor
+
+        def body(x: torch.Tensor) -> torch.Tensor:
+            nonlocal interior_ref
+            interior = remat.region(Stage0.apply, "stage.0", recompute=True)(x)
+            if not remat.is_recomputing():
+                interior_ref = weakref.ref(interior)
+            return remat.region(Stage1.apply, "stage.1", recompute=True)(interior)
+
+        x = torch.tensor([1.0, 2.0], requires_grad=True)
+        out = remat.checkpoint(region_name="scope")(body)(x)
+
+        ref = interior_ref
+        assert ref is not None
+        gc.collect()
+        # The interior output is freed after the forward.
+        self.assertIsNone(ref())
+        # Neither region has recomputed yet (reading the escaped output does not trigger
+        # recompute), and the escaping output (== x**4) survived the forward intact.
+        self.assertEqual(1, Stage0.runs)
+        self.assertEqual(1, Stage1.runs)
+        self.assertTrue(torch.equal(out.detach(), torch.tensor([1.0, 16.0])))
+
+        out.sum().backward()
+        # Both recompute=True regions rerun on the backward replay.
+        self.assertEqual(2, Stage0.runs)
+        self.assertEqual(2, Stage1.runs)
+        # d/dx sum(x**4) = 4 * x**3
+        self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 32.0])))
+
+    def test_recompute_output_shared_by_save_and_recompute_consumers_is_freed(
+        self,
+    ) -> None:
+        # A recompute=True region output consumed by BOTH a SAVE region (recompute=False)
+        # and a RECOMPUTE region (recompute=True) -- mixed-policy fan-out on one producer
+        # output. It stays interior, so it is freed after the forward and reproduced on
+        # the backward replay: the SAVE consumer saved it as an INPUT (a RECOMPUTE -> SAVE
+        # crossing, captured during replay, not retained), and the RECOMPUTE consumer
+        # reruns.
+        producer_output_ref: weakref.ReferenceType[torch.Tensor] | None = None
+
+        class Producer(torch.autograd.Function):  # recompute=True
+            runs: int = 0
+
+            @staticmethod
+            def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
+                Producer.runs += 1
+                del ctx
+                return x * 2
+
+            @staticmethod
+            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+                del ctx
+                return grad_output * 2
+
+        class SaveConsumer(torch.autograd.Function):  # SAVE; saves its input
+            @staticmethod
+            def forward(ctx: Any, h: torch.Tensor) -> torch.Tensor:
+                ctx.save_for_backward(h)
+                return h * h
+
+            @staticmethod
+            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+                (h,) = ctx.saved_tensors
+                return grad_output * 2 * h
+
+        class RecomputeConsumer(torch.autograd.Function):  # RECOMPUTE
+            @staticmethod
+            def forward(ctx: Any, h: torch.Tensor) -> torch.Tensor:
+                ctx.save_for_backward(h)
+                return h * h * h
+
+            @staticmethod
+            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+                (h,) = ctx.saved_tensors
+                return grad_output * 3 * h * h
+
+        def body(x: torch.Tensor) -> torch.Tensor:
+            nonlocal producer_output_ref
+            h = remat.region(Producer.apply, "producer", recompute=True)(x)
+            if not remat.is_recomputing():
+                producer_output_ref = weakref.ref(h)
+            saved = remat.region(SaveConsumer.apply, "save_consumer", recompute=False)(
+                h
+            )
+            recomputed = remat.region(
+                RecomputeConsumer.apply, "recompute_consumer", recompute=True
+            )(h)
+            # Combine via a region: `saved` is a SAVE output, so a bare consumer would
+            # need remat.recompute_needs_tensor; a region consumer ferries it directly.
+            return remat.region(torch.add, "combine", recompute=True)(saved, recomputed)
+
+        x = torch.tensor([1.0, 2.0], requires_grad=True)
+        out = remat.checkpoint(region_name="scope")(body)(x)
+
+        ref = producer_output_ref
+        assert ref is not None
+        gc.collect()
+        # The producer output is a recompute output consumed only inside the scope ->
+        # freed, even though the SAVE consumer saved it as an input.
+        self.assertIsNone(ref())
+
+        out.sum().backward()
+        self.assertEqual(2, Producer.runs)  # recomputed at backward
+        # out = (2x)**2 + (2x)**3 = 4x**2 + 8x**3; d/dx = 8x + 24x**2
+        self.assertTrue(torch.equal(x.grad, torch.tensor([32.0, 112.0])))
+
+    def test_bare_op_output_is_freed_and_recomputed(self) -> None:
+        # A plain op -- not wrapped in remat.region -- inside a checkpoint scope recomputes
+        # by default. Its output is consumed by a downstream plain op that saves it for
+        # backward, but under the whole-region checkpoint that save is diverted, so the
+        # output is freed after the forward and recomputed on the backward replay. No SAVE
+        # region is involved -- this is the default-recompute path for unwrapped ops.
+        producer_output_ref: weakref.ReferenceType[torch.Tensor] | None = None
+
+        class BareProducer(torch.autograd.Function):  # run without remat.region
+            runs: int = 0
+
+            @staticmethod
+            def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
+                BareProducer.runs += 1
+                ctx.save_for_backward(x)
+                return x * 2
+
+            @staticmethod
+            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+                del ctx
+                return grad_output * 2
+
+        class BareConsumer(torch.autograd.Function):  # plain consumer
+            @staticmethod
+            def forward(ctx: Any, y: torch.Tensor) -> torch.Tensor:
+                nonlocal producer_output_ref
+                if not remat.is_recomputing():
+                    producer_output_ref = weakref.ref(y)
+                ctx.save_for_backward(y)
+                return y * y
+
+            @staticmethod
+            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+                (y,) = ctx.saved_tensors
+                return grad_output * 2 * y
+
+        def body(x: torch.Tensor) -> torch.Tensor:
+            produced = BareProducer.apply(x)  # not wrapped in remat.region
+            return BareConsumer.apply(produced)  # plain consumer
+
+        x = torch.tensor([1.0, 2.0], requires_grad=True)
+        out = remat.checkpoint(region_name="scope")(body)(x)
+
+        ref = producer_output_ref
+        assert ref is not None
+        gc.collect()
+        # The unwrapped recompute op's output was freed after the forward.
+        self.assertIsNone(ref())
+
+        out.sum().backward()
+        self.assertEqual(2, BareProducer.runs)  # recomputed at backward
+        # out = (2x)**2 = 4x**2; d/dx sum = 8x
+        self.assertTrue(torch.equal(x.grad, torch.tensor([8.0, 16.0])))
+
+    def _check_retention_cell(
+        self, recompute_a: bool, recompute_b: bool, saves_a: str
+    ) -> None:
+        a_op = _make_exp_save_op(saves_a)
+        b_op = _make_exp_save_op(
+            "internal"
+        )  # B fixed; its role is in the taxonomy test
+        y_ref: weakref.ReferenceType[torch.Tensor] | None = None
+        z_ref: weakref.ReferenceType[torch.Tensor] | None = None
+
+        def body(x: torch.Tensor) -> torch.Tensor:
+            nonlocal y_ref, z_ref
+            y = remat.region(a_op.apply, "a", recompute=recompute_a)(x)
+            z = remat.region(b_op.apply, "b", recompute=recompute_b)(y)
+            if not remat.is_recomputing():
+                y_ref = weakref.ref(y)
+                z_ref = weakref.ref(z)
+            return remat.region(lambda t: t * 3, "tail", recompute=True)(z)
+
+        base = torch.tensor([0.5, 1.0], dtype=torch.float64)
+        x = base.clone().requires_grad_(True)
+        out = remat.checkpoint(region_name="scope")(body)(x)
+
+        assert y_ref is not None and z_ref is not None
+        gc.collect()
+        # A RECOMPUTE region frees its interior output regardless of save role.
+        for recompute, output_ref in ((recompute_a, y_ref), (recompute_b, z_ref)):
+            if recompute:
+                self.assertIsNone(output_ref())
+
+        out.sum().backward()
+
+        # SAVE runs once (body skipped on recompute); RECOMPUTE runs twice.
+        self.assertEqual(2 if recompute_a else 1, a_op.runs)
+        self.assertEqual(2 if recompute_b else 1, b_op.runs)
+        # Gradient matches the uncheckpointed reference in every cell.
+        self.assertTrue(torch.allclose(x.grad, _ref_grad(_exp_exp_times3, base)))
+
+    def test_retention_matrix_over_recompute_flags_and_save_roles(self) -> None:
+        # Retention across a two-region chain A -> B (plus a trailing RECOMPUTE op so that
+        # BOTH A's output and B's output stay *interior* -- consumed downstream, never
+        # returned), swept over two orthogonal axes:
+        #
+        #   * each region's policy: recompute_a, recompute_b in {False (SAVE), True};
+        #   * what the FIRST op saves for backward: an internal intermediate, its own
+        #     output, or its input.
+        #
+        # The invariant under test is that the save role does NOT change interior-output
+        # retention: a RECOMPUTE region frees its interior output no matter what it saved
+        # (a dead weakref witnesses it), a SAVE region keeps it (runs once, never
+        # recomputes), and the gradient matches the uncheckpointed reference in every cell.
+        # Per-save-role retention of the *saved tensor itself* is pinned by the taxonomy
+        # test below.
+        for recompute_a in (False, True):
+            for recompute_b in (False, True):
+                for saves_a in ("internal", "output", "input"):
+                    with self.subTest(
+                        recompute_a=recompute_a,
+                        recompute_b=recompute_b,
+                        saves_a=saves_a,
+                    ):
+                        self._check_retention_cell(recompute_a, recompute_b, saves_a)
+
+    def _run_taxonomy_pass(self, recompute_op: bool) -> None:
+        producer = _make_recompute_doubler()
+        op = _make_taxonomy_op()
+        aux_ref: weakref.ReferenceType[torch.Tensor] | None = None
+        w_ref: weakref.ReferenceType[torch.Tensor] | None = None
+
+        def body(x: torch.Tensor) -> torch.Tensor:
+            nonlocal aux_ref, w_ref
+            w = remat.region(producer.apply, "producer", recompute=True)(x)
+            if not remat.is_recomputing():
+                w_ref = weakref.ref(w)
+            out, aux = remat.region(op.apply, "op", recompute=recompute_op)(w)
+            if not remat.is_recomputing():
+                aux_ref = weakref.ref(aux)
+            return out  # aux dropped
+
+        base = torch.tensor([1.0, 2.0], dtype=torch.float64)
+        x = base.clone().requires_grad_(True)
+        out = remat.checkpoint(region_name="scope")(body)(x)
+
+        assert aux_ref is not None and w_ref is not None
+        gc.collect()
+        self.assertIsNone(w_ref())  # a saved input (from a RECOMPUTE producer) is freed
+        self.assertIsNone(aux_ref())  # a dead auxiliary output is freed
+        if recompute_op:
+            # A RECOMPUTE op frees its internal too (a SAVE op keeps it -- see below).
+            assert op.internal_ref is not None
+            self.assertIsNone(op.internal_ref())
+
+        out.sum().backward()
+        self.assertEqual(2, producer.runs)  # the producer reran to reproduce w
+        self.assertTrue(torch.allclose(x.grad, _ref_grad(_twelve_t_squared, base)))
+
+    def test_save_role_retention_taxonomy_is_per_tensor(self) -> None:
+        # Orthogonality: within a SINGLE op, each saved/produced tensor's fate is decided
+        # by its own role, independent of the others. One op saves an internal AND its own
+        # input (sourced from a RECOMPUTE producer), and also emits a dead auxiliary
+        # output. As a RECOMPUTE op every one of those is freed and reproduced on the
+        # replay; as a SAVE op the roles diverge -- the internal stays resident while the
+        # saved input is freed (recomputed) and the dead aux is freed.
+        self._run_taxonomy_pass(recompute_op=True)
+        self._run_taxonomy_pass(recompute_op=False)
+
+        # Direct residency view of the SAVE op: only the internal is resident (the saved
+        # input is rebuilt on recompute; the dead aux and the output carry no bytes here).
+        forward_context, _ = _checkpoint_context_fn("scope")
+        base = torch.tensor([1.0, 2.0], dtype=torch.float64)
+        x = base.clone().requires_grad_(True)
+        with forward_context:
+            doubler = _make_recompute_doubler()
+            w = remat.region(doubler.apply, "producer", recompute=True)(x)
+            # Hold the op output so its grad_fn keeps the SAVE saves live for the report.
+            held = remat.region(_make_taxonomy_op().apply, "op", recompute=False)(w)
+            self.assertExpectedInline(
+                remat.format_current_memory_report(),
+                """\
+scope: 16 B resident in 1 storage(s)
+scope::op: 16 B
+  16 B  saved.0  (2,)  float64
+  + 1 save rebuilt on recompute, not resident""",
+            )
+            del held
