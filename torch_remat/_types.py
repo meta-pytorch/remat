@@ -24,9 +24,8 @@ import torch
 from torch_remat._placeholder import _TensorMetadata
 from torch_remat._pytree import PathToken
 
-# Same contract as ``torch.autograd.graph.saved_tensors_hooks`` (pack returns an
-# opaque object stored in place of the tensor; unpack recovers it), but installed
-# at remat's tape instead of autograd's saved-tensors machinery.
+# Same contract as ``torch.autograd.graph.saved_tensors_hooks``: pack returns an
+# opaque object stored in place of the tensor, and unpack recovers it.
 PackHook: TypeAlias = Callable[[torch.Tensor], object]
 UnpackHook: TypeAlias = Callable[[object], torch.Tensor]
 
@@ -42,6 +41,7 @@ CaptureContext: TypeAlias = Callable[[], object]
 class SavedTensorKind(Enum):
     """Why remat is packing a tensor for a later load."""
 
+    CHECKPOINT_INPUT = auto()
     BACKWARD = auto()
     SAVE_OUTPUT = auto()
 
@@ -54,14 +54,17 @@ class SavedTensorInfo:
     during a pack-hook invocation.
 
     Attributes:
-        kind: Why the tensor is being packed. ``BACKWARD`` denotes an ordinary
-            saved-for-backward tensor. ``SAVE_OUTPUT`` denotes a ``recompute=False``
-            region output persisted as an input to later recomputation.
+        kind: Why remat is packing the tensor. ``CHECKPOINT_INPUT`` denotes a
+            checkpoint input retained for recomputation. ``BACKWARD`` denotes a
+            tensor retained for backward, including ordinary native saves outside
+            a checkpoint. ``SAVE_OUTPUT`` denotes a ``recompute=False`` region's
+            output persisted as an input to later recomputation.
         context: The value returned by the hook's ``capture_context`` callback where
             the tensor was produced, or ``None`` when no callback was supplied. In
             particular, a deferred ``SAVE_OUTPUT`` pack receives its producer-time
             context even if a later consumer triggers the pack after the producer's
-            hook scope has exited.
+            hook scope has exited. Native saves outside a checkpoint always receive
+            ``None`` because ``capture_context`` is remat-specific.
     """
 
     kind: SavedTensorKind

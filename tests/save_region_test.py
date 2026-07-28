@@ -284,16 +284,16 @@ class SaveRegionTest(expecttest.TestCase):
                 "producer",
                 recompute=True,
             )(x)
-            return remat.region(
-                Consumer.apply,
-                "consumer",
-                recompute=False,
-            )(y)
+            with remat.saved_tensors_hooks(pack, unpack):
+                return remat.region(
+                    Consumer.apply,
+                    "consumer",
+                    recompute=False,
+                )(y)
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
-        with remat.saved_tensors_hooks(pack, unpack):
-            out = remat.checkpoint(region_name="r")(region)(x)
-            out.sum().backward()
+        out = remat.checkpoint(region_name="r")(region)(x)
+        out.sum().backward()
 
         # Only the internal save reached the offloader; the recomputed input did not.
         self.assertEqual(["shape(2,)"], packed)

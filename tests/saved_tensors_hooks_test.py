@@ -14,6 +14,8 @@ SAVE -> RECOMPUTE -> SAVE model bitwise-identically. The offloader machinery liv
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import Callable
 from typing import Any, cast
 
 import expecttest
@@ -25,17 +27,127 @@ from remat_test_helpers import (
     _run_wedge_model,
     _WedgeOffloader,
 )
+from torch_remat._api import _active_saved_tensors_hooks
 
 
 class SavedTensorsHooksTest(expecttest.TestCase):
+    def test_saved_tensors_hooks_match_native_outside_checkpoint(self) -> None:
+        def run(
+            context: contextlib.AbstractContextManager[None],
+            packed_shapes: list[tuple[int, ...]],
+            unpacked_shapes: list[tuple[int, ...]],
+        ) -> torch.Tensor:
+            x = torch.tensor([2.0, 3.0], requires_grad=True)
+            self.assertIsNone(_active_saved_tensors_hooks.get())
+            with context:
+                self.assertIsNone(_active_saved_tensors_hooks.get())
+                y = x * x
+            y.sum().backward()
+            self.assertIsNotNone(x.grad)
+            return cast(torch.Tensor, x.grad)
+
+        native_packed: list[tuple[int, ...]] = []
+        native_unpacked: list[tuple[int, ...]] = []
+        remat_packed: list[tuple[int, ...]] = []
+        remat_unpacked: list[tuple[int, ...]] = []
+
+        def hooks(
+            packed: list[tuple[int, ...]],
+            unpacked: list[tuple[int, ...]],
+        ) -> tuple[Callable[[torch.Tensor], object], Callable[[object], torch.Tensor]]:
+            def pack(tensor: torch.Tensor) -> object:
+                packed.append(tuple(tensor.shape))
+                return tensor
+
+            def unpack(payload: object) -> torch.Tensor:
+                tensor = cast(torch.Tensor, payload)
+                unpacked.append(tuple(tensor.shape))
+                return tensor
+
+            return pack, unpack
+
+        native_pair = hooks(native_packed, native_unpacked)
+        native_grad = run(
+            torch.autograd.graph.saved_tensors_hooks(*native_pair),
+            native_packed,
+            native_unpacked,
+        )
+        remat_pair = hooks(remat_packed, remat_unpacked)
+        remat_grad = run(
+            remat.saved_tensors_hooks(*remat_pair),
+            remat_packed,
+            remat_unpacked,
+        )
+
+        self.assertEqual(native_packed, remat_packed)
+        self.assertEqual(native_unpacked, remat_unpacked)
+        self.assertTrue(torch.equal(native_grad, remat_grad))
+
+    def test_saved_tensors_hooks_expose_native_save_metadata(self) -> None:
+        kinds: list[remat.SavedTensorKind] = []
+        contexts: list[object] = []
+        capture_calls = [0]
+
+        def capture_context() -> object:
+            capture_calls[0] += 1
+            return "captured"
+
+        def pack(tensor: torch.Tensor) -> object:
+            info = remat.current_saved_tensor_info()
+            kinds.append(info.kind)
+            contexts.append(info.context)
+            return tensor
+
+        def unpack(payload: object) -> torch.Tensor:
+            return cast(torch.Tensor, payload)
+
+        x = torch.tensor([2.0, 3.0], requires_grad=True)
+        with remat.saved_tensors_hooks(
+            pack,
+            unpack,
+            capture_context=capture_context,
+        ):
+            y = x * x
+        y.sum().backward()
+
+        self.assertEqual(
+            [remat.SavedTensorKind.BACKWARD, remat.SavedTensorKind.BACKWARD],
+            kinds,
+        )
+        self.assertEqual([None, None], contexts)
+        self.assertEqual(0, capture_calls[0])
+        self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
+
+    def test_raw_push_captures_context_for_native_saves(self) -> None:
+        contexts: list[object] = []
+
+        def pack(tensor: torch.Tensor) -> object:
+            contexts.append(remat.current_saved_tensor_info().context)
+            return tensor
+
+        def unpack(payload: object) -> torch.Tensor:
+            return cast(torch.Tensor, payload)
+
+        remat._push_saved_tensors_hooks(
+            pack,
+            unpack,
+            capture_context=lambda: "native-context",
+        )
+        try:
+            x = torch.tensor([2.0, 3.0], requires_grad=True)
+            y = x * x
+        finally:
+            remat._pop_saved_tensors_hooks()
+        y.sum().backward()
+
+        self.assertEqual(["native-context", "native-context"], contexts)
+        self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
+
     def test_saved_tensors_hooks_fire_at_save_and_load_not_recompute(
         self,
     ) -> None:
-        # A recompute=False region routes its saved tensors through the active remat
-        # saved_tensors_hooks. pack must fire once per saved tensor in the original
-        # forward, unpack once per saved tensor when backward reads them back, and
-        # pack must NOT fire again during recompute. A custom pack/unpack pair that
-        # round-trips through a Python list must leave gradients unchanged.
+        # Inside a checkpoint, the wrapper preserves checkpoint's native hooks while
+        # delegating the SAVE region's retained tensors through the user pair.
         pack_shapes: list[tuple[int, ...]] = []
         pack_kinds: list[remat.SavedTensorKind] = []
         unpack_tags: list[str] = []
@@ -71,21 +183,19 @@ class SavedTensorsHooksTest(expecttest.TestCase):
                 return grad_output * two_x
 
         def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
-            return remat.region(
-                Square.apply,
-                "sq",
-                recompute=False,
-            )(x)
+            with remat.saved_tensors_hooks(pack, unpack):
+                return remat.region(
+                    Square.apply,
+                    "sq",
+                    recompute=False,
+                )(x)
 
         x = torch.tensor([2.0, 3.0], requires_grad=True)
-        with remat.saved_tensors_hooks(pack, unpack):
-            y = remat.checkpoint()(checkpoint_body)(x)
-            y.sum().backward()
+        y = remat.checkpoint()(checkpoint_body)(x)
+        y.sum().backward()
 
-        # pack fires for x and y in the original forward only (not on recompute).
         self.assertEqual(2, len(pack_shapes))
         self.assertEqual([remat.SavedTensorKind.BACKWARD] * 2, pack_kinds)
-        # unpack fires for x and y when backward reads them back.
         self.assertEqual(["stashed", "stashed"], unpack_tags)
         # The custom pack/unpack round-trip leaves the gradient unchanged.
         self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
@@ -137,7 +247,7 @@ class SavedTensorsHooksTest(expecttest.TestCase):
         y.sum().backward()
 
         # unpack still ran (bound at pack time) despite no active hook at backward.
-        self.assertEqual(["bound", "bound"], unpack_calls)
+        self.assertEqual(["bound", "bound", "bound"], unpack_calls)
         self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
 
     def test_saved_tensors_hooks_offload_through_save_recompute_save_wedge(
@@ -151,8 +261,9 @@ class SavedTensorsHooksTest(expecttest.TestCase):
         #   block.k:  in = Sq[SAVE]  ->  mid = Relu[RECOMPUTE]  ->  out = Sq[SAVE]
         #
         # where Sq(t) = t*t (saves the gradient factor 2*t) and Relu(t) = relu(t)
-        # (saves its 0/1 mask). A toy offload engine is wired in via remat
-        # saved_tensors_hooks; we install ONE scope around the whole forward. Each
+        # (saves its 0/1 mask). A toy offload engine is wired in via each
+        # checkpoint's saved_tensors_hooks kwarg. It passes through checkpoint
+        # inputs and offloads the SAVE tensors. Each
         # packed value binds its own unpack hook (a SAVE save's autograd payload and
         # a ferried input's tape slot both capture it at pack), so -- unlike
         # autograd's blanket default hooks, which a real engine must install
@@ -296,55 +407,244 @@ compute block.0.mid [recompute] (recompute)
         self.assertTrue(torch.equal(base_loss, off_loss))
         self.assertTrue(torch.equal(base_grad, off_grad))
 
-    def test_input_saved_tensors_hooks_fire_only_for_region_inputs(self) -> None:
-        # checkpoint(input_saved_tensors_hooks=...) installs autograd saved_tensors_hooks
-        # around the region. torch.utils.checkpoint saves the region INPUTS as autograd
-        # SavedTensors at entry (via _make_saved_tensor), before it installs its own
-        # recompute hook; the body's saves then run under that shadowing hook. So the pair
-        # fires exactly once -- for the region input -- and not for the body's
-        # save_for_backward. The round-trip must leave gradients unchanged.
-        input_pack_shapes: list[tuple[int, ...]] = []
-        input_unpacks = [0]
+    def test_checkpoint_saved_tensors_hooks_include_inputs_and_save_tensors(
+        self,
+    ) -> None:
+        outer_pack_calls = [0]
+        pack_kinds: list[remat.SavedTensorKind] = []
+        unpack_kinds: list[remat.SavedTensorKind] = []
         stash: list[torch.Tensor] = []
 
+        def outer_pack(tensor: torch.Tensor) -> object:
+            outer_pack_calls[0] += 1
+            return tensor
+
+        def outer_unpack(packed: object) -> torch.Tensor:
+            return cast(torch.Tensor, packed)
+
         def pack(tensor: torch.Tensor) -> object:
-            input_pack_shapes.append(tuple(tensor.shape))
+            kind = remat.current_saved_tensor_info().kind
+            pack_kinds.append(kind)
             stash.append(tensor.detach().clone())
-            return len(stash) - 1
+            return (len(stash) - 1, kind)
 
         def unpack(packed: object) -> torch.Tensor:
-            input_unpacks[0] += 1
-            return stash[cast(int, packed)]
+            index, kind = cast(tuple[int, remat.SavedTensorKind], packed)
+            unpack_kinds.append(kind)
+            return stash[index]
 
         class Square(torch.autograd.Function):
             @staticmethod
             def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
-                ctx.save_for_backward(
-                    x
-                )  # a BODY save -- must NOT reach the input hooks
+                two_x = x * 2
+                ctx.save_for_backward(two_x)
                 return x * x
 
             @staticmethod
             def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
-                (x,) = ctx.saved_tensors
-                return grad_output * 2 * x
+                (two_x,) = ctx.saved_tensors
+                return grad_output * two_x
 
         def body(x: torch.Tensor) -> torch.Tensor:
-            return remat.region(Square.apply, "sq", recompute=True)(x)
+            return remat.region(Square.apply, "sq", recompute=False)(x)
 
         leaf = torch.tensor([2.0, 3.0], requires_grad=True)
         region_input = leaf * 1.0  # non-leaf, so it is a real saved input
+        with remat.saved_tensors_hooks(outer_pack, outer_unpack):
+            y = remat.checkpoint(saved_tensors_hooks=(pack, unpack))(body)(region_input)
+        y.sum().backward()
+
+        self.assertEqual(0, outer_pack_calls[0])
+        self.assertCountEqual(
+            [
+                remat.SavedTensorKind.CHECKPOINT_INPUT,
+                remat.SavedTensorKind.BACKWARD,
+            ],
+            pack_kinds,
+        )
+        self.assertCountEqual(
+            [
+                remat.SavedTensorKind.CHECKPOINT_INPUT,
+                remat.SavedTensorKind.BACKWARD,
+            ],
+            unpack_kinds,
+        )
+        self.assertTrue(torch.equal(leaf.grad, torch.tensor([4.0, 6.0])))
+
+    def test_saved_tensors_hooks_entered_inside_save_body_take_precedence(
+        self,
+    ) -> None:
+        outer_packs = [0]
+        inner_packs = [0]
+
+        def outer_pack(tensor: torch.Tensor) -> object:
+            outer_packs[0] += 1
+            return tensor
+
+        def inner_pack(tensor: torch.Tensor) -> object:
+            inner_packs[0] += 1
+            return tensor
+
+        def unpack(payload: object) -> torch.Tensor:
+            return cast(torch.Tensor, payload)
+
+        class Square(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
+                doubled = x * 2
+                ctx.save_for_backward(doubled)
+                return x * x
+
+            @staticmethod
+            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+                (doubled,) = ctx.saved_tensors
+                return grad_output * doubled
+
+        def save_body(x: torch.Tensor) -> torch.Tensor:
+            with remat.saved_tensors_hooks(inner_pack, unpack):
+                return Square.apply(x)
+
+        def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
+            return remat.region(save_body, "square", recompute=False)(x)
+
+        x = torch.tensor([2.0, 3.0], requires_grad=True)
+        with remat.saved_tensors_hooks(outer_pack, unpack):
+            y = remat.checkpoint()(checkpoint_body)(x)
+        y.sum().backward()
+
+        self.assertEqual(1, outer_packs[0])
+        self.assertEqual(1, inner_packs[0])
+        self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
+
+    def test_deprecated_input_hooks_remain_input_only(self) -> None:
+        packed: list[torch.Tensor] = []
+
+        def pack(tensor: torch.Tensor) -> object:
+            packed.append(tensor)
+            return tensor
+
+        def unpack(payload: object) -> torch.Tensor:
+            return cast(torch.Tensor, payload)
+
+        class Square(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
+                doubled = x * 2
+                ctx.save_for_backward(doubled)
+                return x * x
+
+            @staticmethod
+            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+                (doubled,) = ctx.saved_tensors
+                return grad_output * doubled
+
+        def body(x: torch.Tensor) -> torch.Tensor:
+            return remat.region(Square.apply, "square", recompute=False)(x)
+
+        leaf = torch.tensor([2.0, 3.0], requires_grad=True)
+        region_input = leaf * 1.0
         y = remat.checkpoint(input_saved_tensors_hooks=(pack, unpack))(body)(
             region_input
         )
         y.sum().backward()
 
-        # pack fired exactly once -- for the region input, not Square's save_for_backward.
-        self.assertEqual([(2,)], input_pack_shapes)
-        # unpack fired once, when recompute reloaded the input.
-        self.assertEqual(1, input_unpacks[0])
-        # grad of sum(x^2) is 2x -- the round-tripped input fed forward and recompute.
+        self.assertEqual(1, len(packed))
         self.assertTrue(torch.equal(leaf.grad, torch.tensor([4.0, 6.0])))
+
+    def test_deprecated_input_hooks_preserve_outer_native_hooks(self) -> None:
+        input_packed: list[torch.Tensor] = []
+        outer_packed: list[torch.Tensor] = []
+
+        def input_pack(tensor: torch.Tensor) -> object:
+            input_packed.append(tensor)
+            return tensor
+
+        def outer_pack(tensor: torch.Tensor) -> object:
+            outer_packed.append(tensor)
+            return tensor
+
+        def unpack(payload: object) -> torch.Tensor:
+            return cast(torch.Tensor, payload)
+
+        class Square(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
+                doubled = x * 2
+                ctx.save_for_backward(doubled)
+                return x * x
+
+            @staticmethod
+            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+                (doubled,) = ctx.saved_tensors
+                return grad_output * doubled
+
+        def body(x: torch.Tensor) -> torch.Tensor:
+            return remat.region(Square.apply, "square", recompute=False)(x)
+
+        leaf = torch.tensor([2.0, 3.0], requires_grad=True)
+        region_input = leaf * 1.0
+        with torch.autograd.graph.saved_tensors_hooks(outer_pack, unpack):
+            y = remat.checkpoint(input_saved_tensors_hooks=(input_pack, unpack))(body)(
+                region_input
+            )
+        y.sum().backward()
+
+        self.assertEqual(1, len(input_packed))
+        self.assertEqual(1, len(outer_packed))
+        self.assertTrue(torch.equal(leaf.grad, torch.tensor([4.0, 6.0])))
+
+    def test_checkpoint_hook_options_are_mutually_exclusive(self) -> None:
+        def pack(tensor: torch.Tensor) -> object:
+            return tensor
+
+        def unpack(payload: object) -> torch.Tensor:
+            return cast(torch.Tensor, payload)
+
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            remat.checkpoint(
+                saved_tensors_hooks=(pack, unpack),
+                input_saved_tensors_hooks=(pack, unpack),
+            )
+
+    def test_nested_native_hooks_take_precedence(self) -> None:
+        outer_packs = [0]
+        inner_packs = [0]
+
+        def outer_pack(tensor: torch.Tensor) -> object:
+            outer_packs[0] += 1
+            return tensor
+
+        def inner_pack(tensor: torch.Tensor) -> object:
+            inner_packs[0] += 1
+            return tensor
+
+        def unpack(payload: object) -> torch.Tensor:
+            return cast(torch.Tensor, payload)
+
+        class Square(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
+                doubled = x * 2
+                ctx.save_for_backward(doubled)
+                return x * x
+
+            @staticmethod
+            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+                (doubled,) = ctx.saved_tensors
+                return grad_output * doubled
+
+        def body(x: torch.Tensor) -> torch.Tensor:
+            return remat.region(Square.apply, "square", recompute=False)(x)
+
+        x = torch.tensor([2.0, 3.0], requires_grad=True)
+        with remat.saved_tensors_hooks(outer_pack, unpack):
+            with torch.autograd.graph.saved_tensors_hooks(inner_pack, unpack):
+                y = remat.checkpoint()(body)(x)
+        y.sum().backward()
+
+        self.assertEqual(0, outer_packs[0])
+        self.assertEqual(2, inner_packs[0])
+        self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
 
     def test_saved_tensors_hooks_retain_parameter_ness(self) -> None:
         # A SAVE op that saves an nn.Parameter for backward (e.g. a linear weight for
@@ -398,10 +698,9 @@ compute block.0.mid [recompute] (recompute)
             y = remat.checkpoint()(body)(x)
             y.sum().backward()
 
-        # Two body saves reach pack: the activation (plain Tensor) then the weight
-        # (nn.Parameter, preserved across remat's detach). Without the fix the weight
-        # would arrive as a plain Tensor -> [False, False].
-        self.assertEqual([False, True], packed_is_param)
+        # The native checkpoint-input save arrives first, followed by the activation
+        # and parameter retained by the SAVE region.
+        self.assertEqual([False, False, True], packed_is_param)
         # Grad still flows through the parameter-wrapped saved weight.
         self.assertIsNotNone(x.grad)
 

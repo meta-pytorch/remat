@@ -14,7 +14,6 @@ offloader) that the saved-tensors-hooks tests drive."""
 
 from __future__ import annotations
 
-import contextlib
 import gc
 import re
 import types
@@ -70,6 +69,11 @@ class _WedgeOffloader:
         self.committed: list[int] = []  # tags from the last committed block
 
     def pack(self, tensor: torch.Tensor) -> object:
+        if (
+            remat.current_saved_tensor_info().kind
+            is remat.SavedTensorKind.CHECKPOINT_INPUT
+        ):
+            return tensor
         tag = len(self.backups)
         # Key by storage, not object identity: a producer's durable save offloads a
         # *detached* snapshot of the output (shares storage with the real value but is a
@@ -99,6 +103,8 @@ class _WedgeOffloader:
         self.committed = []
 
     def unpack(self, packed: object) -> torch.Tensor:
+        if isinstance(packed, torch.Tensor):
+            return packed
         tag = cast(int, packed)
         _wedge_log(f"  unpack t{tag} = {self.labels[tag]}")
         return self.backups[tag].clone()
@@ -177,19 +183,19 @@ def _run_wedge_model(
     _WEDGE_TRACE = []
     _WEDGE_TAGS.clear()
     x = torch.tensor([1.0, 2.0], requires_grad=True)
-    hooks: contextlib.AbstractContextManager[object] = (
-        remat.saved_tensors_hooks(offloader.pack, offloader.unpack)
-        if offloader is not None
-        else contextlib.nullcontext()
-    )
     _wedge_log("== forward ==")
-    with hooks:
-        h = x
-        for block_id in range(2):
-            block = f"block.{block_id}"
-            h = remat.checkpoint(region_name=block)(_wedge_block_body(block))(h)
-            if offloader is not None:
-                offloader.commit_group(block)  # deferred cleanup of the prior block
+    h = x
+    for block_id in range(2):
+        block = f"block.{block_id}"
+        saved_tensors_hooks = (
+            (offloader.pack, offloader.unpack) if offloader is not None else None
+        )
+        h = remat.checkpoint(
+            region_name=block,
+            saved_tensors_hooks=saved_tensors_hooks,
+        )(_wedge_block_body(block))(h)
+        if offloader is not None:
+            offloader.commit_group(block)  # deferred cleanup of the prior block
     if offloader is not None:
         offloader.flush()
     _wedge_log("== backward ==")
@@ -240,6 +246,11 @@ class _BulkOffloader:
         self.labels[block] = []
 
     def pack(self, tensor: torch.Tensor) -> object:
+        if (
+            remat.current_saved_tensor_info().kind
+            is remat.SavedTensorKind.CHECKPOINT_INPUT
+        ):
+            return tensor
         block = self.current
         index = len(self.originals[block])
         # Key by storage, not object identity: a producer's durable save offloads
@@ -266,6 +277,8 @@ class _BulkOffloader:
         return [t for group in self.originals.values() for t in group]
 
     def unpack(self, packed: object) -> torch.Tensor:
+        if isinstance(packed, torch.Tensor):
+            return packed
         block, index = cast(tuple[str, int], packed)
         _wedge_log(f"  unpack {self.labels[block][index]}")
         return self.onloaded[block][index]
@@ -296,23 +309,21 @@ def _run_bulk_model(
     _WEDGE_TRACE = []
     _WEDGE_TAGS.clear()
     x = torch.tensor([1.0, 2.0], requires_grad=True)
-    hooks: contextlib.AbstractContextManager[object] = (
-        remat.saved_tensors_hooks(offloader.pack, offloader.unpack)
-        if offloader is not None
-        else contextlib.nullcontext()
-    )
     _wedge_log("== forward ==")
-    with hooks:
-        h = x
-        for block_id in range(2):
-            block = f"block.{block_id}"
-            if offloader is not None:
-                offloader.begin_group(block)
-            h = remat.checkpoint(region_name=block)(_bulk_block_body(offloader, block))(
-                h
-            )
-            if offloader is not None:
-                offloader.offload_group(block)  # one bulk D2H per group
+    h = x
+    for block_id in range(2):
+        block = f"block.{block_id}"
+        if offloader is not None:
+            offloader.begin_group(block)
+        saved_tensors_hooks = (
+            (offloader.pack, offloader.unpack) if offloader is not None else None
+        )
+        h = remat.checkpoint(
+            region_name=block,
+            saved_tensors_hooks=saved_tensors_hooks,
+        )(_bulk_block_body(offloader, block))(h)
+        if offloader is not None:
+            offloader.offload_group(block)  # one bulk D2H per group
     _wedge_log("== backward ==")
     loss = h.sum()
     loss.backward()

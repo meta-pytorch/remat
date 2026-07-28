@@ -157,13 +157,15 @@ region, in case we transition back into a `RECOMPUTE` region (since we need
 the inputs to the recompute region to actually recompute it.)  So we just
 introduce two new mechanisms to make this work:
 
-1. Inside a `SAVE` region, we install a nested identity saved-tensor hook. This
-   suspends checkpoint's own saved-tensor hooks, so the region just saves for
-   backwards normally and PyTorch autograd owns those tensors on the original
-   forward graph (present at backward with zero recompute, freed by autograd
-   after backward — no tape bookkeeping). You can override this hook with
-   `remat.saved_tensors_hooks(...)` — e.g. to offload `SAVE` activations — since
-   the identity hook would otherwise shadow PyTorch's own `saved_tensors_hooks`.
+1. Inside a `SAVE` region, we install a nested saved-tensor hook. This suspends
+   checkpoint's discard hook, so PyTorch autograd owns those tensors on the
+   original forward graph (present at backward with zero recompute, freed by
+   autograd after backward — no tape bookkeeping). Any native PyTorch
+   `saved_tensors_hooks` active around `remat.checkpoint` are preserved through
+   this internal hook. `remat.saved_tensors_hooks(...)` has the same behavior as
+   PyTorch's context manager outside a checkpoint and is also safe to use inside
+   the checkpoint body, where it delegates SAVE tensors without overriding
+   checkpoint's recompute machinery.
 
 2. We register each output of a `SAVE` region in a per-region **save-output index**,
    keyed by storage, that marks it as needing to be saved if it flows into a
@@ -315,22 +317,33 @@ TODO: we should describe this more
 
 ## Offloading
 
-* Saved tensor hooks extension point
-* Wedge as a worked example
-* Subtlety: we save outputs for recompute; timing is different
-* Subtlety: when to trigger onload (do it on is recompute, not as an autograd
-  function)
-* Subtlety: **deferred SAVE-output saves and `capture_context`.** A SAVE region's
+* `remat.saved_tensors_hooks` follows native PyTorch saved-tensor-hook semantics.
+  Outside an active checkpoint it installs the hooks directly and observes ordinary
+  saves. A scope surrounding `remat.checkpoint` also observes checkpoint inputs and
+  tensors retained by SAVE regions. A scope entered inside the checkpoint body
+  leaves checkpoint's internal hooks installed and applies only to SAVE tensors.
+  Passing the pair through `remat.checkpoint(saved_tensors_hooks=...)` applies it
+  to both; `remat.current_saved_tensor_info().kind` is `CHECKPOINT_INPUT` for the
+  inputs, so an offloader can pass them through while handling the SAVE tensors.
+  A native PyTorch hook pair surrounding `remat.checkpoint` is preserved
+  automatically. Normal nesting determines precedence.
+* **Reload timing.** Reload at the start of the checkpoint body when
+  `remat.is_recomputing()` is true, rather than from an autograd function. A saved
+  SAVE output can be unpacked during recompute, before backward begins, so an
+  autograd function runs too late to stage that first reload.
+* **Deferred SAVE-output saves and `capture_context`.** A SAVE region's
   output is packed only when a consumer claims it (a `remat.region`, or an explicit
   `remat.recompute_needs_tensor`), so that `pack` can fire *after* the producing region's
   `saved_tensors_hooks` scope has exited — later, at the consumer. remat still packs it
-  with the hooks that were installed *where the output was produced* (snapshotted at region
-  exit), so an offloader gets a consistent view. But the *ambient* state your `pack` reads
-  (e.g. "the current chunk") is gone by then. Pass `capture_context` to
-  `saved_tensors_hooks`: remat calls it in-window (where the output is produced) and exposes
-  its result through `remat.current_saved_tensor_info()` while the upstream-shaped
-  `pack(tensor)` hook runs. Bind your offload target there and a deferred save routes to the
-  right chunk even though it runs at the consumer.
+  with the hook pair that was active *where the output was produced*
+  (snapshotted at region exit), so an offloader gets a consistent view. But the
+  *ambient* state your `pack` reads (e.g. "the current chunk") is gone by then. Pass
+  `capture_context` to `remat.saved_tensors_hooks`: remat calls it in-window (where
+  the output is produced) and exposes its result through
+  `remat.current_saved_tensor_info()` while the upstream-shaped `pack(tensor)` hook
+  runs. Outside a checkpoint this argument is inert and hook behavior is exactly native;
+  `remat.current_saved_tensor_info()` reports `BACKWARD` with a `None` context.
+  Its special role is preserving producer context for remat's deferred saves.
 
 ## License
 
