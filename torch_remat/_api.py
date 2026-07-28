@@ -199,6 +199,11 @@ def checkpoint(
 
         @wraps(function)
         def checkpointed_function(*args: Any, **kwargs: Any) -> Any:
+            # Checkpoint's internal PyTorch hooks shadow the caller's hooks inside the
+            # body. Bridge the caller's pair into remat before that happens, so tensors
+            # that remat keeps saved still follow the surrounding hook policy.
+            inherited_hooks_ctx = _inherit_saved_tensors_hooks()
+
             # We install these around the WHOLE region but they fire only for the region
             # inputs: torch.utils.checkpoint saves the inputs (via _make_saved_tensor) at
             # region entry, then enters its own saved_tensors_hooks for recompute which
@@ -211,7 +216,7 @@ def checkpoint(
                 if input_saved_tensors_hooks is not None
                 else contextlib.nullcontext()
             )
-            with input_hooks_ctx:
+            with inherited_hooks_ctx, input_hooks_ctx:
                 return _torch_checkpoint_with_forward_exception_cleanup(
                     wrapped_function,
                     function_args=args,
@@ -529,6 +534,23 @@ def _capture_context(hooks: _SavedTensorsHooks) -> object:
     return hooks.capture_context() if hooks.capture_context is not None else None
 
 
+@contextlib.contextmanager
+def _inherit_saved_tensors_hooks() -> Iterator[None]:
+    """Bridge the active PyTorch hook pair into remat when none is explicit."""
+
+    if _active_saved_tensors_hooks.get() is not None:
+        yield
+        return
+
+    hooks = torch._C._autograd._top_saved_tensors_default_hooks(True)  # type: ignore[attr-defined]
+    if hooks is None:
+        yield
+        return
+
+    with saved_tensors_hooks(*hooks):
+        yield
+
+
 def _run_pack(
     hooks: _SavedTensorsHooks,
     tensor: torch.Tensor,
@@ -600,10 +622,12 @@ def saved_tensors_hooks(
     ``pack_hook(tensor) -> packed`` runs for every tensor which is saved for
     recompute/backward (this is both normal `save_for_backward` tensors as
     well as outputs of SAVE regions which are needed for RECOMPUTE regions),
-    and ``unpack_hook(packed) -> tensor`` at each load.  The autograd API
-    cannot be used for this, as saved tensor hooks are not compositional and
-    you will override the saved tensor hooks that ``torch_remat`` uses for
-    its functionality.
+    and ``unpack_hook(packed) -> tensor`` at each load. A PyTorch saved-tensor hook
+    pair active when :func:`checkpoint` is called is inherited automatically, so
+    ordinary monitoring hooks continue to observe tensors that remat keeps saved.
+    Use this remat-specific API when the hook needs :class:`SavedTensorInfo` or a
+    producer-time ``capture_context``. An explicitly installed remat hook takes
+    precedence over an inherited PyTorch hook pair.
 
     Although saved tensor hooks are a versatile mechanism, we originally
     designed this with the intent that it can be used for activation

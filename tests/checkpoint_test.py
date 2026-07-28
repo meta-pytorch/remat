@@ -26,6 +26,47 @@ from torch_remat._region import _checkpoint_context_fn
 
 
 class CheckpointTest(expecttest.TestCase):
+    def test_checkpoint_preserves_outer_saved_tensors_hooks(self) -> None:
+        packed: list[torch.Tensor] = []
+        unpacked: list[torch.Tensor] = []
+
+        def pack_hook(tensor: torch.Tensor) -> torch.Tensor:
+            value = tensor.detach().clone()
+            packed.append(value)
+            return value
+
+        def unpack_hook(tensor: torch.Tensor) -> torch.Tensor:
+            unpacked.append(tensor)
+            return tensor
+
+        class Square(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
+                doubled = x * 2
+                ctx.save_for_backward(doubled)
+                return x * x
+
+            @staticmethod
+            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+                (doubled,) = ctx.saved_tensors
+                return grad_output * doubled
+
+        def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
+            return remat.region(Square.apply, "square", recompute=False)(x)
+
+        x = torch.tensor([2.0, 3.0], requires_grad=True)
+        with torch.autograd.graph.saved_tensors_hooks(pack_hook, unpack_hook):
+            y = remat.checkpoint()(checkpoint_body)(x)
+        y.sum().backward()
+
+        self.assertEqual(2, len(packed))
+        self.assertTrue(torch.equal(packed[0], torch.tensor([2.0, 3.0])))
+        self.assertTrue(torch.equal(packed[1], torch.tensor([4.0, 6.0])))
+        self.assertEqual(2, len(unpacked))
+        self.assertTrue(torch.equal(unpacked[0], torch.tensor([2.0, 3.0])))
+        self.assertTrue(torch.equal(unpacked[1], torch.tensor([4.0, 6.0])))
+        self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
+
     def test_checkpoint_options_do_not_collide_with_user_kwargs(self) -> None:
         def fn(x: torch.Tensor, *, region_name: str) -> torch.Tensor:
             self.assertEqual("user.kwarg", region_name)
