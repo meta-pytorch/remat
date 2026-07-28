@@ -11,8 +11,6 @@ from torch_remat._annotate import (  # noqa: F401
     memory_snapshot_annotate,
 )
 from torch_remat._api import (  # noqa: F401
-    _pop_saved_tensors_hooks,
-    _push_saved_tensors_hooks,
     checkpoint,
     current_saved_tensor_info,
     recompute_needs_tensor,

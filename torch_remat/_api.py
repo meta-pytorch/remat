@@ -113,7 +113,6 @@ def checkpoint(
     determinism_check: str = "none",
     preserve_rng_state: bool = False,
     saved_tensors_hooks: tuple[PackHook, UnpackHook] | None = None,
-    input_saved_tensors_hooks: tuple[PackHook, UnpackHook] | None = None,
     recompute_state_hooks: tuple[RecomputeStateHook, ...] = (),
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Return a decorator that builds a torch_remat checkpoint wrapper.
@@ -157,10 +156,6 @@ def checkpoint(
             ``pack_hook`` runs at region entry for each checkpoint input, so it must
             not synchronously free storage the body still reads (defer the free).
             Keyword-only. Default: ``None``.
-        input_saved_tensors_hooks (tuple, optional): Deprecated compatibility alias
-            for the former input-only hook behavior. The pair applies to checkpoint
-            inputs but not tensors retained by SAVE regions. It cannot be combined
-            with ``saved_tensors_hooks``. Keyword-only. Default: ``None``.
         recompute_state_hooks (tuple, optional): Snapshot/restore hooks (each a
             :class:`~torch_remat._region.RecomputeStateHook`) that keep external,
             non-tensor state aligned across recompute -- e.g. a global RNG op-counter
@@ -196,11 +191,6 @@ def checkpoint(
             "torch.cuda.set_rng_state(state[1], device) for the device(s) your region "
             "uses -- the hook then also realigns after each skipped SAVE op, which "
             "torch's boundary-only stashing does not."
-        )
-
-    if saved_tensors_hooks is not None and input_saved_tensors_hooks is not None:
-        raise ValueError(
-            "saved_tensors_hooks and input_saved_tensors_hooks are mutually exclusive"
         )
 
     def decorate(function: Callable[..., Any]) -> Callable[..., Any]:
@@ -247,14 +237,13 @@ def checkpoint(
                 native_pack, native_unpack = native_hooks
                 if isinstance(native_pack, _NativePackHook):
                     hooks = native_pack.hooks
-                    if native_pack.classify_checkpoint_inputs:
-                        native_hooks = (
-                            replace(
-                                native_pack,
-                                kind=SavedTensorKind.CHECKPOINT_INPUT,
-                            ),
-                            native_unpack,
-                        )
+                    native_hooks = (
+                        replace(
+                            native_pack,
+                            kind=SavedTensorKind.CHECKPOINT_INPUT,
+                        ),
+                        native_unpack,
+                    )
                 else:
                     hooks = _SavedTensorsHooks(native_pack, native_unpack)
                 # Native hooks shadow rather than compose, so re-entering an ambient
@@ -264,11 +253,6 @@ def checkpoint(
             # Native hooks catch checkpoint inputs before PyTorch installs its own
             # hooks; the remat context carries the same policy through SAVE regions.
             with native_context, _saved_tensors_hooks_context(hooks):
-                if input_saved_tensors_hooks is not None:
-                    with torch.autograd.graph.saved_tensors_hooks(
-                        *input_saved_tensors_hooks
-                    ):
-                        return invoke_checkpoint()
                 return invoke_checkpoint()
 
         return checkpointed_function
@@ -611,84 +595,10 @@ class _NativePackHook:
     """Add remat metadata while preserving native saved-tensor hook behavior."""
 
     hooks: _SavedTensorsHooks
-    capture_context: bool = False
-    classify_checkpoint_inputs: bool = True
     kind: SavedTensorKind = SavedTensorKind.BACKWARD
 
     def __call__(self, tensor: torch.Tensor) -> object:
-        context = _capture_context(self.hooks) if self.capture_context else None
-        return _run_pack(self.hooks, tensor, context, self.kind)
-
-
-# LIFO stack of reset tokens for the tokenless _push/_pop mutators below, so
-# _pop can restore the prior hooks without the caller threading a token through.
-# Task-local for the same reason as _active_saved_tensors_hooks: concurrent
-# forwards must not pop each other's tokens. Immutable tuple so ContextVar's
-# copy-on-set semantics hold.
-_saved_tensors_hooks_tokens: contextvars.ContextVar[
-    tuple[
-        tuple[
-            contextvars.Token,
-            contextlib.AbstractContextManager[Any] | None,
-        ],
-        ...,
-    ]
-] = contextvars.ContextVar("torch_remat_saved_tensors_hooks_tokens", default=())
-
-
-def _push_saved_tensors_hooks(
-    pack_hook: PackHook,
-    unpack_hook: UnpackHook,
-    capture_context: CaptureContext | None = None,
-    *,
-    _capture_native_context: bool = True,
-    _classify_checkpoint_inputs: bool = False,
-) -> None:
-    """Raw mutator: install the hooks until a matching :func:`_pop_saved_tensors_hooks`.
-
-    Prefer the :func:`saved_tensors_hooks` context manager. This exists for
-    callers whose install and uninstall span two methods (e.g. a manager's
-    ``__enter__`` / ``__exit__``) and so cannot hold a single ``with`` block.
-    Calls must nest LIFO -- each ``_pop`` undoes the most recent ``_push``.
-
-    The raw API preserves its historical behavior of capturing context for native
-    saves. :func:`saved_tensors_hooks` disables that compatibility behavior so
-    ``capture_context`` remains specific to remat-managed saves.
-
-    See :func:`saved_tensors_hooks` for ``capture_context``.
-    """
-
-    native_context: contextlib.AbstractContextManager[Any] | None = None
-    hooks = _SavedTensorsHooks(pack_hook, unpack_hook, capture_context)
-    if _state.get() is None:
-        native_context = torch.autograd.graph.saved_tensors_hooks(
-            _NativePackHook(
-                hooks,
-                capture_context=_capture_native_context,
-                classify_checkpoint_inputs=_classify_checkpoint_inputs,
-            ),
-            unpack_hook,
-        )
-        native_context.__enter__()
-
-    token = _active_saved_tensors_hooks.set(hooks)
-    _saved_tensors_hooks_tokens.set(
-        _saved_tensors_hooks_tokens.get() + ((token, native_context),)
-    )
-
-
-def _pop_saved_tensors_hooks() -> None:
-    """Raw mutator: undo the most recent :func:`_push_saved_tensors_hooks`."""
-    tokens = _saved_tensors_hooks_tokens.get()
-    if not tokens:
-        raise RuntimeError(
-            "_pop_saved_tensors_hooks called without a matching _push_saved_tensors_hooks"
-        )
-    token, native_context = tokens[-1]
-    _saved_tensors_hooks_tokens.set(tokens[:-1])
-    _active_saved_tensors_hooks.reset(token)
-    if native_context is not None:
-        native_context.__exit__(None, None, None)
+        return _run_pack(self.hooks, tensor, None, self.kind)
 
 
 @contextlib.contextmanager
