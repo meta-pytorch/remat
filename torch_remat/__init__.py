@@ -13,6 +13,7 @@ from torch_remat._annotate import (  # noqa: F401
 from torch_remat._api import (  # noqa: F401
     checkpoint,
     current_saved_tensor_info,
+    is_placeholder,
     recompute_needs_tensor,
     region,
     save_for_backward,

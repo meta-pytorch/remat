@@ -445,6 +445,29 @@ def recompute_needs_tensor(*tensors: torch.Tensor) -> None:
             persist()
 
 
+def is_placeholder(tensor: torch.Tensor) -> bool:
+    """Return whether ``tensor`` is (a view of) a recompute placeholder.
+
+    During recompute a ``recompute=False`` (SAVE) region is skipped, so torch_remat returns
+    a placeholder for its output whenever that output has no real value on the replay -- it
+    was not durably saved (neither saved for backward nor needed by a ``recompute=True``
+    consumer), for example an output fed straight into another SAVE region. A placeholder
+    carries real metadata (shape/dtype/device) but its storage raises on any data-pointer
+    access, so metadata/view ops pass through while a real read raises; a (bare) view of a
+    placeholder is itself a placeholder.
+
+    Use this to check whether a tensor is a placeholder before reading its data.
+
+    Args:
+        tensor (Tensor): The tensor to test. A view of a placeholder tests ``True`` too,
+            since the check probes the shared storage rather than the tensor object.
+
+    Returns:
+        bool: ``True`` if ``tensor`` is (a view of) a placeholder, else ``False``.
+    """
+    return _is_placeholder(tensor)
+
+
 def save_for_backward(
     ctx: Any,
     saved: Mapping[str, torch.Tensor | None],
