@@ -289,6 +289,14 @@ def region(
     granularity of an autograd function, since this gives you the most accurate
     reporting of where save-for-backward costs are going.
 
+    Regions may nest. Inside a ``recompute=True`` region, an inner region keeps its
+    own policy. Inside a ``recompute=False`` region, an inner ``recompute=False``
+    region is inert because the outer region already retains the body's activations
+    and skips the whole body during replay. Nesting a ``recompute=True`` region
+    inside a ``recompute=False`` region raises ``RuntimeError``, because the outer
+    body does not run during replay. Inert nested regions do not claim a name;
+    otherwise, names must be unique among regions reached in one checkpoint phase.
+
     Tensor inputs and outputs follow ATen conventions -- a Tensor, or a
     *one-hop* ``tuple`` / ``list`` of Tensors -- deliberately not full pytree
     (nor ``dict``). A ``NamedTuple`` of Tensors counts as a one-hop tuple and keeps
