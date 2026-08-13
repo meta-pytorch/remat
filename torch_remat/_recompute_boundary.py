@@ -28,6 +28,7 @@ begin recompute at a chosen point; if that lands, this whole module deletes and
 
 from __future__ import annotations
 
+import importlib.util
 from typing import Any
 
 import torch
@@ -52,6 +53,12 @@ class _TriggerCheckpointRecompute(torch.autograd.Function):
         # user-visible boundary before nested custom backward bodies run.
         (_,) = ctx.saved_tensors
         return grad_output
+
+
+if importlib.util.find_spec("spmd_types") is not None:
+    import spmd_types
+
+    spmd_types.register_local_autograd_function(_TriggerCheckpointRecompute)
 
 
 def _checkpoint_recompute_boundary(output: Any) -> Any:
