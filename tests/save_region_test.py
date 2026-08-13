@@ -157,6 +157,41 @@ class SaveRegionTest(expecttest.TestCase):
         self.assertTrue(torch.equal(right.detach(), torch.tensor([3.0, 4.0])))
         self.assertTrue(torch.equal(x.grad, torch.tensor([5.0, 7.0])))
 
+    def test_save_op_replays_none_in_original_output_position(self) -> None:
+        forward_runs = 0
+        seen_optional_outputs: list[None] = []
+
+        def optional_output(
+            x: torch.Tensor,
+        ) -> tuple[torch.Tensor, None, torch.Tensor]:
+            nonlocal forward_runs
+            if remat.is_recomputing():
+                raise AssertionError("SAVE replay must skip the forward body")
+            forward_runs += 1
+            return x * x, None, x + 1
+
+        def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
+            left, optional, right = remat.region(
+                optional_output,
+                "optional.output",
+                recompute=False,
+            )(x)
+            seen_optional_outputs.append(optional)
+            return remat.region(
+                lambda lhs, rhs: lhs + rhs,
+                "combine",
+                recompute=True,
+            )(left, right)
+
+        x = torch.tensor([2.0, 3.0], requires_grad=True)
+        y = remat.checkpoint()(checkpoint_body)(x)
+        y.sum().backward()
+
+        self.assertEqual(1, forward_runs)
+        self.assertEqual([None, None], seen_optional_outputs)
+        self.assertTrue(torch.equal(y.detach(), torch.tensor([7.0, 13.0])))
+        self.assertTrue(torch.equal(x.grad, torch.tensor([5.0, 7.0])))
+
     def test_skipped_output_view_of_recomputed_tensor_replays_as_zero_storage(
         self,
     ) -> None:

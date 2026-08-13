@@ -147,6 +147,34 @@ class OpBasicsTest(expecttest.TestCase):
         self.assertEqual(2, ReadmeSquare.forward_runs)
         self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
 
+    def test_recompute_op_supports_none_output(self) -> None:
+        forward_runs = 0
+        seen_optional_outputs: list[None] = []
+
+        def optional_output(
+            x: torch.Tensor,
+        ) -> tuple[torch.Tensor, None]:
+            nonlocal forward_runs
+            forward_runs += 1
+            return x * x, None
+
+        def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
+            y, optional = remat.region(
+                optional_output,
+                "optional.output",
+                recompute=True,
+            )(x)
+            seen_optional_outputs.append(optional)
+            return y
+
+        x = torch.tensor([2.0, 3.0], requires_grad=True)
+        y = remat.checkpoint()(checkpoint_body)(x)
+        y.sum().backward()
+
+        self.assertEqual(2, forward_runs)
+        self.assertEqual([None, None], seen_optional_outputs)
+        self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
+
     def test_recompute_setting_must_match_forward(self) -> None:
         class PolicyDrift(torch.autograd.Function):
             @staticmethod

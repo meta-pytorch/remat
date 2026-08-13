@@ -225,7 +225,7 @@ class _InputInfo:
 
 @dataclass(frozen=True)
 class _OutputSpec:
-    """One boundary output's spec, used to synthesize its recompute placeholder."""
+    """A tensor output reconstructed from a persisted value or placeholder."""
 
     metadata: _TensorMetadata
 
@@ -251,5 +251,6 @@ class _OutputSchema:
     # Recompute rebuilds the placeholders in this container (see ``rebuild_container``).
     container: type | None
 
-    # Per-output specs in return-schema order.
-    specs: tuple[_OutputSpec, ...]
+    # Per-output entries in return-schema order. None reproduces a static None;
+    # every tensor has a spec describing its replay value or placeholder.
+    specs: tuple[_OutputSpec | None, ...]

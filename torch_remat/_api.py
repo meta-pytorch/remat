@@ -93,10 +93,12 @@ from torch_remat._view import (
     _rebuild_saved_view,
 )
 
-# A remat-aware op call returns a tensor, or a flat tuple or list of tensors --
-# the shapes autograd.Function.apply and native ops commonly produce. We only need
-# to locate the tensors; the container type is preserved for the caller.
-Output: TypeAlias = torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor]
+# A remat-aware op call returns a tensor, or a flat tuple or list whose leaves are
+# tensors or None -- the shapes autograd.Function.apply and native ops commonly
+# produce. We only need to locate the tensors; the container type is preserved for
+# the caller, and static None leaves are rebuilt in their original positions.
+OutputLeaf: TypeAlias = torch.Tensor | None
+Output: TypeAlias = torch.Tensor | tuple[OutputLeaf, ...] | list[OutputLeaf]
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -270,7 +272,8 @@ def region(
 
     ``function`` is used unmodified -- it may be a custom ``autograd.Function``'s
     ``.apply``, a bare native op, or any callable taking a flat list of
-    Tensor/non-Tensor arguments and returning a Tensor or tuple of Tensors.
+    Tensor/non-Tensor arguments and returning a Tensor or a tuple/list whose leaves
+    are Tensors or ``None``.
 
         ```python
         y = remat.region(MyOp.apply, "my.op", recompute=False)(x)
@@ -298,10 +301,10 @@ def region(
     otherwise, names must be unique among regions reached in one checkpoint phase.
 
     Tensor inputs and outputs follow ATen conventions -- a Tensor, or a
-    *one-hop* ``tuple`` / ``list`` of Tensors -- deliberately not full pytree
-    (nor ``dict``). A ``NamedTuple`` of Tensors counts as a one-hop tuple and keeps
-    its own type across the region (its named fields survive the round-trip, so a
-    structured return like ``RouterOutput`` can be wrapped directly). Arguments are
+    *one-hop* ``tuple`` / ``list`` whose leaves are Tensors or ``None`` -- deliberately
+    not full pytree (nor ``dict``). A ``NamedTuple`` with such leaves counts as a
+    one-hop tuple and keeps its own type across the region (its named fields survive
+    the round-trip, so a structured return can be wrapped directly). Arguments are
     walked leniently: anything else (a ``dict``, a custom object, deeper nesting) is
     an opaque leaf handed to ``function`` untouched. That leniency has a cost: if an upstream ``recompute=False``
     region's output is hidden inside such a leaf, remat's argument walk never finds
@@ -309,8 +312,8 @@ def region(
     consumer of that output then gets the skipped producer's stand-in placeholder
     instead of real data, which raises -- but only during recompute (inside
     backward), not at this call, so keep saved outputs at the top level or one hop
-    deep. The *return* is validated strictly: a non-Tensor or nested return raises
-    ``RuntimeError``.
+    deep. The *return* is validated strictly: a leaf other than a Tensor or ``None``,
+    or a nested return, raises ``RuntimeError``.
 
     NB: if you smuggle an input into the callable (e.g., via a global or via a
     closure), you had better ensure that it is available/recomputed in
@@ -322,8 +325,9 @@ def region(
     Args:
         function (Callable): The callable to annotate, used unmodified. It may be
             a custom ``autograd.Function``'s ``.apply``, a bare native op, or any
-            callable taking a flat list of Tensor/non-Tensor arguments and
-            returning a Tensor or a one-hop ``tuple`` / ``list`` of Tensors.
+            callable taking a flat list of Tensor/non-Tensor arguments and returning
+            a Tensor or a one-hop ``tuple`` / ``list`` whose leaves are Tensors or
+            ``None``.
         name (str): Region-relative name for this call, shown in memory reports,
             traces, and error messages. Must be non-empty and unique among the
             names reached in a single phase.
@@ -797,9 +801,9 @@ class _SaveRecord:
     saved_input_recipes: list[_SavedInputRecipe] = field(default_factory=list)
 
     # --- Metadata about outputs, and saved output tensors needed for recompute
-    # The "schema" of the output, specifying metadata of the tensors and the
-    # concrete values of all non-Tensor outputs, so we can reconstruct the
-    # output during recompute to continue eager execution.
+    # The "schema" of the output, specifying tensor metadata and the positions of
+    # static None outputs, so recompute can reconstruct the output and continue
+    # eager execution.
     output_schema: _OutputSchema | None = None
 
     # Outputs that are saved for recompute, so we can produce an output tensor
@@ -1153,7 +1157,8 @@ def _prepare_outputs(
     Every output is registered under a persist thunk keyed by storage, so a downstream
     consumer -- a ``remat.region`` (or a bare view of the output, resolved by storage),
     or an explicit :func:`recompute_needs_tensor` call -- can trigger the durable save on
-    demand. Outputs are plain tensors, so the container is returned unchanged.
+    demand. ``None`` leaves need no registration; the output container is returned
+    unchanged.
 
     An output that is *itself* saved for backward (its storage is in
     ``scratch.saved_identity_storages``) is persisted eagerly at region exit: it is
@@ -1166,9 +1171,9 @@ def _prepare_outputs(
     offloader still route a deferred SAVE output to the chunk it captured here.
     """
 
-    tensors = _output_tensors(output)
+    tensors = _indexed_output_tensors(output)
     context = _capture_context(hooks) if hooks is not None else None
-    for index, real in enumerate(tensors):
+    for index, real in tensors:
         storage = StorageWeakRef(real.untyped_storage())
         # Weak ref + lazy snapshot (see _PersistOutputThunk), so a SAVE output nothing
         # consumes is never pinned alive by its own persist-output thunk.
@@ -1271,24 +1276,27 @@ class _PersistOutputThunk:
 def _record_output_schema(record: _SaveRecord, output: Output) -> None:
     """Record a SAVE op's boundary output metadata and report labels on ``record``."""
 
-    tensors = _output_tensors(output)
     # The output container's own type is kept (a bare tensor yields None), so recompute
     # rebuilds the same container -- a NamedTuple's / return_types' named fields survive.
     container = container_type(output)
     record.output_schema = _OutputSchema(
         container=container,
         specs=tuple(
-            _OutputSpec(
-                metadata=_TensorMetadata(
-                    shape=tuple(tensor.shape),
-                    stride=tuple(tensor.stride()),
-                    dtype=tensor.dtype,
-                    device=tensor.device,
-                    storage_nbytes=tensor.untyped_storage().nbytes(),
-                ),
-                requires_grad=tensor.requires_grad,
+            (
+                _OutputSpec(
+                    metadata=_TensorMetadata(
+                        shape=tuple(leaf.shape),
+                        stride=tuple(leaf.stride()),
+                        dtype=leaf.dtype,
+                        device=leaf.device,
+                        storage_nbytes=leaf.untyped_storage().nbytes(),
+                    ),
+                    requires_grad=leaf.requires_grad,
+                )
+                if isinstance(leaf, torch.Tensor)
+                else None
             )
-            for tensor in tensors
+            for leaf in value_leaves(output)
         ),
     )
 
@@ -1370,8 +1378,12 @@ def _load_saved_outputs(
     # accessor returns True (conservative "keep"), so no extra guard is needed.
     pop = not torch._C._autograd._get_current_graph_task_keep_graph()  # type: ignore[attr-defined]
     display_name = _display_name(region_state, record.op_name)
-    outputs: list[torch.Tensor] = []
+    outputs: list[OutputLeaf] = []
     for index, spec in enumerate(schema.specs):
+        if spec is None:
+            outputs.append(None)
+            continue
+
         slot = record.output_slots.get(index)
         if slot is not None:
             loaded = _load_output_slot(
@@ -1402,7 +1414,7 @@ def _load_saved_outputs(
         outputs.append(placeholder)
 
     if schema.container is None:
-        return outputs[0]
+        return cast(torch.Tensor, outputs[0])
     return rebuild_container(schema.container, outputs)
 
 
@@ -1563,7 +1575,8 @@ class _MakeNonLeaf(torch.autograd.Function):
 
 
 _OP_OUTPUT_TYPE_MESSAGE = (
-    "remat.region function must return a Tensor, or a tuple or list of Tensors"
+    "remat.region function must return a Tensor, or a tuple or list whose leaves "
+    "are Tensors or None"
 )
 
 
@@ -1571,7 +1584,7 @@ def _validate_output(
     output: Any,
     reject_leaves_for: tuple[_CheckpointRegionState, str] | None = None,
 ) -> Output:
-    """Check a remat op returned a Tensor, or a one-hop tuple/list of Tensors.
+    """Check a remat op returned a Tensor, or a one-hop tuple/list of Tensor/None.
 
     Returns the output unchanged. When ``reject_leaves_for`` (the ``(region_state,
     op_name)`` of an eager forward op) is given, the same walk also rejects a
@@ -1585,6 +1598,8 @@ def _validate_output(
         return output
     if isinstance(output, (tuple, list)):
         for leaf in output:
+            if leaf is None:
+                continue
             if not isinstance(leaf, torch.Tensor):
                 raise RuntimeError(_OP_OUTPUT_TYPE_MESSAGE)
             if reject_leaves_for is not None:
@@ -1618,14 +1633,14 @@ def _reject_grad_leaf(
         )
 
 
-def _output_tensors(output: Output) -> tuple[torch.Tensor, ...]:
-    """Return output tensors in return-schema order.
+def _indexed_output_tensors(output: Output) -> tuple[tuple[int, torch.Tensor], ...]:
+    """Return ``(schema position, tensor)`` pairs for an output."""
 
-    ``output`` is validated to a Tensor or a flat tuple/list of Tensors, so every
-    value leaf is a Tensor.
-    """
-
-    return cast("tuple[torch.Tensor, ...]", value_leaves(output))
+    return tuple(
+        (index, leaf)
+        for index, leaf in enumerate(value_leaves(output))
+        if isinstance(leaf, torch.Tensor)
+    )
 
 
 def _output_name(index: int, *, container: type | None) -> str:
