@@ -151,13 +151,13 @@ def _classify_saved_input(
     return None
 
 
-def _rebuild_saved_view(
+def _rebuild_input_view(
     region_state: _CheckpointRegionState,
     op_name: str,
     base: torch.Tensor,
     view_spec: _ViewSpec,
 ) -> torch.Tensor:
-    """Rebuild a saved view of an input from its recompute-reproduced base.
+    """Rebuild a view of an input from its recompute-reproduced base.
 
     ``as_strided`` reproduces the saved view's elements only if the reproduced base
     has the layout the spec was recorded against; verify it and raise rather than
@@ -176,9 +176,19 @@ def _rebuild_saved_view(
             f"stride {view_spec.base_stride}, got shape {tuple(base.shape)} "
             f"stride {tuple(base.stride())}). The saved view cannot be reconstructed."
         )
-    rebuilt = base.as_strided(
+    return base.as_strided(
         view_spec.size,
         view_spec.stride,
         base.storage_offset() + view_spec.rel_offset,
     )
-    return rebuilt.detach()
+
+
+def _rebuild_saved_view(
+    region_state: _CheckpointRegionState,
+    op_name: str,
+    base: torch.Tensor,
+    view_spec: _ViewSpec,
+) -> torch.Tensor:
+    """Rebuild and detach a saved-for-backward view of a recomputed input."""
+
+    return _rebuild_input_view(region_state, op_name, base, view_spec).detach()

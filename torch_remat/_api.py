@@ -873,6 +873,32 @@ def _detach_for_user_hook(tensor: torch.Tensor) -> torch.Tensor:
     return detached
 
 
+def _replay_save_op(
+    region_state: _CheckpointRegionState,
+    name: str,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> Output:
+    """Skip a SAVE body and reproduce its forward outputs during recompute."""
+
+    record = region_state.records.get(name)
+    if record is None:
+        raise RuntimeError(
+            f"No save record for {_display_name(region_state, name)} during "
+            "recompute; forward and recompute followed different code paths (or the "
+            "region's recompute setting differs between them)"
+        )
+    # The body is skipped on recompute, so restore the external state to the
+    # op's forward exit -- otherwise state it advanced (e.g. an RNG op-counter
+    # seeding downstream dropout / stochastic rounding) is left behind and every
+    # later draw shifts. See :class:`RecomputeStateHook`.
+    for hook, snapshot in zip(region_state.state_hooks, record.exit_snapshots):
+        hook.restore(snapshot)
+    if record.saved_input_recipes:
+        _rederive_saved_inputs(record, region_state, args, kwargs)
+    return _load_saved_outputs(record, region_state)
+
+
 def _run_save_op(
     state: _ActiveCheckpointRegion,
     name: str,
@@ -899,22 +925,7 @@ def _run_save_op(
 
     region_state = state.region_state
     if state.phase is _Phase.RECOMPUTE:
-        record = region_state.records.get(name)
-        if record is None:
-            raise RuntimeError(
-                f"No save record for {_display_name(region_state, name)} during "
-                "recompute; forward and recompute followed different code paths (or the "
-                "region's recompute setting differs between them)"
-            )
-        # The body is skipped on recompute, so restore the external state to the
-        # op's forward exit -- otherwise state it advanced (e.g. an RNG op-counter
-        # seeding downstream dropout / stochastic rounding) is left behind and every
-        # later draw shifts. See :class:`RecomputeStateHook`.
-        for hook, snapshot in zip(region_state.state_hooks, record.exit_snapshots):
-            hook.restore(snapshot)
-        if record.saved_input_recipes:
-            _rederive_saved_inputs(record, region_state, args, kwargs)
-        return _load_saved_outputs(record, region_state)
+        return _replay_save_op(region_state, name, args, kwargs)
 
     # The wrapper's duplicate-name check is phase-local; this guards the cross-phase
     # records dict against a phase-dispatch bug clobbering the forward record.

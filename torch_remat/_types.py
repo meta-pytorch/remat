@@ -152,13 +152,13 @@ class _SavedInputRef:
 
 @dataclass(frozen=True)
 class _ViewSpec:
-    """How to reconstruct a saved *view of an input* from that input at recompute.
+    """How to reconstruct an alias or view of an input at recompute.
 
     The view is rebuilt from the reproduced base with ``as_strided``. ``rel_offset``
     is the view's storage offset relative to the base's (absolute offsets are not
     stable across recompute). ``base_shape`` / ``base_stride`` pin the base layout the
     view was recorded against; recompute verifies the reproduced base matches before
-    rebuilding (see :func:`torch_remat._view._rebuild_saved_view`).
+    rebuilding (see :func:`torch_remat._view._rebuild_input_view`).
     """
 
     size: tuple[int, ...]
@@ -169,7 +169,20 @@ class _ViewSpec:
 
 
 @dataclass(frozen=True)
-class _SavedInputRecipe:
+class _InputReplay:
+    """How to reproduce a tensor from one of a region's recomputed inputs."""
+
+    # Path token locating the source input in the op's call (e.g. ``(0,)`` ->
+    # ``args[0]``); stable across forward and recompute.
+    path: PathToken
+    # ``None`` reuses the input directly; otherwise rebuild this alias or view with
+    # ``as_strided`` relative to the input's replayed layout. The consumer decides
+    # whether its replayed value must be detached.
+    view_spec: _ViewSpec | None
+
+
+@dataclass(frozen=True)
+class _SavedInputRecipe(_InputReplay):
     """Forward recipe for one recompute-sourced saved input a SAVE op diverted off the
     identity hook (recorded in :func:`torch_remat._api._run_save_op`'s pack).
 
@@ -177,16 +190,10 @@ class _SavedInputRecipe:
     input rather than retained -- the whole point of diverting.
     """
 
-    # Path token locating the source input in the op's call (e.g. ``(0,)`` ->
-    # ``args[0]``); stable across forward and recompute.
-    path: PathToken
     # Tape-buffer key (``saved_input.<i>``); the same string rides the autograd pack
     # payload (:class:`_SavedInputRef`), and is what links forward to recompute --
     # this entry's list position is not load-bearing.
     slot_name: str
-    # ``None`` reconstructs the input itself (detached); a :class:`_ViewSpec` rebuilds
-    # a saved view of it with ``as_strided``.
-    view_spec: _ViewSpec | None
     # Report name (diagnostics only; the value is fetched via ``slot_name``).
     name: str
 
