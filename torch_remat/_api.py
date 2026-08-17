@@ -202,6 +202,23 @@ def checkpoint(
 
         @wraps(function)
         def checkpointed_function(*args: Any, **kwargs: Any) -> Any:
+            if torch.compiler.is_compiling():
+                if saved_tensors_hooks is not None:
+                    raise NotImplementedError(
+                        "torch_remat.checkpoint(saved_tensors_hooks=...) is not "
+                        "supported under torch.compile"
+                    )
+                if recompute_state_hooks:
+                    raise NotImplementedError(
+                        "torch_remat.checkpoint(recompute_state_hooks=...) is not "
+                        "supported under torch.compile"
+                    )
+                from torch_remat._compile import compiled_checkpoint
+
+                return compiled_checkpoint(
+                    function, args, kwargs, determinism_check=determinism_check
+                )
+
             def invoke_checkpoint() -> Any:
                 return _torch_checkpoint_with_forward_exception_cleanup(
                     wrapped_function,
@@ -320,7 +337,11 @@ def region(
     recompute, otherwise we may fail to save it for backwards (only direct
     inputs induce save.)
 
-    ``torch.compile`` is not supported yet.
+    Under ``torch.compile`` the eager tape is bypassed: there is a single
+    AOTAutograd trace and the min-cut partitioner performs recompute. A
+    ``recompute=False`` region tags its decomposed graph nodes so the partitioner
+    saves them (a ``recompute=True`` region is left to the partitioner's default
+    recompute of the enclosing checkpoint). See :mod:`torch_remat._compile`.
 
     Args:
         function (Callable): The callable to annotate, used unmodified. It may be
@@ -355,6 +376,19 @@ def region(
         ValueError: If ``name`` is empty.
     """
 
+    if torch.compiler.is_compiling():
+        # region() is called as Dynamo symbolically executes the checkpoint body. The
+        # eager-only construction machinery below -- callable()/isinstance() validation
+        # and @wraps metadata copy -- is untraceable on an autograd Function's .apply
+        # (graph break), so skip straight to a minimal wrapper that routes the body
+        # through compiled_region. Validation already ran on the first, uncompiled call.
+        from torch_remat._compile import compiled_region
+
+        def compiled_wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+            return cast(_R, compiled_region(function, recompute, args, kwargs))
+
+        return compiled_wrapper
+
     if not callable(function):
         raise RuntimeError("region expects a function as its first argument")
     _validate_name(name, what="region name")
@@ -363,6 +397,11 @@ def region(
 
     @wraps(function)
     def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        if torch.compiler.is_compiling():
+            from torch_remat._compile import compiled_region
+
+            return cast(_R, compiled_region(function, recompute, args, kwargs))
+
         state = _state.get()
         if state is None:
             # Outside a checkpoint region: behave as a plain call.
@@ -518,6 +557,13 @@ def save_for_backward(
             return g(y)
         ```
     """
+
+    if torch.compiler.is_compiling():
+        # The pending_save_names scratch only feeds the eager memory report; under
+        # compile the partitioner owns saving and there is no scratch (also
+        # _active_save_op is a ContextVar, untraceable). Forward to ctx unnamed.
+        ctx.save_for_backward(*saved.values())
+        return
 
     scratch = _active_save_op.get()
     for tensor_name, tensor in saved.items():

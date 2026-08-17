@@ -193,6 +193,12 @@ def is_recomputing() -> bool:
         ```
     """
 
+    if torch.compiler.is_compiling():
+        # Under compile there is no eager recompute pass: the body is traced once and
+        # the partitioner rematerializes. Report ordinary forward so trace-time code
+        # takes the same path it would in a plain forward.
+        return False
+
     state = _state.get()
     return state is not None and state.phase is _Phase.RECOMPUTE
 
