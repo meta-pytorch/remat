@@ -219,6 +219,17 @@ def checkpoint(
                     function, args, kwargs, determinism_check=determinism_check
                 )
 
+            # Nesting checkpoint regions is unsupported: an inner region would overwrite
+            # the outer's context-local state (its tape and phase) and restore it on
+            # exit, so the outer's own ops would run against the wrong region.
+            # _state is set only inside a checkpoint phase context, so a non-None value
+            # here means this call is itself inside a live region. Compile bypasses this
+            # path and bans nesting separately (see torch_remat._compile).
+            if _state.get() is not None:
+                raise NotImplementedError(
+                    "nested torch_remat.checkpoint regions are not supported"
+                )
+
             def invoke_checkpoint() -> Any:
                 return _torch_checkpoint_with_forward_exception_cleanup(
                     wrapped_function,

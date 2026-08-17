@@ -49,8 +49,8 @@ from torch.utils.checkpoint import checkpoint as _torch_checkpoint, CheckpointPo
 # mutation is unsupported by Dynamo in fullgraph mode, so this is a plain module global.
 # It is read from region() as Dynamo symbolically executes the checkpoint body, so its
 # value is resolved at trace time. region() tags nodes only while inside a checkpoint,
-# matching eager's pass-through-outside-a-region behavior. Nesting of checkpoint regions
-# is unsupported, so a bool suffices (no depth counter).
+# matching eager's pass-through-outside-a-region behavior. Nesting is banned (see
+# compiled_checkpoint), so a bool suffices -- no depth counter needed.
 _in_compiled_checkpoint: bool = False
 
 
@@ -127,6 +127,10 @@ def compiled_checkpoint(
     """
 
     global _in_compiled_checkpoint
+    if _in_compiled_checkpoint:
+        raise NotImplementedError(
+            "nested torch_remat.checkpoint regions are not supported under torch.compile"
+        )
     _in_compiled_checkpoint = True
     try:
         return _torch_checkpoint(

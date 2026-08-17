@@ -188,6 +188,26 @@ class CompileTest(expecttest.TestCase):
                 # RECOMPUTE: exp is rematerialized in backward.
                 self.assertGreaterEqual(bwd, 1)
 
+    def test_nested_checkpoint_regions_are_banned(self) -> None:
+        # Nesting is unsupported under compile too: the inner checkpoint raises while
+        # the outer region is being traced.
+        inner = remat.checkpoint()(lambda t: t * 2)
+        compiled = torch.compile(
+            lambda a, b: remat.checkpoint()(
+                lambda p, q: inner(torch.matmul(p, q)).sum()
+            )(a, b),
+            backend="aot_eager",
+            fullgraph=True,
+        )
+        x, w = self._inputs()
+        # Dynamo wraps a trace-time raise in Unsupported but keeps the message; accept
+        # either the raw NotImplementedError or the wrapped form.
+        with self.assertRaisesRegex(
+            (NotImplementedError, torch._dynamo.exc.Unsupported),
+            "nested torch_remat.checkpoint regions are not supported",
+        ):
+            compiled(x, w)
+
 
 if __name__ == "__main__":
     import unittest

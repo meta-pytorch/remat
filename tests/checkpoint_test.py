@@ -81,6 +81,28 @@ class CheckpointTest(expecttest.TestCase):
 
         self.assertTrue(torch.equal(x.grad, torch.tensor([2.0])))
 
+    def test_nested_checkpoint_regions_are_banned(self) -> None:
+        # A checkpoint region entered while another is live raises: an inner region
+        # would clobber the outer's context-local state. The inner checkpoint sits
+        # inside the outer's body (directly, and via a region()), both of which run
+        # with the outer region active.
+        inner = remat.checkpoint(region_name="inner")(lambda t: t * 2)
+
+        def outer_direct(x: torch.Tensor) -> torch.Tensor:
+            return inner(x) + 1
+
+        def outer_via_region(x: torch.Tensor) -> torch.Tensor:
+            return remat.region(inner, "inner.call", recompute=True)(x) + 1
+
+        x = torch.tensor([3.0], requires_grad=True)
+        for body in (outer_direct, outer_via_region):
+            with self.subTest(body=body.__name__):
+                with self.assertRaisesRegex(
+                    NotImplementedError,
+                    "nested torch_remat.checkpoint regions are not supported",
+                ):
+                    remat.checkpoint(region_name="outer")(body)(x)
+
     def test_checkpoint_forward_exception_unwinds_remat_state(self) -> None:
         class FailingForward(torch.autograd.Function):
             @staticmethod
