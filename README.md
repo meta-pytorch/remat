@@ -61,6 +61,13 @@ def forward(self, hidden_states):
 The interaction between recompute and save regions is somewhat subtle;
 check [Mental model](docs/mental_model.md) for more details.
 
+## `torch.compile`
+
+The core checkpoint and save-versus-recompute policy works under
+`torch.compile` with AOTAutograd's min-cut partitioner. Eager-only hooks and
+diagnostics are not available in compiled regions. See
+[Compilation](docs/compilation.md) for the complete compatibility table.
+
 ## State and side effects
 
 Code that is replayed must behave consistently with the original forward, even

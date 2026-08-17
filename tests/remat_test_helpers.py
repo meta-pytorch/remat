@@ -9,12 +9,14 @@
 """Shared, non-test helpers for the torch_remat API test suite. Not collected by pytest
 (the filename does not match ``*_test.py``). Holds the byte-report parsing and
 column-sum invariant, the placeholder assertion, the ``_ref_grad`` reference, and the
-two worked activation-offload engines (the fine-grained wedge and the coarse bulk
-offloader) that the saved-tensors-hooks tests drive."""
+explicit eager/compile checkpoint adapter, and the two worked activation-offload
+engines (the fine-grained wedge and the coarse bulk offloader) that the
+saved-tensors-hooks tests drive."""
 
 from __future__ import annotations
 
 import gc
+import os
 import re
 import types
 import weakref
@@ -24,6 +26,27 @@ import expecttest
 import torch
 import torch_remat as remat
 from torch_remat._placeholder import _placeholder_message
+
+IS_COMPILE_TEST: bool = os.environ.get("TORCH_REMAT_TEST_COMPILE") == "1"
+
+
+def checkpoint_for_test(
+    **kwargs: Any,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Return an eager checkpoint decorator, compiled in the compile test target."""
+
+    decorate = remat.checkpoint(**kwargs)
+
+    def decorate_for_test(function: Callable[..., Any]) -> Callable[..., Any]:
+        checkpointed = decorate(function)
+        if not IS_COMPILE_TEST:
+            return checkpointed
+        # Every checkpoint wrapper shares one code object; reset so the suite-wide
+        # matrix does not hit Dynamo's per-code recompile limit.
+        torch._dynamo.reset()
+        return torch.compile(checkpointed, backend="aot_eager", fullgraph=True)
+
+    return decorate_for_test
 
 
 def _numel(shape: tuple[int, ...]) -> int:
@@ -190,7 +213,7 @@ def _run_wedge_model(
         saved_tensors_hooks = (
             (offloader.pack, offloader.unpack) if offloader is not None else None
         )
-        h = remat.checkpoint(
+        h = checkpoint_for_test(
             region_name=block,
             saved_tensors_hooks=saved_tensors_hooks,
         )(_wedge_block_body(block))(h)
@@ -318,7 +341,7 @@ def _run_bulk_model(
         saved_tensors_hooks = (
             (offloader.pack, offloader.unpack) if offloader is not None else None
         )
-        h = remat.checkpoint(
+        h = checkpoint_for_test(
             region_name=block,
             saved_tensors_hooks=saved_tensors_hooks,
         )(_bulk_block_body(offloader, block))(h)

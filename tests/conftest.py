@@ -6,7 +6,10 @@
 
 # pyre-strict
 
-"""Environment-conditional xfail for the recompute-placeholder path.
+"""Conditional expected-failure handling for the API suite.
+
+In the explicit compile test target, ``compile_xfail`` tests run under strict xfail:
+the documented incompatibility must reproduce, and an unexpected pass fails the test.
 
 ``torch_remat._placeholder`` builds a storage-free recompute placeholder by binding a
 tensor onto a null-pointer storage (``torch._C._construct_storage_from_data_pointer``)
@@ -28,6 +31,7 @@ from collections.abc import Generator
 
 import pytest
 import torch
+from remat_test_helpers import IS_COMPILE_TEST
 
 _PLACEHOLDER_PRIMITIVES: tuple[str, ...] = (
     "_construct_storage_from_data_pointer",
@@ -36,6 +40,27 @@ _PLACEHOLDER_PRIMITIVES: tuple[str, ...] = (
 _HAS_PLACEHOLDER_PRIMITIVES: bool = all(
     hasattr(torch._C, name) for name in _PLACEHOLDER_PRIMITIVES
 )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "compile_xfail(reason): behavior that is unsupported under torch.compile",
+    )
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    del config
+    if not IS_COMPILE_TEST:
+        return
+    for item in items:
+        marker = item.get_closest_marker("compile_xfail")
+        if marker is None:
+            continue
+        reason = marker.args[0] if marker.args else "not supported under torch.compile"
+        item.add_marker(pytest.mark.xfail(reason=reason, strict=True))
 
 
 @pytest.hookimpl(hookwrapper=True)

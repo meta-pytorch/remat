@@ -19,6 +19,7 @@ from collections.abc import Callable
 from typing import Any, cast
 
 import expecttest
+import pytest
 import torch
 import torch_remat as remat
 from remat_test_helpers import (
@@ -26,6 +27,7 @@ from remat_test_helpers import (
     _run_bulk_model,
     _run_wedge_model,
     _WedgeOffloader,
+    checkpoint_for_test,
 )
 from torch_remat._api import _active_saved_tensors_hooks
 
@@ -118,6 +120,9 @@ class SavedTensorsHooksTest(expecttest.TestCase):
         self.assertEqual(0, capture_calls[0])
         self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
 
+    @pytest.mark.compile_xfail(
+        "remat saved-tensor hooks are unsupported under torch.compile"
+    )
     def test_saved_tensors_hooks_fire_at_save_and_load_not_recompute(
         self,
     ) -> None:
@@ -166,7 +171,7 @@ class SavedTensorsHooksTest(expecttest.TestCase):
                 )(x)
 
         x = torch.tensor([2.0, 3.0], requires_grad=True)
-        y = remat.checkpoint()(checkpoint_body)(x)
+        y = checkpoint_for_test()(checkpoint_body)(x)
         y.sum().backward()
 
         self.assertEqual(2, len(pack_shapes))
@@ -175,6 +180,9 @@ class SavedTensorsHooksTest(expecttest.TestCase):
         # The custom pack/unpack round-trip leaves the gradient unchanged.
         self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
 
+    @pytest.mark.compile_xfail(
+        "remat saved-tensor hooks are unsupported under torch.compile"
+    )
     def test_saved_tensors_hooks_unpack_is_bound_per_tensor(self) -> None:
         # The unpack hook used at load time must be the one bound when the tensor
         # was packed, even if a different pack/unpack pair is active later (here:
@@ -218,13 +226,16 @@ class SavedTensorsHooksTest(expecttest.TestCase):
         x = torch.tensor([2.0, 3.0], requires_grad=True)
         # Pack inside the hook scope; recompute/backward runs OUTSIDE it.
         with remat.saved_tensors_hooks(pack, unpack):
-            y = remat.checkpoint()(checkpoint_body)(x)
+            y = checkpoint_for_test()(checkpoint_body)(x)
         y.sum().backward()
 
         # unpack still ran (bound at pack time) despite no active hook at backward.
         self.assertEqual(["bound", "bound", "bound"], unpack_calls)
         self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
 
+    @pytest.mark.compile_xfail(
+        "remat saved-tensor hooks are unsupported under torch.compile"
+    )
     def test_saved_tensors_hooks_offload_through_save_recompute_save_wedge(
         self,
     ) -> None:
@@ -315,6 +326,9 @@ compute block.0.mid [recompute] (recompute)
         self.assertTrue(torch.equal(base_loss, off_loss))
         self.assertTrue(torch.equal(base_grad, off_grad))
 
+    @pytest.mark.compile_xfail(
+        "remat saved-tensor hooks are unsupported under torch.compile"
+    )
     def test_saved_tensors_hooks_bulk_offload_group_onloads_at_recompute_start(
         self,
     ) -> None:
@@ -382,6 +396,9 @@ compute block.0.mid [recompute] (recompute)
         self.assertTrue(torch.equal(base_loss, off_loss))
         self.assertTrue(torch.equal(base_grad, off_grad))
 
+    @pytest.mark.compile_xfail(
+        "remat saved-tensor hooks are unsupported under torch.compile"
+    )
     def test_checkpoint_saved_tensors_hooks_include_inputs_and_save_tensors(
         self,
     ) -> None:
@@ -426,7 +443,9 @@ compute block.0.mid [recompute] (recompute)
         leaf = torch.tensor([2.0, 3.0], requires_grad=True)
         region_input = leaf * 1.0  # non-leaf, so it is a real saved input
         with remat.saved_tensors_hooks(outer_pack, outer_unpack):
-            y = remat.checkpoint(saved_tensors_hooks=(pack, unpack))(body)(region_input)
+            y = checkpoint_for_test(saved_tensors_hooks=(pack, unpack))(body)(
+                region_input
+            )
         y.sum().backward()
 
         self.assertEqual(0, outer_pack_calls[0])
@@ -446,6 +465,9 @@ compute block.0.mid [recompute] (recompute)
         )
         self.assertTrue(torch.equal(leaf.grad, torch.tensor([4.0, 6.0])))
 
+    @pytest.mark.compile_xfail(
+        "remat saved-tensor hooks are unsupported under torch.compile"
+    )
     def test_saved_tensors_hooks_entered_inside_save_body_take_precedence(
         self,
     ) -> None:
@@ -484,13 +506,16 @@ compute block.0.mid [recompute] (recompute)
 
         x = torch.tensor([2.0, 3.0], requires_grad=True)
         with remat.saved_tensors_hooks(outer_pack, unpack):
-            y = remat.checkpoint()(checkpoint_body)(x)
+            y = checkpoint_for_test()(checkpoint_body)(x)
         y.sum().backward()
 
         self.assertEqual(1, outer_packs[0])
         self.assertEqual(1, inner_packs[0])
         self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
 
+    @pytest.mark.compile_xfail(
+        "remat saved-tensor hooks are unsupported under torch.compile"
+    )
     def test_nested_native_hooks_take_precedence(self) -> None:
         outer_packs = [0]
         inner_packs = [0]
@@ -524,13 +549,16 @@ compute block.0.mid [recompute] (recompute)
         x = torch.tensor([2.0, 3.0], requires_grad=True)
         with remat.saved_tensors_hooks(outer_pack, unpack):
             with torch.autograd.graph.saved_tensors_hooks(inner_pack, unpack):
-                y = remat.checkpoint()(body)(x)
+                y = checkpoint_for_test()(body)(x)
         y.sum().backward()
 
         self.assertEqual(0, outer_packs[0])
         self.assertEqual(2, inner_packs[0])
         self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
 
+    @pytest.mark.compile_xfail(
+        "remat saved-tensor hooks are unsupported under torch.compile"
+    )
     def test_saved_tensors_hooks_retain_parameter_ness(self) -> None:
         # A SAVE op that saves an nn.Parameter for backward (e.g. a linear weight for
         # its wgrad) must hand that tensor to the user pack hook AS an nn.Parameter.
@@ -580,7 +608,7 @@ compute block.0.mid [recompute] (recompute)
 
         x = torch.randn(4, 3, requires_grad=True)
         with remat.saved_tensors_hooks(pack, unpack):
-            y = remat.checkpoint()(body)(x)
+            y = checkpoint_for_test()(body)(x)
             y.sum().backward()
 
         # The native checkpoint-input save arrives first, followed by the activation
@@ -589,6 +617,9 @@ compute block.0.mid [recompute] (recompute)
         # Grad still flows through the parameter-wrapped saved weight.
         self.assertIsNotNone(x.grad)
 
+    @pytest.mark.compile_xfail(
+        "remat saved-tensor hooks are unsupported under torch.compile"
+    )
     def test_capture_context_binds_producer_context_for_deferred_output_save(
         self,
     ) -> None:
@@ -631,7 +662,7 @@ compute block.0.mid [recompute] (recompute)
             return torch.relu(y)  # bare consumer, reads y during recompute
 
         x = torch.tensor([1.0, -1.0], requires_grad=True)
-        remat.checkpoint()(body)(x).sum().backward()
+        checkpoint_for_test()(body)(x).sum().backward()
         # Packed once, with the context captured at the producer (7), not the later 999.
         self.assertEqual([7], packed_with)
         # ...and pack was told this entry is a persisted SAVE-region output, not a

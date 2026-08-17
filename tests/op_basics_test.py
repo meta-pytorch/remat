@@ -17,8 +17,10 @@ from __future__ import annotations
 from typing import Any, cast
 
 import expecttest
+import pytest
 import torch
 import torch_remat as remat
+from remat_test_helpers import checkpoint_for_test, IS_COMPILE_TEST
 from torch_remat._api import _MakeNonLeaf
 from torch_remat._region import (
     _checkpoint_context_fn,
@@ -91,10 +93,10 @@ class OpBasicsTest(expecttest.TestCase):
 
             @staticmethod
             def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
-                if remat.is_recomputing():
-                    raise AssertionError("SAVE replay must skip the forward body")
-
-                FunctionStyleSquare.forward_runs += 1
+                if not IS_COMPILE_TEST:
+                    if remat.is_recomputing():
+                        raise AssertionError("SAVE replay must skip the forward body")
+                    FunctionStyleSquare.forward_runs += 1
                 y = x * x
                 ctx.save_for_backward(x)
                 return y
@@ -112,10 +114,11 @@ class OpBasicsTest(expecttest.TestCase):
             )(x)
 
         x = torch.tensor([2.0, 3.0], requires_grad=True)
-        y = remat.checkpoint()(checkpoint_body)(x)
+        y = checkpoint_for_test()(checkpoint_body)(x)
         y.sum().backward()
 
-        self.assertEqual(1, FunctionStyleSquare.forward_runs)
+        if not IS_COMPILE_TEST:
+            self.assertEqual(1, FunctionStyleSquare.forward_runs)
         self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
 
     def test_recompute_op_reruns_body(self) -> None:
@@ -124,7 +127,8 @@ class OpBasicsTest(expecttest.TestCase):
 
             @staticmethod
             def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
-                ReadmeSquare.forward_runs += 1
+                if not IS_COMPILE_TEST:
+                    ReadmeSquare.forward_runs += 1
                 ctx.save_for_backward(x)
                 return x * x
 
@@ -141,10 +145,11 @@ class OpBasicsTest(expecttest.TestCase):
             )(x)
 
         x = torch.tensor([2.0, 3.0], requires_grad=True)
-        y = remat.checkpoint()(checkpoint_body)(x)
+        y = checkpoint_for_test()(checkpoint_body)(x)
         y.sum().backward()
 
-        self.assertEqual(2, ReadmeSquare.forward_runs)
+        if not IS_COMPILE_TEST:
+            self.assertEqual(2, ReadmeSquare.forward_runs)
         self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
 
     def test_recompute_op_supports_none_output(self) -> None:
@@ -155,7 +160,8 @@ class OpBasicsTest(expecttest.TestCase):
             x: torch.Tensor,
         ) -> tuple[torch.Tensor, None]:
             nonlocal forward_runs
-            forward_runs += 1
+            if not IS_COMPILE_TEST:
+                forward_runs += 1
             return x * x, None
 
         def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
@@ -164,17 +170,22 @@ class OpBasicsTest(expecttest.TestCase):
                 "optional.output",
                 recompute=True,
             )(x)
-            seen_optional_outputs.append(optional)
+            if not IS_COMPILE_TEST:
+                seen_optional_outputs.append(optional)
             return y
 
         x = torch.tensor([2.0, 3.0], requires_grad=True)
-        y = remat.checkpoint()(checkpoint_body)(x)
+        y = checkpoint_for_test()(checkpoint_body)(x)
         y.sum().backward()
 
-        self.assertEqual(2, forward_runs)
-        self.assertEqual([None, None], seen_optional_outputs)
+        if not IS_COMPILE_TEST:
+            self.assertEqual(2, forward_runs)
+            self.assertEqual([None, None], seen_optional_outputs)
         self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
 
+    @pytest.mark.compile_xfail(
+        "compile has no second Python phase whose policy can drift"
+    )
     def test_recompute_setting_must_match_forward(self) -> None:
         class PolicyDrift(torch.autograd.Function):
             @staticmethod
@@ -196,11 +207,12 @@ class OpBasicsTest(expecttest.TestCase):
                 x
             )
 
-        y = remat.checkpoint()(run)(torch.ones(1, requires_grad=True))
+        y = checkpoint_for_test()(run)(torch.ones(1, requires_grad=True))
 
         with self.assertRaisesRegex(RuntimeError, "Conflicting recompute settings"):
             y.sum().backward()
 
+    @pytest.mark.compile_xfail("compile relies on Dynamo's requires-grad validation")
     def test_leaf_requires_grad_output_from_remat_op_errors(self) -> None:
         # A remat.region that returns a requires-grad *leaf* (a bare allocation, not the
         # result of a real computation) is rejected: an autograd.Function or a
@@ -218,7 +230,7 @@ class OpBasicsTest(expecttest.TestCase):
         with self.assertRaisesRegex(
             RuntimeError, "returned a leaf tensor that requires grad"
         ):
-            remat.checkpoint()(save_block)(x)
+            checkpoint_for_test()(save_block)(x)
 
         def recompute_block(x: torch.Tensor) -> torch.Tensor:
             return remat.region(alloc, "alloc", recompute=True)(x)
@@ -226,7 +238,7 @@ class OpBasicsTest(expecttest.TestCase):
         with self.assertRaisesRegex(
             RuntimeError, "returned a leaf tensor that requires grad"
         ):
-            remat.checkpoint()(recompute_block)(x)
+            checkpoint_for_test()(recompute_block)(x)
 
     def test_op_outside_checkpoint_preserves_saved_tensors_hooks(self) -> None:
         packed_shapes: list[tuple[int, ...]] = []
@@ -267,6 +279,7 @@ class OpBasicsTest(expecttest.TestCase):
         self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
         self.assertEqual([(2,)], packed_shapes)
 
+    @pytest.mark.compile_xfail("region names are diagnostic-only under compile")
     def test_duplicate_op_name_errors_in_forward(self) -> None:
         class FirstDuplicate(torch.autograd.Function):
             @staticmethod
@@ -306,7 +319,7 @@ class OpBasicsTest(expecttest.TestCase):
             RuntimeError,
             "Duplicate torch_remat region name.*during forward",
         ):
-            remat.checkpoint()(checkpoint_body)(torch.ones(1, requires_grad=True))
+            checkpoint_for_test()(checkpoint_body)(torch.ones(1, requires_grad=True))
 
     def test_identity_node_rejects_backprop(self) -> None:
         # _MakeNonLeaf is fabricated only during recompute to reshape autograd

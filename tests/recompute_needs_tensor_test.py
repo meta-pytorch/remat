@@ -20,9 +20,10 @@ from __future__ import annotations
 from typing import Callable
 
 import expecttest
+import pytest
 import torch
 import torch_remat as remat
-from remat_test_helpers import _ref_grad
+from remat_test_helpers import _ref_grad, checkpoint_for_test
 
 
 def _recompute_error(
@@ -32,7 +33,7 @@ def _recompute_error(
     and return its message."""
 
     try:
-        remat.checkpoint()(body)(x).sum().backward()
+        checkpoint_for_test()(body)(x).sum().backward()
     except RuntimeError as error:
         return str(error)
     raise AssertionError("expected a placeholder RuntimeError during recompute")
@@ -42,6 +43,7 @@ def _recompute_error(
 # save nothing for backward, so the region's output is not resident during recompute --
 # which is exactly the condition that produces a placeholder for a bare consumer to hit.
 class RecomputeNeedsTensorTest(expecttest.TestCase):
+    @pytest.mark.compile_xfail("compiled graphs carry saved-region outputs directly")
     def test_bare_consumer_without_annotation_raises_during_recompute(self) -> None:
         # A bare consumer of a SAVE output is not detected, so during recompute it reads
         # the skipped op's placeholder and raises. The message names the producing region
@@ -69,7 +71,7 @@ To fix it, call remat.recompute_needs_tensor(t) on the output tensor, right befo
             return torch.relu(y)
 
         x = torch.tensor([1.0, -1.0], requires_grad=True)
-        remat.checkpoint()(body)(x).sum().backward()
+        checkpoint_for_test()(body)(x).sum().backward()
         # d/dx relu(2x) = 2 where 2x > 0.
         self.assertTrue(torch.equal(x.grad, torch.tensor([2.0, 0.0])))
 
@@ -87,7 +89,7 @@ To fix it, call remat.recompute_needs_tensor(t) on the output tensor, right befo
             return torch.relu(y)
 
         x = torch.tensor([1.0, -1.0], requires_grad=True)
-        remat.checkpoint()(body)(x).sum().backward()
+        checkpoint_for_test()(body)(x).sum().backward()
         self.assertTrue(torch.equal(x.grad, torch.tensor([2.0, 0.0])))
 
     def test_recompute_needs_tensor_on_one_of_two_outputs(self) -> None:
@@ -99,7 +101,7 @@ To fix it, call remat.recompute_needs_tensor(t) on the output tensor, right befo
             return torch.relu(a)
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
-        remat.checkpoint()(body)(x).sum().backward()
+        checkpoint_for_test()(body)(x).sum().backward()
         # Only a = 2x is used: d/dx relu(2x) = 2 (both positive); b unused -> grad 0.
         self.assertTrue(torch.equal(x.grad, torch.tensor([2.0, 2.0])))
 
@@ -111,7 +113,7 @@ To fix it, call remat.recompute_needs_tensor(t) on the output tensor, right befo
             return torch.relu(a) + torch.relu(b)  # bare consumers of both
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
-        remat.checkpoint()(body)(x).sum().backward()
+        checkpoint_for_test()(body)(x).sum().backward()
         # d/dx (relu(2x) + relu(3x)) = 2 + 3 = 5 (all positive).
         self.assertTrue(torch.equal(x.grad, torch.tensor([5.0, 5.0])))
 
@@ -128,7 +130,7 @@ To fix it, call remat.recompute_needs_tensor(t) on the output tensor, right befo
             return torch.relu((x * 2).reshape(-1))
 
         x = torch.tensor([1.0, -1.0], requires_grad=True)
-        remat.checkpoint()(body)(x).sum().backward()
+        checkpoint_for_test()(body)(x).sum().backward()
         self.assertTrue(torch.allclose(x.grad, _ref_grad(reference, x)))
 
     def test_region_consuming_bare_view_of_save_output_works(self) -> None:
@@ -144,7 +146,7 @@ To fix it, call remat.recompute_needs_tensor(t) on the output tensor, right befo
             return (x * 2).reshape(-1) * 3.0
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
-        remat.checkpoint(region_name="r")(body)(x).sum().backward()
+        checkpoint_for_test(region_name="r")(body)(x).sum().backward()
         # d/dx (2x * 3) = 6.
         self.assertTrue(torch.allclose(x.grad, _ref_grad(reference, x)))
 
@@ -158,5 +160,5 @@ To fix it, call remat.recompute_needs_tensor(t) on the output tensor, right befo
             return torch.relu(y)  # bare consumer is fine
 
         x = torch.tensor([1.0, -1.0], requires_grad=True)
-        remat.checkpoint()(body)(x).sum().backward()
+        checkpoint_for_test()(body)(x).sum().backward()
         self.assertTrue(torch.equal(x.grad, torch.tensor([2.0, 0.0])))

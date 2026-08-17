@@ -492,6 +492,9 @@ def recompute_needs_tensor(*tensors: torch.Tensor) -> None:
             to persist. Non-tensor arguments raise.
     """
 
+    if torch.compiler.is_compiling():
+        return
+
     state = _state.get()
     for tensor in tensors:
         if not isinstance(tensor, torch.Tensor):

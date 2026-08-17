@@ -61,6 +61,18 @@ def _fn_block(x: torch.Tensor, w: torch.Tensor, *, recompute: bool) -> torch.Ten
     return e.sum()
 
 
+def _bare_block(x: torch.Tensor, w: torch.Tensor, *, recompute: bool) -> torch.Tensor:
+    return torch.exp(torch.matmul(x, w)).sum()
+
+
+class _StateHook:
+    def snapshot(self) -> None:
+        return None
+
+    def restore(self, state: Any) -> None:
+        del state
+
+
 class CompileTest(expecttest.TestCase):
     def _inputs(self) -> tuple[torch.Tensor, torch.Tensor]:
         torch.manual_seed(0)
@@ -124,7 +136,9 @@ class CompileTest(expecttest.TestCase):
         self.assertTrue(torch.equal(eager_gw, comp_gw))
 
     def _marker_in_fwd_bwd(
-        self, block: Callable[..., torch.Tensor], recompute: bool
+        self,
+        block: Callable[..., torch.Tensor],
+        recompute: bool,
     ) -> tuple[int, int]:
         """Return (# exp in partitioned forward, # exp in partitioned backward)."""
 
@@ -207,6 +221,71 @@ class CompileTest(expecttest.TestCase):
             "nested torch_remat.checkpoint regions are not supported",
         ):
             compiled(x, w)
+
+    def test_bare_op_is_recomputed(self) -> None:
+        # Unannotated operations remain under the checkpoint's recompute policy.
+        _, bwd = self._marker_in_fwd_bwd(_bare_block, recompute=True)
+        self.assertGreaterEqual(bwd, 1)
+
+    def test_region_outside_checkpoint_is_transparent(self) -> None:
+        compiled = torch.compile(
+            lambda x: remat.region(torch.exp, "exp", recompute=False)(x),
+            backend="aot_eager",
+            fullgraph=True,
+        )
+        x = torch.randn(4)
+        self.assertTrue(torch.equal(compiled(x), torch.exp(x)))
+
+    def test_is_recomputing_is_false(self) -> None:
+        compiled = torch.compile(
+            lambda x: remat.checkpoint()(lambda y: y + int(remat.is_recomputing()))(x),
+            backend="aot_eager",
+            fullgraph=True,
+        )
+        x = torch.randn(4, requires_grad=True)
+        self.assertTrue(torch.equal(compiled(x), x))
+
+    def test_determinism_check_is_forwarded(self) -> None:
+        compiled = torch.compile(
+            lambda x: remat.checkpoint(determinism_check="default")(torch.exp)(x),
+            backend="aot_eager",
+            fullgraph=True,
+        )
+        x = torch.randn(4, requires_grad=True)
+        expected = torch.exp(x.detach())
+        output = compiled(x)
+        output.sum().backward()
+        self.assertTrue(torch.equal(output, expected))
+        self.assertTrue(torch.equal(x.grad, expected))
+
+    def test_unsupported_checkpoint_options_raise(self) -> None:
+        from torch._dynamo.exc import Unsupported
+
+        def compile_with_options(
+            options: dict[str, Any],
+        ) -> Callable[[torch.Tensor], torch.Tensor]:
+            return torch.compile(
+                lambda x: remat.checkpoint(**options)(torch.exp)(x),
+                backend="aot_eager",
+                fullgraph=True,
+            )
+
+        options: tuple[tuple[str, dict[str, Any]], ...] = (
+            (
+                "saved_tensors_hooks",
+                {"saved_tensors_hooks": (lambda x: x, lambda x: x)},
+            ),
+            (
+                "recompute_state_hooks",
+                {"recompute_state_hooks": (_StateHook(),)},
+            ),
+        )
+        for option, kwargs in options:
+            with self.subTest(option=option):
+                torch._dynamo.reset()
+                compiled = compile_with_options(kwargs)
+                with self.assertRaisesRegex(Unsupported, option):
+                    compiled(torch.ones(2, requires_grad=True))
 
 
 if __name__ == "__main__":

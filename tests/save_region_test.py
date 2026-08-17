@@ -19,9 +19,14 @@ import weakref
 from typing import Any, cast, NamedTuple
 
 import expecttest
+import pytest
 import torch
 import torch_remat as remat
-from remat_test_helpers import _ref_grad
+from remat_test_helpers import (
+    _ref_grad,
+    checkpoint_for_test,
+    IS_COMPILE_TEST,
+)
 from torch_remat._region import _checkpoint_context_fn
 
 
@@ -35,10 +40,10 @@ class SaveRegionTest(expecttest.TestCase):
                 ctx: Any,
                 x: torch.Tensor,
             ) -> torch.Tensor:
-                if remat.is_recomputing():
-                    raise AssertionError("SAVE replay must skip the forward body")
-
-                SavesOutputView.forward_runs += 1
+                if not IS_COMPILE_TEST:
+                    if remat.is_recomputing():
+                        raise AssertionError("SAVE replay must skip the forward body")
+                    SavesOutputView.forward_runs += 1
                 query = x
                 key = x + 1
                 value = x + 2
@@ -63,9 +68,13 @@ class SaveRegionTest(expecttest.TestCase):
             ) -> torch.Tensor:
                 query, key, value, attn_vis, out, softmax_lse = ctx.saved_tensors
                 del query, key, value, attn_vis
-                self.assertGreater(out.contiguous().data_ptr(), 0)
-                self.assertGreater(softmax_lse.data_ptr(), 0)
-                return grad_output * out.contiguous().view_as(grad_output)
+                if not IS_COMPILE_TEST:
+                    self.assertGreater(out.contiguous().data_ptr(), 0)
+                    self.assertGreater(softmax_lse.data_ptr(), 0)
+                return (
+                    grad_output * out.contiguous().view_as(grad_output)
+                    + softmax_lse.sum() * 0
+                )
 
         x = torch.tensor([1.0, 2.0, 3.0, 4.0], requires_grad=True)
 
@@ -76,19 +85,19 @@ class SaveRegionTest(expecttest.TestCase):
                 recompute=False,
             )(x)
 
-        y = remat.checkpoint()(checkpoint_body)(x)
+        y = checkpoint_for_test()(checkpoint_body)(x)
         y.sum().backward()
 
-        self.assertEqual(1, SavesOutputView.forward_runs)
+        if not IS_COMPILE_TEST:
+            self.assertEqual(1, SavesOutputView.forward_runs)
         self.assertTrue(torch.equal(x.grad, torch.tensor([1.0, 4.0, 9.0, 16.0])))
 
     def test_save_preserves_none_saved_tensor_slots(self) -> None:
         class OptionalSavedTensor(torch.autograd.Function):
             @staticmethod
             def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
-                if remat.is_recomputing():
+                if not IS_COMPILE_TEST and remat.is_recomputing():
                     raise AssertionError("SAVE replay must skip the forward body")
-
                 right = x + 1
                 ctx.save_for_backward(x, None, right)
                 return right
@@ -96,7 +105,7 @@ class SaveRegionTest(expecttest.TestCase):
             @staticmethod
             def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
                 left, missing, right = ctx.saved_tensors
-                self.assertIsNone(missing)
+                assert missing is None
                 return grad_output * (right - left + 1)
 
         def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
@@ -107,7 +116,7 @@ class SaveRegionTest(expecttest.TestCase):
             )(x)
 
         x = torch.tensor([3.0, 4.0], requires_grad=True)
-        y = remat.checkpoint()(checkpoint_body)(x)
+        y = checkpoint_for_test()(checkpoint_body)(x)
         y.sum().backward()
 
         self.assertTrue(torch.equal(x.grad, torch.full_like(x, 2.0)))
@@ -121,10 +130,10 @@ class SaveRegionTest(expecttest.TestCase):
                 ctx: Any,
                 x: torch.Tensor,
             ) -> tuple[torch.Tensor, torch.Tensor]:
-                if remat.is_recomputing():
-                    raise AssertionError("SAVE replay must skip the forward body")
-
-                TupleReturn.forward_runs += 1
+                if not IS_COMPILE_TEST:
+                    if remat.is_recomputing():
+                        raise AssertionError("SAVE replay must skip the forward body")
+                    TupleReturn.forward_runs += 1
                 left = x * x
                 right = x + 1
                 ctx.save_for_backward(x, left, right)
@@ -149,10 +158,11 @@ class SaveRegionTest(expecttest.TestCase):
                 recompute=False,
             )(value)
 
-        left, right = remat.checkpoint()(checkpoint_body)(x)
+        left, right = checkpoint_for_test()(checkpoint_body)(x)
         (left + right).sum().backward()
 
-        self.assertEqual(1, TupleReturn.forward_runs)
+        if not IS_COMPILE_TEST:
+            self.assertEqual(1, TupleReturn.forward_runs)
         self.assertTrue(torch.equal(left.detach(), torch.tensor([4.0, 9.0])))
         self.assertTrue(torch.equal(right.detach(), torch.tensor([3.0, 4.0])))
         self.assertTrue(torch.equal(x.grad, torch.tensor([5.0, 7.0])))
@@ -165,9 +175,10 @@ class SaveRegionTest(expecttest.TestCase):
             x: torch.Tensor,
         ) -> tuple[torch.Tensor, None, torch.Tensor]:
             nonlocal forward_runs
-            if remat.is_recomputing():
-                raise AssertionError("SAVE replay must skip the forward body")
-            forward_runs += 1
+            if not IS_COMPILE_TEST:
+                if remat.is_recomputing():
+                    raise AssertionError("SAVE replay must skip the forward body")
+                forward_runs += 1
             return x * x, None, x + 1
 
         def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
@@ -176,7 +187,8 @@ class SaveRegionTest(expecttest.TestCase):
                 "optional.output",
                 recompute=False,
             )(x)
-            seen_optional_outputs.append(optional)
+            if not IS_COMPILE_TEST:
+                seen_optional_outputs.append(optional)
             return remat.region(
                 lambda lhs, rhs: lhs + rhs,
                 "combine",
@@ -184,11 +196,12 @@ class SaveRegionTest(expecttest.TestCase):
             )(left, right)
 
         x = torch.tensor([2.0, 3.0], requires_grad=True)
-        y = remat.checkpoint()(checkpoint_body)(x)
+        y = checkpoint_for_test()(checkpoint_body)(x)
         y.sum().backward()
 
-        self.assertEqual(1, forward_runs)
-        self.assertEqual([None, None], seen_optional_outputs)
+        if not IS_COMPILE_TEST:
+            self.assertEqual(1, forward_runs)
+            self.assertEqual([None, None], seen_optional_outputs)
         self.assertTrue(torch.equal(y.detach(), torch.tensor([7.0, 13.0])))
         self.assertTrue(torch.equal(x.grad, torch.tensor([5.0, 7.0])))
 
@@ -230,7 +243,9 @@ class SaveRegionTest(expecttest.TestCase):
                 recompute=False,
             )(produced)
 
-        y = remat.checkpoint()(checkpointed_region)(torch.ones(2, requires_grad=True))
+        y = checkpoint_for_test()(checkpointed_region)(
+            torch.ones(2, requires_grad=True)
+        )
 
         y.sum().backward()
 
@@ -268,10 +283,11 @@ class SaveRegionTest(expecttest.TestCase):
             return remat.region(SaveInput.apply, "consumer", recompute=False)(v)
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
-        remat.checkpoint(region_name="r")(region)(x).sum().backward()
+        checkpoint_for_test(region_name="r")(region)(x).sum().backward()
         # d/dx (3x)^2 = 18x
         self.assertTrue(torch.equal(x.grad, torch.tensor([18.0, 36.0])))
 
+    @pytest.mark.compile_xfail("remat saved-tensor hooks are unsupported under compile")
     def test_save_op_recomputed_input_is_not_offloaded(self) -> None:
         # With remat offload hooks active, a SAVE op that saves a RECOMPUTE-sourced
         # input does NOT offload it (case A): it is recomputed instead. Only the
@@ -327,7 +343,7 @@ class SaveRegionTest(expecttest.TestCase):
                 )(y)
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
-        out = remat.checkpoint(region_name="r")(region)(x)
+        out = checkpoint_for_test(region_name="r")(region)(x)
         out.sum().backward()
 
         # Only the internal save reached the offloader; the recomputed input did not.
@@ -340,7 +356,8 @@ class SaveRegionTest(expecttest.TestCase):
 
             @staticmethod
             def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
-                Affine.runs += 1
+                if not IS_COMPILE_TEST:
+                    Affine.runs += 1
                 z = x + 1
                 remat.save_for_backward(ctx, {"x": x, "missing": None, "z": z})
                 return x * x
@@ -349,17 +366,19 @@ class SaveRegionTest(expecttest.TestCase):
             def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
                 x, missing, z = ctx.saved_tensors
                 assert missing is None
-                assert torch.equal(z, x + 1)  # names mapped to the right tensors
-                return grad_output * 2 * x
+                if not IS_COMPILE_TEST:
+                    assert torch.equal(z, x + 1)
+                return grad_output * (x + z - 1)
 
         base = torch.tensor([2.0, 3.0], dtype=torch.float64)
         x = base.clone().requires_grad_(True)
         Affine.runs = 0
-        y = remat.checkpoint()(
+        y = checkpoint_for_test()(
             lambda t: remat.region(Affine.apply, "affine", recompute=False)(t)
         )(x)
         y.sum().backward()
-        self.assertEqual(1, Affine.runs)  # SAVE: body not rerun during recompute
+        if not IS_COMPILE_TEST:
+            self.assertEqual(1, Affine.runs)
         self.assertTrue(torch.allclose(x.grad, _ref_grad(lambda t: t * t, base)))
 
     def test_named_save_in_multi_op_span_keys_by_identity(self) -> None:
@@ -418,7 +437,7 @@ blk::span: 12 B
         # And the span still produces correct gradients end to end.
         base = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64)
         xc = base.clone().requires_grad_(True)
-        remat.checkpoint(region_name="blk")(span)(xc).sum().backward()
+        checkpoint_for_test(region_name="blk")(span)(xc).sum().backward()
         self.assertTrue(torch.allclose(xc.grad, _ref_grad(lambda t: t * t, base)))
 
     def test_recompute_op_loads_mixed_flat_inputs(self) -> None:
@@ -450,7 +469,7 @@ blk::span: 12 B
             )
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
-        out = remat.checkpoint()(body)(x)
+        out = checkpoint_for_test()(body)(x)
         out.sum().backward()
 
         self.assertTrue(torch.equal(out.detach(), torch.tensor([8.0, 16.0])))
@@ -486,7 +505,7 @@ blk::span: 12 B
             )([saved, recomputed])
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
-        out = remat.checkpoint()(body)(x)
+        out = checkpoint_for_test()(body)(x)
         out.sum().backward()
 
         self.assertTrue(torch.equal(out.detach(), torch.tensor([5.0, 10.0])))
@@ -503,20 +522,21 @@ blk::span: 12 B
                 "split",
                 recompute=False,
             )(x)
-            seen_container.append(type(pair))
+            assert isinstance(pair, list)
+            if not IS_COMPILE_TEST:
+                seen_container.append(type(pair))
             first, second = pair
             # add(2x, 3x) = 5x; both inputs are SAVE outputs ferried on recompute.
             return remat.region(torch.add, "add", recompute=True)(first, second)
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
-        out = remat.checkpoint()(body)(x)
+        out = checkpoint_for_test()(body)(x)
         out.sum().backward()
 
         self.assertTrue(torch.equal(out.detach(), torch.tensor([5.0, 10.0])))
         self.assertTrue(torch.equal(x.grad, torch.tensor([5.0, 5.0])))
-        # Recorded on the original forward and again on recompute (where the SAVE
-        # op replays as placeholders): both must rebuild a list, not a tuple.
-        self.assertEqual(seen_container, [list, list])
+        if not IS_COMPILE_TEST:
+            self.assertEqual(seen_container, [list, list])
 
     def test_save_op_returns_namedtuple_output(self) -> None:
         """A SAVE op may return a NamedTuple; recompute rebuilds the same named type.
@@ -538,7 +558,9 @@ blk::span: 12 B
                 "split",
                 recompute=False,
             )(x)
-            seen_container.append(type(pair))
+            assert isinstance(pair, Pair)
+            if not IS_COMPILE_TEST:
+                seen_container.append(type(pair))
             # Named-field access must work on the forward value and the recompute
             # reconstruction alike; both fields are SAVE outputs ferried on recompute.
             return remat.region(torch.add, "add", recompute=True)(
@@ -546,14 +568,13 @@ blk::span: 12 B
             )
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
-        out = remat.checkpoint()(body)(x)
+        out = checkpoint_for_test()(body)(x)
         out.sum().backward()
 
         self.assertTrue(torch.equal(out.detach(), torch.tensor([5.0, 10.0])))
         self.assertTrue(torch.equal(x.grad, torch.tensor([5.0, 5.0])))
-        # Rebuilt as the NamedTuple type on the original forward and again on
-        # recompute (where the SAVE op replays from the tape), not a plain tuple.
-        self.assertEqual(seen_container, [Pair, Pair])
+        if not IS_COMPILE_TEST:
+            self.assertEqual(seen_container, [Pair, Pair])
 
     def test_save_op_returns_structseq_output(self) -> None:
         """A SAVE op may return a structseq (torch.return_types.*); recompute rebuilds it.
@@ -573,7 +594,8 @@ blk::span: 12 B
                 "split",
                 recompute=False,
             )(x)
-            seen_container.append(type(pair))
+            if not IS_COMPILE_TEST:
+                seen_container.append(type(pair))
             # structseq field access (``.values`` / ``.indices``) must work on the
             # forward value and the recompute reconstruction alike; both fields are
             # SAVE outputs ferried on recompute.
@@ -582,14 +604,15 @@ blk::span: 12 B
             )
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
-        out = remat.checkpoint()(body)(x)
+        out = checkpoint_for_test()(body)(x)
         out.sum().backward()
 
         self.assertTrue(torch.equal(out.detach(), torch.tensor([5.0, 10.0])))
         self.assertTrue(torch.equal(x.grad, torch.tensor([5.0, 5.0])))
         # Rebuilt as the structseq type on the original forward and again on recompute,
         # not collapsed to a plain tuple.
-        self.assertEqual(seen_container, [structseq_type, structseq_type])
+        if not IS_COMPILE_TEST:
+            self.assertEqual(seen_container, [structseq_type, structseq_type])
 
     def test_multi_op_save_region(self) -> None:
         base = torch.randn(5, dtype=torch.float64)
@@ -608,7 +631,7 @@ blk::span: 12 B
             return (torch.exp(torch.sin(t)) * t) ** 2
 
         x = base.clone().requires_grad_(True)
-        y = remat.checkpoint()(block)(x)
+        y = checkpoint_for_test()(block)(x)
         y.sum().backward()
         self.assertTrue(torch.allclose(x.grad, _ref_grad(reference, base)))
 
@@ -652,9 +675,10 @@ blk::span: 12 B
             )(q, k, v)
 
         x = base.clone().requires_grad_(True)
-        remat.checkpoint(region_name="attn")(attention)(x).backward()
+        checkpoint_for_test(region_name="attn")(attention)(x).backward()
         self.assertTrue(torch.allclose(x.grad, _ref_grad(attention, base)))
 
+    @pytest.mark.compile_xfail("compile does not use remat's eager version guard")
     def test_save_op_detects_in_place_mutation_of_saved_tensor(self) -> None:
         # A SAVE op's saved tensor is packed through an identity saved_tensors_hooks
         # so autograd owns it -- but autograd's native version-counter guard does
@@ -681,7 +705,7 @@ blk::span: 12 B
             return remat.region(Square.apply, "sq", recompute=False)(x)
 
         x = torch.tensor([2.0, 3.0], requires_grad=True)
-        y = remat.checkpoint()(body)(x)
+        y = checkpoint_for_test()(body)(x)
         with torch.no_grad():
             saved_holder[0].mul_(5.0)  # invalidate the saved tensor after the forward
         with self.assertRaisesRegex(RuntimeError, "modified in-place"):
@@ -714,7 +738,7 @@ blk::span: 12 B
 
         base = torch.randn(4, dtype=torch.float64)
         x = base.clone().requires_grad_(True)
-        remat.checkpoint(region_name="r")(region)(x).sum().backward()
+        checkpoint_for_test(region_name="r")(region)(x).sum().backward()
         self.assertTrue(torch.allclose(x.grad, _ref_grad(region, base)))
 
     def test_save_op_saves_distinct_object_alias_of_input_is_ferried(self) -> None:
@@ -730,7 +754,8 @@ blk::span: 12 B
 
             @staticmethod
             def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
-                Producer.runs += 1
+                if not IS_COMPILE_TEST:
+                    Producer.runs += 1
                 ctx.save_for_backward(x)
                 return x * 3
 
@@ -743,7 +768,7 @@ blk::span: 12 B
             @staticmethod
             def forward(ctx: Any, y: torch.Tensor) -> torch.Tensor:
                 nonlocal producer_output_ref
-                if not remat.is_recomputing():
+                if not IS_COMPILE_TEST and not remat.is_recomputing():
                     producer_output_ref = weakref.ref(y)
                 alias = y.view_as(y)  # distinct object, same storage + layout
                 assert alias is not y
@@ -764,16 +789,18 @@ blk::span: 12 B
             return remat.region(Consumer.apply, "consumer", recompute=False)(y)
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
-        out = remat.checkpoint(region_name="r")(region)(x)
+        out = checkpoint_for_test(region_name="r")(region)(x)
 
-        ref = producer_output_ref
-        assert ref is not None
-        gc.collect()
-        # The aliased input was ferried (recognized by storage), not retained.
-        self.assertIsNone(ref())
+        if not IS_COMPILE_TEST:
+            ref = producer_output_ref
+            assert ref is not None
+            gc.collect()
+            # The aliased input was ferried (recognized by storage), not retained.
+            self.assertIsNone(ref())
 
         out.sum().backward()
-        self.assertEqual(2, Producer.runs)  # recomputed once at backward
+        if not IS_COMPILE_TEST:
+            self.assertEqual(2, Producer.runs)  # recomputed once at backward
         self.assertTrue(torch.equal(x.grad, torch.tensor([18.0, 36.0])))
 
     def test_save_op_saves_slice_views_of_recomputed_input_is_ferried(self) -> None:
@@ -788,7 +815,8 @@ blk::span: 12 B
 
             @staticmethod
             def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
-                Producer.runs += 1
+                if not IS_COMPILE_TEST:
+                    Producer.runs += 1
                 ctx.save_for_backward(x)
                 return x * 3
 
@@ -801,7 +829,7 @@ blk::span: 12 B
             @staticmethod
             def forward(ctx: Any, y: torch.Tensor) -> torch.Tensor:
                 nonlocal producer_output_ref
-                if not remat.is_recomputing():
+                if not IS_COMPILE_TEST and not remat.is_recomputing():
                     producer_output_ref = weakref.ref(y)
                 first = y[:2]  # view, storage offset 0
                 second = y[2:]  # view, storage offset 2
@@ -822,16 +850,18 @@ blk::span: 12 B
             return remat.region(Consumer.apply, "consumer", recompute=False)(y)
 
         x = torch.tensor([1.0, 2.0, 3.0, 4.0], requires_grad=True)
-        out = remat.checkpoint(region_name="r")(region)(x)
+        out = checkpoint_for_test(region_name="r")(region)(x)
 
-        ref = producer_output_ref
-        assert ref is not None
-        gc.collect()
-        # The views were ferried, so the producer output was not kept resident.
-        self.assertIsNone(ref())
+        if not IS_COMPILE_TEST:
+            ref = producer_output_ref
+            assert ref is not None
+            gc.collect()
+            # The views were ferried, so the producer output was not kept resident.
+            self.assertIsNone(ref())
 
         out.backward()
-        self.assertEqual(2, Producer.runs)
+        if not IS_COMPILE_TEST:
+            self.assertEqual(2, Producer.runs)
         # d/dx sum((3x)^2) = 18x
         self.assertTrue(torch.equal(x.grad, torch.tensor([18.0, 36.0, 54.0, 72.0])))
 
@@ -869,7 +899,7 @@ blk::span: 12 B
             return remat.region(Consumer.apply, "consumer", recompute=False)(y)
 
         x = torch.tensor([1.0, 2.0, 3.0, 4.0], requires_grad=True)
-        out = remat.checkpoint(region_name="r")(region)(x)
+        out = checkpoint_for_test(region_name="r")(region)(x)
         expected = torch.tensor([18.0, 36.0, 54.0, 72.0])
 
         out.backward(retain_graph=True)
@@ -893,7 +923,8 @@ blk::span: 12 B
 
             @staticmethod
             def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
-                Producer.runs += 1
+                if not IS_COMPILE_TEST:
+                    Producer.runs += 1
                 ctx.save_for_backward(x)
                 return (x * 3).t()  # non-contiguous output
 
@@ -906,7 +937,7 @@ blk::span: 12 B
             @staticmethod
             def forward(ctx: Any, y: torch.Tensor) -> torch.Tensor:
                 nonlocal producer_output_ref
-                if not remat.is_recomputing():
+                if not IS_COMPILE_TEST and not remat.is_recomputing():
                     producer_output_ref = weakref.ref(y)
                 # Save two row views of the non-contiguous base.
                 ctx.save_for_backward(y[0], y[1])
@@ -929,18 +960,21 @@ blk::span: 12 B
             return ((x * 3).t() ** 2).sum()
 
         x = base.clone().requires_grad_(True)
-        out = remat.checkpoint(region_name="r")(region)(x)
+        out = checkpoint_for_test(region_name="r")(region)(x)
 
-        ref = producer_output_ref
-        assert ref is not None
-        gc.collect()
-        # The views were ferried, so the non-contiguous input was not kept resident.
-        self.assertIsNone(ref())
+        if not IS_COMPILE_TEST:
+            ref = producer_output_ref
+            assert ref is not None
+            gc.collect()
+            # The views were ferried, so the non-contiguous input was not kept resident.
+            self.assertIsNone(ref())
 
         out.backward()
-        self.assertEqual(2, Producer.runs)
+        if not IS_COMPILE_TEST:
+            self.assertEqual(2, Producer.runs)
         self.assertTrue(torch.allclose(x.grad, _ref_grad(reference, base)))
 
+    @pytest.mark.compile_xfail("compile has no Python replay whose layout can drift")
     def test_save_op_saved_view_layout_mismatch_on_recompute_errors(self) -> None:
         # If a ferried saved view's base reproduces with a DIFFERENT layout than the
         # forward recorded (here forced by a producer that returns a non-contiguous
@@ -980,7 +1014,7 @@ blk::span: 12 B
             return remat.region(Consumer.apply, "consumer", recompute=False)(y)
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
-        out = remat.checkpoint(region_name="r")(region)(x)
+        out = checkpoint_for_test(region_name="r")(region)(x)
         with self.assertRaisesRegex(RuntimeError, "different layout"):
             out.backward()
 
@@ -1018,7 +1052,7 @@ blk::span: 12 B
 
         base = torch.tensor([1.0, 2.0], dtype=torch.float64)
         x = base.clone().requires_grad_(True)
-        y = remat.checkpoint(region_name="outer_ckpt")(
+        y = checkpoint_for_test(region_name="outer_ckpt")(
             lambda t: remat.region(outer_body, "outer", recompute=False)(t)
         )(x)
         y.sum().backward()
@@ -1031,6 +1065,7 @@ blk::span: 12 B
             torch.allclose(x.grad, _ref_grad(lambda t: (t * 3) ** 2 + 1, base))
         )
 
+    @pytest.mark.compile_xfail("nested region validation is eager-only")
     def test_recompute_region_inside_save_region_raises(self) -> None:
         # A recompute=True region nested inside a SAVE (recompute=False) region cannot
         # be honored -- the enclosing SAVE never recomputes -- so it is rejected.
@@ -1041,10 +1076,13 @@ blk::span: 12 B
         with self.assertRaisesRegex(
             RuntimeError, "recompute=True.*nested inside a recompute=False"
         ):
-            remat.checkpoint(region_name="outer_ckpt")(
+            checkpoint_for_test(region_name="outer_ckpt")(
                 lambda t: remat.region(outer_body, "outer", recompute=False)(t)
             )(x)
 
+    @pytest.mark.compile_xfail(
+        "the test observes a Python hook inside the compiled body"
+    )
     def test_save_output_register_hook_fires_with_grad(self) -> None:
         # A backward hook registered on a SAVE region's output must fire with the
         # gradient w.r.t. that output when the output is consumed by a remat.region.
@@ -1071,7 +1109,7 @@ blk::span: 12 B
             return remat.region(lambda t: t * 2, "consumer", recompute=True)(y)
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
-        remat.checkpoint(region_name="r")(body)(x).sum().backward()
+        checkpoint_for_test(region_name="r")(body)(x).sum().backward()
 
         # The hook fired once, with the gradient w.r.t. the SAVE output y = 3x:
         # d(sum(2 * y))/dy = 2.

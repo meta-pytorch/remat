@@ -19,13 +19,16 @@ import weakref
 from typing import Any
 
 import expecttest
+import pytest
 import torch
 import torch_remat as remat
+from remat_test_helpers import checkpoint_for_test
 from torch_remat._recompute_boundary import _checkpoint_recompute_boundary
 from torch_remat._region import _checkpoint_context_fn
 
 
 class CheckpointTest(expecttest.TestCase):
+    @pytest.mark.compile_xfail("saved-tensor hooks are unsupported under torch.compile")
     def test_checkpoint_preserves_outer_saved_tensors_hooks(self) -> None:
         packed: list[torch.Tensor] = []
         unpacked: list[torch.Tensor] = []
@@ -56,7 +59,7 @@ class CheckpointTest(expecttest.TestCase):
 
         x = torch.tensor([2.0, 3.0], requires_grad=True)
         with torch.autograd.graph.saved_tensors_hooks(pack_hook, unpack_hook):
-            y = remat.checkpoint()(checkpoint_body)(x)
+            y = checkpoint_for_test()(checkpoint_body)(x)
         y.sum().backward()
 
         self.assertEqual(2, len(packed))
@@ -69,11 +72,10 @@ class CheckpointTest(expecttest.TestCase):
 
     def test_checkpoint_options_do_not_collide_with_user_kwargs(self) -> None:
         def fn(x: torch.Tensor, *, region_name: str) -> torch.Tensor:
-            self.assertEqual("user.kwarg", region_name)
-            return x * 2
+            return x * (2 if region_name == "user.kwarg" else 0)
 
         x = torch.tensor([3.0], requires_grad=True)
-        y = remat.checkpoint(region_name="checkpoint.region")(fn)(
+        y = checkpoint_for_test(region_name="checkpoint.region")(fn)(
             x,
             region_name="user.kwarg",
         )
@@ -86,7 +88,7 @@ class CheckpointTest(expecttest.TestCase):
         # would clobber the outer's context-local state. The inner checkpoint sits
         # inside the outer's body (directly, and via a region()), both of which run
         # with the outer region active.
-        inner = remat.checkpoint(region_name="inner")(lambda t: t * 2)
+        inner = checkpoint_for_test(region_name="inner")(lambda t: t * 2)
 
         def outer_direct(x: torch.Tensor) -> torch.Tensor:
             return inner(x) + 1
@@ -98,10 +100,10 @@ class CheckpointTest(expecttest.TestCase):
         for body in (outer_direct, outer_via_region):
             with self.subTest(body=body.__name__):
                 with self.assertRaisesRegex(
-                    NotImplementedError,
+                    (NotImplementedError, torch._dynamo.exc.Unsupported),
                     "nested torch_remat.checkpoint regions are not supported",
                 ):
-                    remat.checkpoint(region_name="outer")(body)(x)
+                    checkpoint_for_test(region_name="outer")(body)(x)
 
     def test_checkpoint_forward_exception_unwinds_remat_state(self) -> None:
         class FailingForward(torch.autograd.Function):
@@ -124,7 +126,7 @@ class CheckpointTest(expecttest.TestCase):
 
         caught_exception: RuntimeError | None = None
         try:
-            remat.checkpoint(
+            checkpoint_for_test(
                 region_name="leak.check",
             )(failing_body)(torch.ones(1, requires_grad=True))
         except RuntimeError as exc:
@@ -158,13 +160,14 @@ class CheckpointTest(expecttest.TestCase):
             )(x)
 
         x = torch.tensor([2.0], requires_grad=True)
-        y = remat.checkpoint(
+        y = checkpoint_for_test(
             region_name="followup.check",
         )(followup_body)(x)
         y.sum().backward()
 
         self.assertTrue(torch.equal(x.grad, torch.tensor([4.0])))
 
+    @pytest.mark.compile_xfail("compiled regions do not populate collect_trace")
     def test_collect_trace_records_original_forward_annotations(self) -> None:
         def scope_body(x: torch.Tensor) -> torch.Tensor:
             y = remat.region(
@@ -187,7 +190,7 @@ class CheckpointTest(expecttest.TestCase):
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
         with remat.collect_trace() as trace:
-            y = remat.checkpoint()(checkpoint_body)(x)
+            y = checkpoint_for_test()(checkpoint_body)(x)
             y.sum().backward()
 
         self.assertExpectedInline(
@@ -199,6 +202,7 @@ scope [test_flag]
   cos: recompute""",
         )
 
+    @pytest.mark.compile_xfail("compile has no Python forward replay to order")
     def test_checkpoint_forces_recompute_before_inner_custom_backward(self) -> None:
         events: list[str] = []
 
@@ -221,7 +225,7 @@ scope [test_flag]
             events.append("checkpoint_body")
             return Inner.apply(x)
 
-        y = remat.checkpoint()(checkpoint_body)(
+        y = checkpoint_for_test()(checkpoint_body)(
             torch.tensor([1.0, 2.0], requires_grad=True)
         )
         y.sum().backward()
@@ -267,12 +271,13 @@ inner_backward_after_unpack""",
         self.assertEqual([0], unpacked_nbytes)
         self.assertTrue(torch.equal(x.grad, torch.full_like(x, 3)))
 
+    @pytest.mark.compile_xfail("compile uses Dynamo's output pytree handling")
     def test_checkpoint_boundary_rejects_non_tensor_leaf(self) -> None:
         x = torch.ones(1, requires_grad=True)
 
         # A non-tensor leaf in the one-hop container has no place at the boundary.
         with self.assertRaisesRegex(RuntimeError, "must return a Tensor"):
-            remat.checkpoint()(lambda value: (value, None))(x)
+            checkpoint_for_test()(lambda value: (value, None))(x)
 
     def test_checkpoint_boundary_preserves_tuple_subclass(self) -> None:
         # _pytree keeps a one-hop container's own type across the round-trip, so a
@@ -282,7 +287,7 @@ inner_backward_after_unpack""",
             pass
 
         x = torch.ones(1, requires_grad=True)
-        output = remat.checkpoint()(lambda value: TensorTuple((value * 2,)))(x)
+        output = checkpoint_for_test()(lambda value: TensorTuple((value * 2,)))(x)
 
         self.assertIs(type(output), TensorTuple)
         output[0].sum().backward()
@@ -297,12 +302,13 @@ inner_backward_after_unpack""",
             return [x * 2, x * 3]
 
         x = torch.tensor([2.0], requires_grad=True)
-        output = remat.checkpoint()(fn)(x)
+        output = checkpoint_for_test()(fn)(x)
         loss = output[0].sum() + output[1].sum()
         loss.backward()
 
         self.assertTrue(torch.equal(x.grad, torch.tensor([5.0])))
 
+    @pytest.mark.compile_xfail("compile uses Dynamo's output pytree handling")
     def test_checkpoint_boundary_rejects_dict(self) -> None:
         # dict is not a recognized container -- it matches the autograd.Function /
         # ATen op support level, so a dict return is an opaque, non-tensor leaf and
@@ -315,8 +321,9 @@ inner_backward_after_unpack""",
             RuntimeError,
             "must return a Tensor, or one hop of tuple/list of Tensors",
         ):
-            remat.checkpoint()(fn)(x)
+            checkpoint_for_test()(fn)(x)
 
+    @pytest.mark.compile_xfail("compile uses Dynamo's output pytree handling")
     def test_checkpoint_boundary_rejects_deeply_nested_containers(self) -> None:
         # The region output is a single _pytree value: a Tensor or one hop of
         # tuple/list of Tensors. A container nested one hop deeper is not
@@ -329,7 +336,7 @@ inner_backward_after_unpack""",
             RuntimeError,
             "must return a Tensor, or one hop of tuple/list of Tensors",
         ):
-            remat.checkpoint()(fn)(x)
+            checkpoint_for_test()(fn)(x)
 
     def test_phase_helpers_report_forward_and_recompute(self) -> None:
         forward_context, recompute_context = _checkpoint_context_fn()
@@ -340,6 +347,7 @@ inner_backward_after_unpack""",
         with recompute_context:
             self.assertTrue(remat.is_recomputing())
 
+    @pytest.mark.compile_xfail("compiled regions do not use the eager tape lifetime")
     def test_save_policy_checkpoint_releases_saved_tensors_by_default(self) -> None:
         saved_activation_ref: weakref.ReferenceType[torch.Tensor] | None = None
 
@@ -373,7 +381,7 @@ inner_backward_after_unpack""",
             )(x)
 
         x = torch.tensor([2.0, 3.0], requires_grad=True)
-        y = remat.checkpoint()(checkpoint_body)(x)
+        y = checkpoint_for_test()(checkpoint_body)(x)
         y.sum().backward()
         self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
 
@@ -408,7 +416,7 @@ inner_backward_after_unpack""",
             )(x)
 
         x = torch.tensor([2.0, 3.0], requires_grad=True)
-        y = remat.checkpoint()(checkpoint_body)(x)
+        y = checkpoint_for_test()(checkpoint_body)(x)
         y.sum().backward(retain_graph=True)
         self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
 

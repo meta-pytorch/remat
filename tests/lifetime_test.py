@@ -19,9 +19,14 @@ import weakref
 from typing import Any, cast
 
 import expecttest
+import pytest
 import torch
 import torch_remat as remat
-from remat_test_helpers import _ref_grad, assert_reclaimed_without_gc
+from remat_test_helpers import (
+    _ref_grad,
+    assert_reclaimed_without_gc,
+    checkpoint_for_test,
+)
 from torch_remat._region import (
     _checkpoint_context_fn,
     _state,
@@ -112,6 +117,9 @@ def _twelve_t_squared(t: torch.Tensor) -> torch.Tensor:
 
 
 class LifetimeTest(expecttest.TestCase):
+    @pytest.mark.compile_xfail(
+        "compiled regions do not retain the eager forward's saved tensor"
+    )
     def test_recompute_policy_does_not_retain_original_saved_tensors_after_forward(
         self,
     ) -> None:
@@ -142,7 +150,7 @@ class LifetimeTest(expecttest.TestCase):
             )(x)
 
         x = torch.tensor([2.0, 3.0], requires_grad=True)
-        y = remat.checkpoint()(checkpoint_body)(x)
+        y = checkpoint_for_test()(checkpoint_body)(x)
 
         saved_ref = original_saved_ref
         self.assertIsNotNone(saved_ref)
@@ -187,7 +195,9 @@ class LifetimeTest(expecttest.TestCase):
         was_enabled = gc.isenabled()
         gc.disable()  # isolate refcount reclamation from cyclic collection
         try:
-            y = remat.checkpoint()(region)(torch.tensor([1.0, 2.0], requires_grad=True))
+            y = checkpoint_for_test()(region)(
+                torch.tensor([1.0, 2.0], requires_grad=True)
+            )
             ref = saved_output_ref
             assert ref is not None
             self.assertIsNotNone(ref())  # graph alive -> saved output still resident
@@ -232,7 +242,7 @@ class LifetimeTest(expecttest.TestCase):
                 )(x)
 
             with remat.saved_tensors_hooks(lambda t: t, lambda t: t):
-                y = remat.checkpoint()(region)(
+                y = checkpoint_for_test()(region)(
                     torch.tensor([1.0, 2.0], requires_grad=True)
                 )
             assert saved_output_ref is not None
@@ -276,7 +286,7 @@ class LifetimeTest(expecttest.TestCase):
                 )(x)
 
             with remat.saved_tensors_hooks(pack, lambda index: stash[cast(int, index)]):
-                y = remat.checkpoint()(region)(
+                y = checkpoint_for_test()(region)(
                     torch.tensor([1.0, 2.0], requires_grad=True)
                 )
             assert saved_output_ref is not None
@@ -284,6 +294,9 @@ class LifetimeTest(expecttest.TestCase):
 
         assert_reclaimed_without_gc(self, make_graph)
 
+    @pytest.mark.compile_xfail(
+        "compiled regions do not expose the eager producer-output lifetime"
+    )
     def test_recompute_chain_does_not_retain_producer_output(
         self,
     ) -> None:
@@ -336,7 +349,7 @@ class LifetimeTest(expecttest.TestCase):
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
 
-        y = remat.checkpoint(
+        y = checkpoint_for_test(
             region_name="inputs",
         )(checkpointed_region)(x)
         y.backward()
@@ -344,6 +357,9 @@ class LifetimeTest(expecttest.TestCase):
         self.assertEqual(2, Producer.runs)
         self.assertTrue(torch.equal(x.grad, torch.tensor([3.0, 3.0])))
 
+    @pytest.mark.compile_xfail(
+        "compiled regions do not expose the eager tape's input retention"
+    )
     def test_recompute_to_save_input_is_not_retained(self) -> None:
         # RECOMPUTE -> SAVE crossing where the SAVE op saves its input for backward.
         # The input is a RECOMPUTE op's output, reproduced during replay, so it must
@@ -398,7 +414,7 @@ class LifetimeTest(expecttest.TestCase):
             )(y)
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
-        out = remat.checkpoint(region_name="r")(region)(x)
+        out = checkpoint_for_test(region_name="r")(region)(x)
 
         ref = producer_output_ref
         assert ref is not None
@@ -463,7 +479,7 @@ class LifetimeTest(expecttest.TestCase):
 
         # And it produces correct gradients end to end.
         x = torch.tensor([1.0, 2.0], requires_grad=True)
-        out = remat.checkpoint(region_name="r")(consumes_save)(x)
+        out = checkpoint_for_test(region_name="r")(consumes_save)(x)
         out.sum().backward()
         # d/dx (3x)^2 = 18x
         self.assertTrue(torch.equal(x.grad, torch.tensor([18.0, 36.0])))
@@ -514,7 +530,7 @@ class LifetimeTest(expecttest.TestCase):
         # And it still round-trips through recompute at backward: each consumer computes
         # 2*(3x) = 6x, so d/dx sum(a+b+c) = 18 per element.
         x = torch.tensor([1.0, 2.0], requires_grad=True)
-        out = remat.checkpoint(region_name="r")(region)(x)
+        out = checkpoint_for_test(region_name="r")(region)(x)
         out.sum().backward()
         self.assertTrue(torch.equal(x.grad, torch.tensor([18.0, 18.0])))
 
@@ -565,6 +581,9 @@ class LifetimeTest(expecttest.TestCase):
         self.assertIsNone(resident_ref())
         self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
 
+    @pytest.mark.compile_xfail(
+        "compiled regions do not expose the eager dead-output lifetime"
+    )
     def test_save_op_dead_output_is_freed_after_forward(self) -> None:
         # A SAVE op output that nothing consumes -- not fed downstream, not saved for
         # backward, not returned as the region output -- must not stay resident from
@@ -596,7 +615,7 @@ class LifetimeTest(expecttest.TestCase):
             return main  # aux is consumed by nothing
 
         x = torch.ones(1024, requires_grad=True)
-        out = remat.checkpoint(region_name="r")(region)(x)
+        out = checkpoint_for_test(region_name="r")(region)(x)
 
         ref = aux_ref
         assert ref is not None
@@ -607,6 +626,7 @@ class LifetimeTest(expecttest.TestCase):
         out.sum().backward()
         self.assertTrue(torch.equal(x.grad, torch.full((1024,), 2.0)))
 
+    @pytest.mark.compile_xfail("compiled regions do not expose eager tensor lifetimes")
     def test_interior_recompute_output_freed_but_escaping_output_retained(
         self,
     ) -> None:
@@ -654,7 +674,7 @@ class LifetimeTest(expecttest.TestCase):
             return remat.region(Stage1.apply, "stage.1", recompute=True)(interior)
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
-        out = remat.checkpoint(region_name="scope")(body)(x)
+        out = checkpoint_for_test(region_name="scope")(body)(x)
 
         ref = interior_ref
         assert ref is not None
@@ -674,6 +694,7 @@ class LifetimeTest(expecttest.TestCase):
         # d/dx sum(x**4) = 4 * x**3
         self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 32.0])))
 
+    @pytest.mark.compile_xfail("compiled regions do not expose eager tensor lifetimes")
     def test_recompute_output_shared_by_save_and_recompute_consumers_is_freed(
         self,
     ) -> None:
@@ -737,7 +758,7 @@ class LifetimeTest(expecttest.TestCase):
             return remat.region(torch.add, "combine", recompute=True)(saved, recomputed)
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
-        out = remat.checkpoint(region_name="scope")(body)(x)
+        out = checkpoint_for_test(region_name="scope")(body)(x)
 
         ref = producer_output_ref
         assert ref is not None
@@ -751,6 +772,7 @@ class LifetimeTest(expecttest.TestCase):
         # out = (2x)**2 + (2x)**3 = 4x**2 + 8x**3; d/dx = 8x + 24x**2
         self.assertTrue(torch.equal(x.grad, torch.tensor([32.0, 112.0])))
 
+    @pytest.mark.compile_xfail("compiled regions do not expose eager tensor lifetimes")
     def test_bare_op_output_is_freed_and_recomputed(self) -> None:
         # A plain op -- not wrapped in remat.region -- inside a checkpoint scope recomputes
         # by default. Its output is consumed by a downstream plain op that saves it for
@@ -792,7 +814,7 @@ class LifetimeTest(expecttest.TestCase):
             return BareConsumer.apply(produced)  # plain consumer
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
-        out = remat.checkpoint(region_name="scope")(body)(x)
+        out = checkpoint_for_test(region_name="scope")(body)(x)
 
         ref = producer_output_ref
         assert ref is not None
@@ -826,7 +848,7 @@ class LifetimeTest(expecttest.TestCase):
 
         base = torch.tensor([0.5, 1.0], dtype=torch.float64)
         x = base.clone().requires_grad_(True)
-        out = remat.checkpoint(region_name="scope")(body)(x)
+        out = checkpoint_for_test(region_name="scope")(body)(x)
 
         assert y_ref is not None and z_ref is not None
         gc.collect()
@@ -843,6 +865,7 @@ class LifetimeTest(expecttest.TestCase):
         # Gradient matches the uncheckpointed reference in every cell.
         self.assertTrue(torch.allclose(x.grad, _ref_grad(_exp_exp_times3, base)))
 
+    @pytest.mark.compile_xfail("compiled regions do not expose eager tensor lifetimes")
     def test_retention_matrix_over_recompute_flags_and_save_roles(self) -> None:
         # Retention across a two-region chain A -> B (plus a trailing RECOMPUTE op so that
         # BOTH A's output and B's output stay *interior* -- consumed downstream, never
@@ -886,7 +909,7 @@ class LifetimeTest(expecttest.TestCase):
 
         base = torch.tensor([1.0, 2.0], dtype=torch.float64)
         x = base.clone().requires_grad_(True)
-        out = remat.checkpoint(region_name="scope")(body)(x)
+        out = checkpoint_for_test(region_name="scope")(body)(x)
 
         assert aux_ref is not None and w_ref is not None
         gc.collect()
@@ -901,6 +924,7 @@ class LifetimeTest(expecttest.TestCase):
         self.assertEqual(2, producer.runs)  # the producer reran to reproduce w
         self.assertTrue(torch.allclose(x.grad, _ref_grad(_twelve_t_squared, base)))
 
+    @pytest.mark.compile_xfail("compiled regions do not expose eager tensor lifetimes")
     def test_save_role_retention_taxonomy_is_per_tensor(self) -> None:
         # Orthogonality: within a SINGLE op, each saved/produced tensor's fate is decided
         # by its own role, independent of the others. One op saves an internal AND its own
