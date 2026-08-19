@@ -68,13 +68,27 @@ def pytest_runtest_makereport(
     item: pytest.Item, call: pytest.CallInfo[None]
 ) -> Generator[None, None, None]:
     outcome = yield
+    report = outcome.get_result()
+    if (
+        IS_COMPILE_TEST
+        and call.when == "call"
+        and report.outcome == "skipped"
+        and hasattr(report, "wasxfail")
+    ):
+        # TPX currently reports pytest xfails as skips, which opens test-health
+        # issues for this intentionally strict expected-failure catalogue. Pytest
+        # has already verified that the test failed here; a strict unexpected pass
+        # has outcome "failed" and remains a failure.
+        report.outcome = "passed"
+        report.longrepr = None
+        delattr(report, "wasxfail")
+        return
     if _HAS_PLACEHOLDER_PRIMITIVES or call.when != "call" or call.excinfo is None:
         return
     exc = call.excinfo.value
     if isinstance(exc, AttributeError) and any(
         name in str(exc) for name in _PLACEHOLDER_PRIMITIVES
     ):
-        report = outcome.get_result()
         report.outcome = "skipped"
         report.wasxfail = (
             "torch build lacks the null-storage placeholder primitives "
