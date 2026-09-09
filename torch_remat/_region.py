@@ -27,7 +27,7 @@ import weakref
 from dataclasses import dataclass, field
 from enum import Enum
 from types import TracebackType
-from typing import Any, Callable, Protocol, runtime_checkable, TYPE_CHECKING
+from typing import Any, Callable, Iterator, Protocol, runtime_checkable, TYPE_CHECKING
 
 import torch
 from torch.multiprocessing.reductions import StorageWeakRef
@@ -157,6 +157,43 @@ _state: contextvars.ContextVar[_ActiveCheckpointRegion | None] = contextvars.Con
     "torch_remat_state",
     default=None,
 )
+
+_name_scope: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
+    "torch_remat_name_scope",
+    default=(),
+)
+
+
+@contextlib.contextmanager
+def name_scope(prefix: str) -> Iterator[None]:
+    """Qualify region names invoked within this context.
+
+    Scopes are task-local and nest by joining non-empty prefixes with ``.``.
+    The scope must be entered from the checkpoint body so the same qualified
+    names are produced during the original forward and recomputation.
+    Scopes are ignored under ``torch.compile``, where compiled remat does not use
+    eager diagnostic names.
+    """
+
+    if not isinstance(prefix, str):
+        raise RuntimeError("torch_remat name scope prefix must be a string")
+    if not prefix:
+        raise ValueError("torch_remat name scope prefix must be non-empty")
+    if torch.compiler.is_compiling():
+        yield
+        return
+    token = _name_scope.set((*_name_scope.get(), prefix))
+    try:
+        yield
+    finally:
+        _name_scope.reset(token)
+
+
+def _qualified_name(name: str) -> str:
+    prefixes = _name_scope.get()
+    if not prefixes:
+        return name
+    return ".".join((*prefixes, name))
 
 
 # Weak registry of checkpoint regions whose forward has run and whose backward graph is

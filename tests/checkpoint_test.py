@@ -28,6 +28,86 @@ from torch_remat._region import _checkpoint_context_fn
 
 
 class CheckpointTest(expecttest.TestCase):
+    @pytest.mark.compile_xfail("compiled regions do not populate collect_trace")
+    def test_name_scope_qualifies_region_identity_and_trace(self) -> None:
+        def body(x: torch.Tensor) -> torch.Tensor:
+            with remat.name_scope("left"):
+                left = remat.region(torch.sin, "activation", recompute=True)(x)
+            with remat.name_scope("right"):
+                right = remat.region(torch.cos, "activation", recompute=True)(x)
+            return left + right
+
+        x = torch.tensor([1.0, 2.0], requires_grad=True)
+        with remat.collect_trace() as trace:
+            y = checkpoint_for_test(region_name="scope.test")(body)(x)
+            y.sum().backward()
+
+        self.assertExpectedInline(
+            trace.format(),
+            """\
+torch_remat trace
+left.activation: recompute
+right.activation: recompute""",
+        )
+
+    @pytest.mark.compile_xfail("compiled regions do not populate collect_trace")
+    def test_name_scope_nests_and_unwinds_after_exception(self) -> None:
+        def body(x: torch.Tensor) -> torch.Tensor:
+            with remat.name_scope("outer"):
+                with remat.name_scope("inner"):
+                    nested = remat.region(torch.sin, "op", recompute=True)(x)
+            try:
+                with remat.name_scope("failed"):
+                    raise RuntimeError("expected")
+            except RuntimeError:
+                pass
+            plain = remat.region(torch.cos, "op", recompute=True)(x)
+            return nested + plain
+
+        x = torch.tensor([1.0, 2.0], requires_grad=True)
+        with remat.collect_trace() as trace:
+            checkpoint_for_test()(body)(x).sum().backward()
+
+        self.assertExpectedInline(
+            trace.format(),
+            """\
+torch_remat trace
+outer.inner.op: recompute
+op: recompute""",
+        )
+
+    def test_name_scope_rejects_invalid_prefix(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be non-empty"):
+            with remat.name_scope(""):
+                pass
+        with self.assertRaisesRegex(RuntimeError, "must be a string"):
+            with remat.name_scope(1):  # type: ignore[arg-type]
+                pass
+
+    def test_name_scope_compiles_transparently(self) -> None:
+        def body(x: torch.Tensor) -> torch.Tensor:
+            with remat.name_scope("layer.0"):
+                saved = remat.region(torch.sin, "saved", recompute=False)(x)
+                with remat.name_scope("inner"):
+                    recomputed = remat.region(torch.cos, "recomputed", recompute=True)(
+                        saved
+                    )
+            return saved + recomputed
+
+        x = torch.tensor([1.0, 2.0], requires_grad=True)
+        reference_x = x.detach().clone().requires_grad_()
+
+        actual = checkpoint_for_test()(body)(x)
+        reference_saved = torch.sin(reference_x)
+        expected = reference_saved + torch.cos(reference_saved)
+        torch.testing.assert_close(actual, expected)
+
+        actual.sum().backward()
+        expected.sum().backward()
+        assert x.grad is not None
+        assert reference_x.grad is not None
+        torch.testing.assert_close(x.grad, reference_x.grad)
+
     @pytest.mark.compile_xfail("saved-tensor hooks are unsupported under torch.compile")
     def test_checkpoint_preserves_outer_saved_tensors_hooks(self) -> None:
         packed: list[torch.Tensor] = []

@@ -67,6 +67,7 @@ from torch_remat._region import (
     _CheckpointRegionState,
     _display_name,
     _Phase,
+    _qualified_name,
     _save_output_persist,
     _state,
     PersistOutputThunk,
@@ -429,10 +430,11 @@ def region(
         # Running inert lets the inner op's saves ride the enclosing region's hooks
         # like any other tensor in its body. A nested recompute=True region cannot be
         # honored (the enclosing SAVE never recomputes), so it is a configuration error.
+        effective_name = _qualified_name(name)
         if _active_save_op.get() is not None:
             if recompute:
                 raise RuntimeError(
-                    f"remat.region {name!r} was called with recompute=True while "
+                    f"remat.region {effective_name!r} was called with recompute=True while "
                     "nested inside a recompute=False (SAVE) region. The enclosing "
                     "SAVE region is never recomputed, so the inner recompute cannot "
                     "be honored. Set the inner region to recompute=False, or make "
@@ -440,29 +442,32 @@ def region(
                 )
             return function(*args, **kwargs)
 
-        _record_trace_op(name, recompute=recompute)
+        _record_trace_op(effective_name, recompute=recompute)
 
         # Record this region invocation in the current phase, rejecting duplicates.
-        if name in state.claimed_names:
+        if effective_name in state.claimed_names:
             raise RuntimeError(
                 f"Duplicate torch_remat region name "
-                f"{_display_name(state.region_state, name)} during "
+                f"{_display_name(state.region_state, effective_name)} during "
                 f"{state.phase.name.lower()}"
             )
-        state.claimed_names.add(name)
+        state.claimed_names.add(effective_name)
 
         if not recompute:
             return cast(
                 _R,
                 _run_save_op(
                     state,
-                    name,
+                    effective_name,
                     function,
                     args,
                     kwargs,
                 ),
             )
-        return cast(_R, _run_recompute_op(state, name, function, args, kwargs))
+        return cast(
+            _R,
+            _run_recompute_op(state, effective_name, function, args, kwargs),
+        )
 
     return wrapper
 
