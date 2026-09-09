@@ -321,6 +321,61 @@ class OpBasicsTest(expecttest.TestCase):
         ):
             checkpoint_for_test()(checkpoint_body)(torch.ones(1, requires_grad=True))
 
+    def test_name_scope_disambiguates_repeated_sub_blocks(self) -> None:
+        # A checkpoint body that runs one sub-block twice reuses its region names.
+        # Distinct name scopes per repetition make the names unique, both on the
+        # forward and on the recompute (the body re-enters the scopes itself).
+        square_calls: list[int] = []
+
+        def square(t: torch.Tensor) -> torch.Tensor:
+            if not IS_COMPILE_TEST:
+                square_calls.append(1)
+            return t * t
+
+        def sub_block(t: torch.Tensor) -> torch.Tensor:
+            y = remat.region(square, "square", recompute=False)(t)
+            return remat.region(torch.sin, "sin", recompute=True)(y)
+
+        def scoped_body(t: torch.Tensor) -> torch.Tensor:
+            for index in range(2):
+                with remat.name_scope(f"block.{index}"):
+                    t = sub_block(t)
+            return t
+
+        def unscoped_body(t: torch.Tensor) -> torch.Tensor:
+            for _ in range(2):
+                t = sub_block(t)
+            return t
+
+        x = torch.linspace(-1.0, 1.0, 5, requires_grad=True)
+        with remat.collect_trace() as trace:
+            out = checkpoint_for_test()(scoped_body)(x)
+        out.sum().backward()
+
+        reference_x = x.detach().clone().requires_grad_()
+        reference = torch.sin(torch.sin(reference_x * reference_x) ** 2)
+        reference.sum().backward()
+        self.assertTrue(torch.allclose(out, reference))
+        assert x.grad is not None and reference_x.grad is not None
+        self.assertTrue(torch.allclose(x.grad, reference_x.grad))
+        # SAVE regions are skipped on recompute: each square ran exactly once.
+        if not IS_COMPILE_TEST:
+            self.assertEqual(len(square_calls), 2)
+            names = [
+                entry.name for entry in trace.entries if hasattr(entry, "recompute")
+            ]
+            self.assertEqual(
+                names,
+                ["block.0/square", "block.0/sin", "block.1/square", "block.1/sin"],
+            )
+
+        if not IS_COMPILE_TEST:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Duplicate torch_remat region name.*during forward",
+            ):
+                checkpoint_for_test()(unscoped_body)(torch.ones(1, requires_grad=True))
+
     def test_identity_node_rejects_backprop(self) -> None:
         # _MakeNonLeaf is fabricated only during recompute to reshape autograd
         # metadata, and non-reentrant checkpoint discards that graph -- so its

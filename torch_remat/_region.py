@@ -166,9 +166,19 @@ _name_scope: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
 
 @contextlib.contextmanager
 def name_scope(prefix: str) -> Iterator[None]:
-    """Qualify region names invoked within this context.
+    """Prefix region names invoked within this context with ``prefix/``.
 
-    Scopes are task-local and nest by joining non-empty prefixes with ``.``.
+    Region names must be unique within one checkpoint. When a checkpoint body
+    invokes the same sub-block repeatedly, enter a distinct scope for each
+    invocation::
+
+        def body(x):
+            for index, block in enumerate(blocks):
+                with remat.name_scope(f"block.{index}"):
+                    x = block(x)
+            return x
+
+    Scopes are task-local and nest by joining non-empty prefixes with ``/``.
     The scope must be entered from the checkpoint body so the same qualified
     names are produced during the original forward and recomputation.
     Scopes are ignored under ``torch.compile``, where compiled remat does not use
@@ -193,7 +203,7 @@ def _qualified_name(name: str) -> str:
     prefixes = _name_scope.get()
     if not prefixes:
         return name
-    return ".".join((*prefixes, name))
+    return "/".join((*prefixes, name))
 
 
 # Weak registry of checkpoint regions whose forward has run and whose backward graph is

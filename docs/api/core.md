@@ -11,6 +11,8 @@
 ```{eval-rst}
 .. autofunction:: torch_remat.region
 
+.. autofunction:: torch_remat.name_scope
+
 .. autofunction:: torch_remat.recompute_needs_tensor
 
 .. autofunction:: torch_remat.save_for_backward

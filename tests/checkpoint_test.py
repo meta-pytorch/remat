@@ -46,8 +46,8 @@ class CheckpointTest(expecttest.TestCase):
             trace.format(),
             """\
 torch_remat trace
-left.activation: recompute
-right.activation: recompute""",
+left/activation: recompute
+right/activation: recompute""",
         )
 
     @pytest.mark.compile_xfail("compiled regions do not populate collect_trace")
@@ -72,7 +72,7 @@ right.activation: recompute""",
             trace.format(),
             """\
 torch_remat trace
-outer.inner.op: recompute
+outer/inner/op: recompute
 op: recompute""",
         )
 
