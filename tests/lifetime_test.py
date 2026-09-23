@@ -474,7 +474,6 @@ class LifetimeTest(expecttest.TestCase):
             self.assertEqual([], list(consumer_record.saved_input_recipes))
             self.assertEqual([], list(consumer_record.output_slots))
             self.assertEqual(1, len(consumer_record.saved_tensor_names))
-            self.assertEqual({}, active.region_state.rederived_saved_inputs)
             del out
 
         # And it produces correct gradients end to end.
@@ -575,9 +574,9 @@ class LifetimeTest(expecttest.TestCase):
         self.assertIsNotNone(resident_ref())
 
         y.sum().backward()
-        del y
         gc.collect()
-        # Freed by autograd after a normal (non-retain_graph) backward; no pop.
+        # Freed by autograd after a normal (non-retain_graph) backward even while
+        # the consumed graph's output (and therefore its grad_fn) remains reachable.
         self.assertIsNone(resident_ref())
         self.assertTrue(torch.equal(x.grad, torch.tensor([4.0, 6.0])))
 
@@ -954,3 +953,170 @@ scope::op: 16 B
   + 1 save rebuilt on recompute, not resident""",
             )
             del held
+
+    def test_rederived_saved_inputs_are_released_after_each_backward(self) -> None:
+        saved_input_refs: list[weakref.ReferenceType[Any]] = []
+        producer_runs = 0
+
+        class SaveInput(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx: Any, value: torch.Tensor) -> torch.Tensor:
+                ctx.save_for_backward(value)
+                return value * value
+
+            @staticmethod
+            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+                (value,) = ctx.saved_tensors
+                return grad_output * 2 * value
+
+        def producer(value: torch.Tensor) -> torch.Tensor:
+            nonlocal producer_runs
+            producer_runs += 1
+            return value * 3
+
+        def body(value: torch.Tensor) -> torch.Tensor:
+            produced = remat.region(producer, "producer", recompute=True)(value)
+            result = remat.region(SaveInput.apply, "consumer", recompute=False)(
+                produced
+            )
+            if not remat.is_recomputing():
+                active = _state.get()
+                assert active is not None
+                recipe = active.region_state.records["consumer"].saved_input_recipes[0]
+                saved_input_refs.append(recipe.packed_ref)
+            return result
+
+        x = torch.tensor([1.0, 2.0], requires_grad=True)
+        out = remat.checkpoint(region_name="scope")(body)(x)
+        saved_input = saved_input_refs[0]()
+        self.assertIsNotNone(saved_input)
+        assert saved_input is not None
+
+        out.sum().backward(retain_graph=True)
+        self.assertIsNone(saved_input.value)
+        self.assertTrue(torch.equal(x.grad, torch.tensor([18.0, 36.0])))
+
+        x.grad = None
+        out.sum().backward()
+        self.assertIsNone(saved_input.value)
+        self.assertTrue(torch.equal(x.grad, torch.tensor([18.0, 36.0])))
+        self.assertEqual(3, producer_runs)
+
+    def test_rederived_non_grad_input_is_released_after_consumer(self) -> None:
+        saved_input_refs: list[weakref.ReferenceType[Any]] = []
+        released_before_upstream: list[bool] = []
+
+        class ObserveAfterConsumer(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx: Any, value: torch.Tensor) -> torch.Tensor:
+                del ctx
+                return value
+
+            @staticmethod
+            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+                del ctx
+                released_before_upstream.append(saved_input_refs[0]() is None)
+                return grad_output
+
+        class SaveNonGradInput(torch.autograd.Function):
+            @staticmethod
+            def forward(
+                ctx: Any, value: torch.Tensor, saved: torch.Tensor
+            ) -> torch.Tensor:
+                ctx.save_for_backward(saved)
+                return value * saved
+
+            @staticmethod
+            def backward(
+                ctx: Any, grad_output: torch.Tensor
+            ) -> tuple[torch.Tensor, None]:
+                (saved,) = ctx.saved_tensors
+                return grad_output * saved, None
+
+        def body(value: torch.Tensor) -> torch.Tensor:
+            observed = ObserveAfterConsumer.apply(value)
+            saved = remat.region(
+                lambda tensor: tensor.detach() * 3,
+                "producer",
+                recompute=True,
+            )(value)
+            result = remat.region(
+                SaveNonGradInput.apply,
+                "consumer",
+                recompute=False,
+            )(observed, saved)
+            if not remat.is_recomputing():
+                active = _state.get()
+                assert active is not None
+                recipe = active.region_state.records["consumer"].saved_input_recipes[0]
+                saved_input_refs.append(recipe.packed_ref)
+            return result
+
+        x = torch.tensor([1.0, 2.0], requires_grad=True)
+        out = remat.checkpoint(region_name="scope")(body)(x)
+        out.sum().backward()
+
+        self.assertEqual([True], released_before_upstream)
+        self.assertTrue(torch.equal(x.grad, torch.tensor([3.0, 6.0])))
+
+    def test_rederived_saved_input_unread_by_failed_backward_dies_with_graph(
+        self,
+    ) -> None:
+        saved_input_refs: list[weakref.ReferenceType[Any]] = []
+
+        class RaiseInBackward(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx: Any, value: torch.Tensor) -> torch.Tensor:
+                ctx.save_for_backward(value)
+                return value * value
+
+            @staticmethod
+            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+                del ctx, grad_output
+                raise RuntimeError("backward failed")
+
+        def body(value: torch.Tensor) -> torch.Tensor:
+            produced = remat.region(lambda t: t * 3, "producer", recompute=True)(value)
+            result = remat.region(RaiseInBackward.apply, "consumer", recompute=False)(
+                produced
+            )
+            if not remat.is_recomputing():
+                active = _state.get()
+                assert active is not None
+                recipe = active.region_state.records["consumer"].saved_input_recipes[0]
+                saved_input_refs.append(recipe.packed_ref)
+            return result
+
+        x = torch.tensor([1.0, 2.0], requires_grad=True)
+        out = remat.checkpoint(region_name="scope")(body)(x)
+
+        with self.assertRaisesRegex(RuntimeError, "backward failed"):
+            out.sum().backward(retain_graph=True)
+
+        del out
+        gc.collect()
+        self.assertIsNone(saved_input_refs[0]())
+
+    def test_rederived_saved_input_unpacked_twice_raises(self) -> None:
+        class ReadSavedTwice(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx: Any, value: torch.Tensor) -> torch.Tensor:
+                ctx.save_for_backward(value)
+                return value * value
+
+            @staticmethod
+            def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+                (value,) = ctx.saved_tensors
+                ctx.saved_tensors
+                return grad_output * 2 * value
+
+        def body(value: torch.Tensor) -> torch.Tensor:
+            produced = remat.region(lambda t: t * 3, "producer", recompute=True)(value)
+            return remat.region(ReadSavedTwice.apply, "consumer", recompute=False)(
+                produced
+            )
+
+        x = torch.tensor([1.0, 2.0], requires_grad=True)
+        out = remat.checkpoint(region_name="scope")(body)(x)
+        with self.assertRaisesRegex(RuntimeError, "already unpacked once"):
+            out.sum().backward()

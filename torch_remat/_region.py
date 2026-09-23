@@ -121,15 +121,6 @@ class _CheckpointRegionState:
         default_factory=dict
     )
 
-    # Recompute-scoped buffer of materialized saved-input values, keyed op_name ->
-    # {slot_name: tensor}. Empty during the forward; a skipped SAVE op's replay fills
-    # its entry (``_rederive_saved_inputs``) and the op's unpack hook reads it
-    # (``_load_saved_input``). Each op's entry is fully replaced per replay, so a
-    # ``retain_graph`` backward gets fresh values.
-    rederived_saved_inputs: dict[str, dict[str, torch.Tensor]] = field(
-        default_factory=dict
-    )
-
     # Snapshot/restore hooks for external state (e.g. an RNG op-counter) kept aligned
     # across recompute. Registered via ``checkpoint(..., recompute_state_hooks=...)``;
     # see :class:`RecomputeStateHook`. Empty when none are registered.

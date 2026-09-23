@@ -1021,15 +1021,17 @@ def _run_save_op(
             info, view_spec = match
             if view_spec is not None or not info.is_stub:
                 slot_name = f"saved_input.{len(record.saved_input_recipes)}"
+                saved_input_ref = _SavedInputRef(slot_name)
                 record.saved_input_recipes.append(
                     _SavedInputRecipe(
                         path=info.path,
                         slot_name=slot_name,
+                        packed_ref=weakref.ref(saved_input_ref),
                         view_spec=view_spec,
                         name=name,
                     )
                 )
-                return _SavedInputRef(slot_name)
+                return saved_input_ref
 
         # Preserved user saved-tensor hooks: autograd holds the packed payload (the
         # original tensor may be dropped, e.g. offloaded). No version check and no
@@ -1056,7 +1058,7 @@ def _run_save_op(
 
     def unpack(saved: object) -> torch.Tensor:
         if isinstance(saved, _SavedInputRef):
-            return _load_saved_input(record, region_state, saved.slot_name)
+            return _load_saved_input(record, region_state, saved)
         if isinstance(saved, _SavedHookData):
             # Restore via the pair that packed it -- works even after the user's
             # hook scope has exited.
@@ -1405,8 +1407,10 @@ def _rederive_saved_inputs(
     _assert_phase(_Phase.RECOMPUTE)
 
     leaves_by_path = dict(iter_arg_leaves(args, kwargs))
-    captured_slots: dict[str, torch.Tensor] = {}
     for recipe in record.saved_input_recipes:
+        saved_input = recipe.packed_ref()
+        if saved_input is None:
+            continue
         captured = leaves_by_path[recipe.path]
         if _is_placeholder(captured):
             raise RuntimeError(
@@ -1423,9 +1427,7 @@ def _rederive_saved_inputs(
             value = _rebuild_saved_view(
                 region_state, record.op_name, captured, recipe.view_spec
             )
-        captured_slots[recipe.slot_name] = value
-    # Replace the op's whole entry so a re-replay (retain_graph) starts from fresh values.
-    region_state.rederived_saved_inputs[record.op_name] = captured_slots
+        saved_input.value = value
 
 
 def _load_saved_outputs(
@@ -1542,26 +1544,25 @@ def _load_output_slot(
 def _load_saved_input(
     record: _SaveRecord,
     region_state: _CheckpointRegionState,
-    slot_name: str,
+    saved_input: _SavedInputRef,
 ) -> torch.Tensor:
     """Return a saved input's recompute-materialized value for the op's unpack hook.
 
-    :func:`_rederive_saved_inputs` filled the region's recompute buffer when replay
-    reached the skipped op; a missing entry means replay never reached it. Not popped:
-    it may back more than one saved-tensor reference, and is rebuilt each replay
-    under ``retain_graph``.
+    :func:`_rederive_saved_inputs` wrote the value onto this autograd-owned pack
+    payload when replay reached the skipped op. Like ``torch.utils.checkpoint``, it
+    is handed out once: clearing it on load keeps it from staying resident under
+    ``retain_graph``, and the next replay refills it.
     """
 
-    slots = region_state.rederived_saved_inputs.get(record.op_name)
-    tensor = slots.get(slot_name) if slots is not None else None
+    tensor = saved_input.value
     if tensor is None:
-        saved_names = ", ".join(slots) if slots else "(none)"
         raise RuntimeError(
-            f"No saved input {slot_name} for "
-            f"{_display_name(region_state, record.op_name)} "
-            f"(saved inputs: {saved_names}). "
-            "This usually means forward and recompute followed different code paths."
+            f"No saved input {saved_input.slot_name} for "
+            f"{_display_name(region_state, record.op_name)}. Either it was already "
+            "unpacked once in this backward (read ctx.saved_tensors only once), or "
+            "forward and recompute followed different code paths."
         )
+    saved_input.value = None
     return tensor
 
 

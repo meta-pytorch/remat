@@ -134,20 +134,27 @@ class _SavedTensor:
     version: int
 
 
-@dataclass(frozen=True)
+@dataclass(eq=False)
 class _SavedInputRef:
-    """Autograd-held pack payload for a SAVE op's saved *input* that replay reproduces.
+    """What autograd stores in place of a saved input that recompute can rebuild.
 
-    A recompute-sourced tensor that crosses into a SAVE op from outside and is saved
-    for backward is not retained on the identity hook: pack returns this ref instead of
-    the tensor, and unpack resolves the value from the op's tape slot, which
-    :func:`_rederive_saved_inputs` fills during recompute. This is what lets a
-    RECOMPUTE->SAVE crossing avoid keeping the recompute output resident. (A
-    SAVE-sourced stub input, which replay does not reproduce, is retained like any other
-    save rather than diverted here.)
+    Suppose a ``recompute=False`` region saves one of its inputs (or a view of it) for
+    backward, and that input came from a ``recompute=True`` region. Keeping the tensor
+    would defeat the point of recomputing its producer, so the pack hook returns one of
+    these instead. During backward, replay rebuilds the tensor and stores it in
+    ``value`` (see :func:`_rederive_saved_inputs`). The unpack hook returns it and
+    clears ``value``, so each rebuild is handed out once.
+
+    Autograd owns this object as the consumer's saved tensor, so it, and any value on
+    it, is freed when autograd frees that node's saved tensors. The checkpoint region
+    keeps only a weak reference to it.
+
+    An input that came from another ``recompute=False`` region is not handled this
+    way: replay doesn't rebuild it, so it is saved normally.
     """
 
     slot_name: str
+    value: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -190,10 +197,18 @@ class _SavedInputRecipe(_InputReplay):
     input rather than retained -- the whole point of diverting.
     """
 
-    # Tape-buffer key (``saved_input.<i>``); the same string rides the autograd pack
+    # Saved-input key (``saved_input.<i>``); the same string rides the autograd pack
     # payload (:class:`_SavedInputRef`), and is what links forward to recompute --
     # this entry's list position is not load-bearing.
     slot_name: str
+    # Weak link to the pack payload, which the consumer's SavedVariable owns: it dies
+    # when autograd releases that node's saved tensors (after its backward without
+    # retain_graph, or when the graph is dropped). Replay writes the rederived value
+    # there without making the durable region tape own it, and skips a dead payload.
+    packed_ref: weakref.ReferenceType[_SavedInputRef]
+    # ``None`` reconstructs the input itself (detached); a :class:`_ViewSpec` rebuilds
+    # a saved view of it with ``as_strided``.
+    view_spec: _ViewSpec | None
     # Report name (diagnostics only; the value is fetched via ``slot_name``).
     name: str
 
