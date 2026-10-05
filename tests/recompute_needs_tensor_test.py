@@ -17,6 +17,7 @@ the output, resolved by storage) still triggers the save automatically."""
 
 from __future__ import annotations
 
+import importlib.util
 from typing import Callable
 
 import expecttest
@@ -158,6 +159,60 @@ To fix it, call remat.recompute_needs_tensor(t) on the output tensor, right befo
         # d/dx (2x * 3) = 6.
         # pyrefly: ignore[bad-argument-type]
         self.assertTrue(torch.allclose(x.grad, _ref_grad(reference, x)))
+
+    @pytest.mark.skipif(
+        importlib.util.find_spec("spmd_types") is None, reason="needs spmd_types"
+    )
+    def test_persist_of_local_typed_save_output_from_global_consumer(self) -> None:
+        # Mirrors a projection module under SPMD type checking: its body runs as a
+        # spmd local_map (local types inside, global types stamped on what it
+        # returns), a SAVE region wraps the matmul, and the body returns a reshaped
+        # view of the matmul output. The globally typed caller unbinds that view and
+        # feeds a RECOMPUTE region, which persists the matmul output by storage. The
+        # persisted tensor is the region output itself, which still carries its
+        # local type (Varying, no PartitionSpec), so the persist's detach must not
+        # be type checked in the caller's global scope.
+        import spmd_types as spmd  # pyrefly: ignore[missing-import]
+        import torch.distributed as dist
+        from spmd_types.checker import typecheck  # pyrefly: ignore[missing-import]
+        from torch.testing._internal.distributed.fake_pg import FakeStore
+
+        dist.init_process_group("fake", rank=0, world_size=2, store=FakeStore())
+        try:
+            pg = dist.group.WORLD
+            assert pg is not None
+
+            @spmd.local_map(out_types={pg: spmd.S(0)})
+            def project(x_TD: torch.Tensor, w_DF: torch.Tensor) -> torch.Tensor:
+                y_TF = remat.region(torch.matmul, "linear", recompute=False)(x_TD, w_DF)
+                return y_TF.unflatten(-1, (2, -1))
+
+            def swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+                return torch.nn.functional.silu(gate) * up
+
+            def block(x_TD: torch.Tensor, w_DF: torch.Tensor) -> torch.Tensor:
+                gate, up = project(x_TD, w_DF).unbind(-2)
+                return remat.region(swiglu, "activation", recompute=True)(gate, up)
+
+            x_TD = torch.randn(8, 4, requires_grad=True)
+            w_DF = torch.randn(4, 6, requires_grad=True)
+            with typecheck(local=False):
+                spmd.assert_type(x_TD, {pg: spmd.S(0)})
+                spmd.assert_type(w_DF, {pg: spmd.R})
+                out = checkpoint_for_test(region_name="block")(block)(x_TD, w_DF)
+            # Types describe forward behavior; backward runs unchecked.
+            out.sum().backward()
+
+            x_ref = x_TD.detach().requires_grad_(True)
+            w_ref = w_DF.detach().requires_grad_(True)
+            gate_ref, up_ref = (x_ref @ w_ref).unflatten(-1, (2, -1)).unbind(-2)
+            swiglu(gate_ref, up_ref).sum().backward()
+            # pyrefly: ignore[bad-argument-type]
+            self.assertTrue(torch.allclose(x_TD.grad, x_ref.grad))
+            # pyrefly: ignore[bad-argument-type]
+            self.assertTrue(torch.allclose(w_DF.grad, w_ref.grad))
+        finally:
+            dist.destroy_process_group()
 
     def test_recompute_needs_tensor_is_a_noop_with_recompute_true(self) -> None:
         # A recompute=True region reruns during recompute, so its output is always real --

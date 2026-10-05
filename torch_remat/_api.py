@@ -28,8 +28,10 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import importlib.util
 import weakref
 from collections.abc import Mapping, MutableMapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field, replace
 from functools import wraps
 from typing import (
@@ -93,6 +95,17 @@ from torch_remat._view import (
     _classify_saved_input,
     _rebuild_saved_view,
 )
+
+# Optional: when spmd_types is installed, its type checker can be paused around
+# remat's own bookkeeping ops (see _PersistOutputThunk).
+if importlib.util.find_spec("spmd_types") is not None:
+    import spmd_types  # pyrefly: ignore[missing-import]
+
+    _no_spmd_typecheck: Callable[[], AbstractContextManager[None]] = (
+        spmd_types.no_typecheck
+    )
+else:
+    _no_spmd_typecheck = contextlib.nullcontext
 
 # A remat-aware op call returns a tensor, or a flat tuple or list whose leaves are
 # tensors or None -- the shapes autograd.Function.apply and native ops commonly
@@ -1334,7 +1347,12 @@ class _PersistOutputThunk:
         real = self.output_ref()
         if real is None:
             return
-        detached = real.detach()
+        # The consumer that fires this can run in a different SPMD typing scope than
+        # the producer: e.g. the output was made inside a local_map body (local types)
+        # and is read by a globally typed consumer through a view the body returned.
+        # This detach only snapshots the value for replay, so skip type checking it.
+        with _no_spmd_typecheck():
+            detached = real.detach()
         if self.hooks is not None:
             # Bind the matching unpack hook to the slot so replay reloads via the pair
             # that packed it, not whatever hooks are active at load time. Pack against the
