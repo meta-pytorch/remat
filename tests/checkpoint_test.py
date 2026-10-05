@@ -23,7 +23,10 @@ import pytest
 import torch
 import torch_remat as remat
 from remat_test_helpers import checkpoint_for_test  # pyrefly: ignore[missing-import]
-from torch_remat._recompute_boundary import _checkpoint_recompute_boundary
+from torch_remat._recompute_boundary import (
+    _checkpoint_recompute_boundary,
+    _new_replay_anchor,
+)
 from torch_remat._region import _checkpoint_context_fn
 
 
@@ -372,7 +375,6 @@ inner_backward_after_unpack""",
         packed_numels: list[int] = []
         packed_nbytes: list[int] = []
         unpacked_numels: list[int] = []
-        unpacked_nbytes: list[int] = []
 
         def pack_hook(tensor: torch.Tensor) -> torch.Tensor:
             packed_numels.append(tensor.numel())
@@ -381,7 +383,6 @@ inner_backward_after_unpack""",
 
         def unpack_hook(tensor: torch.Tensor) -> torch.Tensor:
             unpacked_numels.append(tensor.numel())
-            unpacked_nbytes.append(tensor.untyped_storage().nbytes())
             return tensor
 
         x = torch.ones(1024, requires_grad=True)
@@ -389,15 +390,17 @@ inner_backward_after_unpack""",
         self.assertGreater(output.untyped_storage().nbytes(), 0)
 
         with torch.autograd.graph.saved_tensors_hooks(pack_hook, unpack_hook):
-            y = _checkpoint_recompute_boundary(output)
-            y.sum().backward()
+            # The anchor saves the only (zero-element) tensor; two boundaries share
+            # it and the backward unpacks it once.
+            anchor = _new_replay_anchor(x.device)
+            y, z = _checkpoint_recompute_boundary((output, output * 2), anchor)
+            (y.sum() + z.sum()).backward()
 
         self.assertEqual([0], packed_numels)
         self.assertEqual([0], packed_nbytes)
         self.assertEqual([0], unpacked_numels)
-        self.assertEqual([0], unpacked_nbytes)
         # pyrefly: ignore[bad-argument-type]
-        self.assertTrue(torch.equal(x.grad, torch.full_like(x, 3)))
+        self.assertTrue(torch.equal(x.grad, torch.full_like(x, 9)))
 
     @pytest.mark.compile_xfail("compile uses Dynamo's output pytree handling")
     def test_checkpoint_boundary_rejects_non_tensor_leaf(self) -> None:

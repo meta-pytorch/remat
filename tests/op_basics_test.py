@@ -21,6 +21,7 @@ import pytest
 import torch
 import torch_remat as remat
 from remat_test_helpers import (  # pyrefly: ignore[missing-import]
+    replay_to_end,
     checkpoint_for_test,
     IS_COMPILE_TEST,
 )
@@ -181,7 +182,7 @@ class OpBasicsTest(expecttest.TestCase):
             )(x)
             if not IS_COMPILE_TEST:
                 seen_optional_outputs.append(optional)
-            return y
+            return replay_to_end(y)
 
         x = torch.tensor([2.0, 3.0], requires_grad=True)
         y = checkpoint_for_test()(checkpoint_body)(x)

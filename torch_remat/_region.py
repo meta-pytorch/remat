@@ -131,6 +131,21 @@ class _CheckpointRegionState:
     # Filled when the FORWARD phase context is entered.
     entry_snapshots: tuple[Any, ...] = ()
 
+    # Device of the checkpointed function's first tensor input, where the replay
+    # anchor and markers save their zero-element tensors (see _recompute_boundary).
+    replay_device: Any = None
+
+    # Weak reference to PyTorch checkpoint's frame for this region, captured on the
+    # forward. Its holder count is the number of checkpoint packs so far, which is
+    # where early-stopped replay ends.
+    checkpoint_frame: Any = None
+
+    # (record, output slot index, checkpoint pack count) for each SAVE output
+    # persisted on the forward by a consumer. A persist after the last pack is
+    # dropped at the end of the forward: early-stopped replay never reaches its
+    # consumer.
+    persist_pack_counts: list[tuple[Any, int, int]] = field(default_factory=list)
+
 
 @dataclass(frozen=True)
 class _ActiveCheckpointRegion:

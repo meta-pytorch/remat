@@ -49,6 +49,19 @@ def checkpoint_for_test(
     return decorate_for_test
 
 
+def replay_to_end(tensor: torch.Tensor) -> torch.Tensor:
+    """Return ``tensor`` unchanged through an op that saves tensors for backward.
+
+    Checkpoint's early stop ends replay at the last op that saves something, so a
+    test that asserts on replay of the ops before it ends its body with this. Under
+    the compile target, where tests do not assert on replay, it is the identity.
+    """
+
+    if IS_COMPILE_TEST:
+        return tensor
+    return tensor * torch.ones_like(tensor, requires_grad=True)
+
+
 def _numel(shape: tuple[int, ...]) -> int:
     numel = 1
     for size in shape:

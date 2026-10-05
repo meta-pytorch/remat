@@ -23,6 +23,7 @@ import pytest
 import torch
 import torch_remat as remat
 from remat_test_helpers import (  # pyrefly: ignore[missing-import]
+    replay_to_end,
     _ref_grad,
     checkpoint_for_test,
     IS_COMPILE_TEST,
@@ -194,11 +195,13 @@ class SaveRegionTest(expecttest.TestCase):
             )(x)
             if not IS_COMPILE_TEST:
                 seen_optional_outputs.append(optional)
-            return remat.region(
-                lambda lhs, rhs: lhs + rhs,
-                "combine",
-                recompute=True,
-            )(left, right)
+            return replay_to_end(
+                remat.region(
+                    lambda lhs, rhs: lhs + rhs,
+                    "combine",
+                    recompute=True,
+                )(left, right)
+            )
 
         x = torch.tensor([2.0, 3.0], requires_grad=True)
         y = checkpoint_for_test()(checkpoint_body)(x)
@@ -561,7 +564,9 @@ blk::span: 12 B
                 seen_container.append(type(pair))
             first, second = pair
             # add(2x, 3x) = 5x; both inputs are SAVE outputs ferried on recompute.
-            return remat.region(torch.add, "add", recompute=True)(first, second)
+            return replay_to_end(
+                remat.region(torch.add, "add", recompute=True)(first, second)
+            )
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
         out = checkpoint_for_test()(body)(x)
@@ -598,8 +603,8 @@ blk::span: 12 B
                 seen_container.append(type(pair))
             # Named-field access must work on the forward value and the recompute
             # reconstruction alike; both fields are SAVE outputs ferried on recompute.
-            return remat.region(torch.add, "add", recompute=True)(
-                pair.double, pair.triple
+            return replay_to_end(
+                remat.region(torch.add, "add", recompute=True)(pair.double, pair.triple)
             )
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
@@ -635,8 +640,10 @@ blk::span: 12 B
             # structseq field access (``.values`` / ``.indices``) must work on the
             # forward value and the recompute reconstruction alike; both fields are
             # SAVE outputs ferried on recompute.
-            return remat.region(torch.add, "add", recompute=True)(
-                pair.values, pair.indices
+            return replay_to_end(
+                remat.region(torch.add, "add", recompute=True)(
+                    pair.values, pair.indices
+                )
             )
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)

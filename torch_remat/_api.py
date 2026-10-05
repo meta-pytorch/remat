@@ -60,7 +60,11 @@ from torch_remat._pytree import (
     rebuild_container,
     value_leaves,
 )
-from torch_remat._recompute_boundary import _checkpoint_recompute_boundary
+from torch_remat._recompute_boundary import (
+    _checkpoint_recompute_boundary,
+    _mark_replay_point,
+    _new_replay_anchor,
+)
 from torch_remat._region import (
     _active_save_op,
     _ActiveCheckpointRegion,
@@ -215,8 +219,28 @@ def checkpoint(
 
     def decorate(function: Callable[..., Any]) -> Callable[..., Any]:
         def wrapped_function(*inner_args: Any, **inner_kwargs: Any) -> Any:
+            active = _state.get()
+            region_state = active.region_state if active is not None else None
+            forward = active is not None and active.phase is _Phase.FORWARD
+            device = next(
+                (
+                    leaf.device
+                    for _token, leaf in iter_arg_leaves(inner_args, inner_kwargs)
+                    if isinstance(leaf, torch.Tensor)
+                ),
+                None,
+            )
+            # The anchor is the first checkpoint pack in both phases; see
+            # torch_remat._recompute_boundary.
+            anchor = _new_replay_anchor(device)
+            if region_state is not None:
+                region_state.replay_device = device
+                if forward:
+                    region_state.checkpoint_frame = _current_checkpoint_frame()
             output = function(*inner_args, **inner_kwargs)
-            return _checkpoint_recompute_boundary(output)
+            if region_state is not None and forward:
+                _drop_unreplayed_persists(region_state)
+            return _checkpoint_recompute_boundary(output, anchor)
 
         @wraps(function)
         def checkpointed_function(*args: Any, **kwargs: Any) -> Any:
@@ -984,6 +1008,8 @@ def _replay_save_op(
         hook.restore(snapshot)
     if record.saved_input_recipes:
         _rederive_saved_inputs(record, region_state, args, kwargs)
+        # Matches the forward's marker, so both phases pack the same count.
+        _mark_replay_point(region_state.replay_device)
     return _load_saved_outputs(record, region_state)
 
 
@@ -1101,6 +1127,10 @@ def _run_save_op(
     # Snapshot external state at the op's exit so recompute can restore it where the
     # body is skipped. See :class:`RecomputeStateHook`.
     record.exit_snapshots = tuple(hook.snapshot() for hook in region_state.state_hooks)
+    if record.saved_input_recipes:
+        # Replay must reach this op to rederive its saved inputs, so keep
+        # checkpoint's early stop from ending replay before it.
+        _mark_replay_point(region_state.replay_device)
 
     validated_output = _validate_output(output, reject_leaves_for=(region_state, name))
     _record_output_schema(record, validated_output)
@@ -1292,7 +1322,7 @@ def _prepare_outputs(
             persist if existing is None else _merge_persist(existing, persist)
         )
         if storage in scratch.saved_identity_storages:
-            persist()  # saved for backward, so resident anyway -- persist eagerly
+            persist(track=False)  # saved for backward, so resident anyway
     return output
 
 
@@ -1341,7 +1371,9 @@ class _PersistOutputThunk:
     hooks: _SavedTensorsHooks | None = None
     context: object = None
 
-    def __call__(self) -> None:
+    def __call__(self, *, track: bool = True) -> None:
+        # ``track=False`` marks an eager persist (the output is saved for backward,
+        # so its slot costs nothing and is never dropped for early stop).
         if self.slot_index in self.record.output_slots:
             return
         real = self.output_ref()
@@ -1370,6 +1402,8 @@ class _PersistOutputThunk:
                 requires_grad=real.requires_grad,
                 is_leaf=real.is_leaf,
             )
+            if track:
+                _note_persist(self.record, self.slot_index)
             return
         self.record.output_slots[self.slot_index] = _OutputSlot(
             tensor=detached,
@@ -1377,6 +1411,59 @@ class _PersistOutputThunk:
             requires_grad=real.requires_grad,
             is_leaf=real.is_leaf,
         )
+        if track:
+            _note_persist(self.record, self.slot_index)
+
+
+def _current_checkpoint_frame() -> weakref.ReferenceType[Any] | None:
+    """Return a weak reference to the active PyTorch checkpoint frame, if any.
+
+    The frame is reachable only through the closure of checkpoint's pack hook, which
+    is the innermost saved-tensor hook while the checkpointed function runs. A core
+    accessor for the frame's pack count would replace this.
+    """
+
+    hooks = torch._C._autograd._top_saved_tensors_default_hooks(False)  # type: ignore[attr-defined]
+    if hooks is None:
+        return None
+    code = getattr(hooks[0], "__code__", None)
+    closure = getattr(hooks[0], "__closure__", None)
+    if code is None or closure is None or "frame" not in code.co_freevars:
+        return None
+    frame = closure[code.co_freevars.index("frame")].cell_contents
+    return weakref.ref(frame)
+
+
+def _checkpoint_pack_count(region_state: _CheckpointRegionState) -> int | None:
+    ref = region_state.checkpoint_frame
+    frame = ref() if ref is not None else None
+    return None if frame is None else len(frame.weak_holders)
+
+
+def _note_persist(record: _SaveRecord, slot_index: int) -> None:
+    """Record the checkpoint pack count at which a SAVE output was persisted."""
+
+    active = _state.get()
+    if active is None or active.phase is not _Phase.FORWARD:
+        return
+    count = _checkpoint_pack_count(active.region_state)
+    if count is not None:
+        active.region_state.persist_pack_counts.append((record, slot_index, count))
+
+
+def _drop_unreplayed_persists(region_state: _CheckpointRegionState) -> None:
+    """Free SAVE outputs persisted after the region's last checkpoint pack.
+
+    PyTorch checkpoint's early stop ends replay at the last pack, so no consumer of
+    such an output runs during replay (e.g. a residual add at the end of the region).
+    """
+
+    total = _checkpoint_pack_count(region_state)
+    if total is not None:
+        for record, slot_index, count in region_state.persist_pack_counts:
+            if count == total:
+                record.output_slots.pop(slot_index, None)
+    region_state.persist_pack_counts.clear()
 
 
 def _record_output_schema(record: _SaveRecord, output: Output) -> None:
@@ -1426,10 +1513,10 @@ def _rederive_saved_inputs(
     view is rebuilt from the reproduced base with ``as_strided``.
 
     Load-bearing invariant: this fires only if replay actually reaches this
-    skipped op. That holds because ``_TriggerCheckpointRecompute`` at the region
-    output is the highest-index checkpoint holder, so the first backward unpack
-    forces a full replay before any saved-input unpack reads a slot. A change
-    that lets recompute stop earlier would silently skip rederiving them.
+    skipped op. Replay starts at the region output (the boundary unpacks the
+    replay anchor) before any saved-input unpack reads a slot, and a SAVE op with
+    rederivation recipes adds a checkpoint pack (:func:`_mark_replay_point`) in both
+    phases, so checkpoint's early stop never ends replay before it.
     """
 
     _assert_phase(_Phase.RECOMPUTE)
