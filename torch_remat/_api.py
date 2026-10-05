@@ -129,6 +129,10 @@ def checkpoint(
     :func:`region` (``recompute=False``) to keep their activations and skip
     recompute instead.
 
+    Unlike ``torch.utils.checkpoint``, replay does not stop early: the whole
+    function reruns, including trailing ops whose saved tensors are already
+    rebuilt. Wrap such a tail in a ``recompute=False`` region to skip it.
+
     Region arguments are forwarded unchanged (``torch.utils.checkpoint`` handles
     them), but the region *output* must be a Tensor or a one-hop ``tuple`` /
     ``list`` of Tensors; anything else raises at the region boundary.

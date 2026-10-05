@@ -136,3 +136,25 @@ to be saved, we attribute the cost of saving it to the producer of the tensor
 SAVE regions save tensors, and also implies that if an output is needed for
 any recompute, it *always* is available in all code in the recompute that has
 a reference to it.
+
+## No early stop: wrap the tail in a SAVE region
+
+`torch.utils.checkpoint` stops replay early, as soon as every tensor saved
+under the checkpoint has been recomputed.  If the last op in the checkpointed
+function saves only tensors produced earlier (e.g. a final matmul saving its
+inputs), native checkpoint never reruns it.
+
+`remat.checkpoint` always replays the whole function.  It saves a zero-element
+tensor at the function's output to force replay to start before any inner
+backward runs, and since that is the last tensor saved, early stop never
+triggers before the end.  To skip the trailing ops, wrap them in a SAVE region:
+
+```python
+def block(x, w):
+    h = x.sin()
+    return remat.region(torch.matmul, "out_proj", recompute=False)(h, w)
+```
+
+This retains no extra memory in the case where early stop would have skipped
+the tail: the matmul's saved `h` comes from a RECOMPUTE producer, so it is
+rederived during replay (see the table above) rather than kept resident.

@@ -332,6 +332,42 @@ inner_backward_before_unpack
 inner_backward_after_unpack""",
         )
 
+    @pytest.mark.compile_xfail("compile has no Python forward replay to count")
+    def test_save_region_skips_tail_replay(self) -> None:
+        # The boundary trigger defeats checkpoint early stop, so a trailing op whose
+        # saved tensors are all rebuilt earlier in replay still reruns unless it is
+        # wrapped in a SAVE region -- which then retains nothing.
+        tail_runs: list[str] = []
+
+        def tail(h: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            tail_runs.append("replay" if remat.is_recomputing() else "forward")
+            return h @ w
+
+        def body(x: torch.Tensor, w: torch.Tensor, save_tail: bool) -> torch.Tensor:
+            h = x.sin()
+            if save_tail:
+                return remat.region(tail, "tail", recompute=False)(h, w)
+            return tail(h, w)
+
+        for save_tail, expected_runs in (
+            (False, ["forward", "replay"]),
+            (True, ["forward"]),
+        ):
+            tail_runs.clear()
+            x = torch.randn(4, 4, requires_grad=True)
+            w = torch.randn(4, 4, requires_grad=True)
+            y = checkpoint_for_test(region_name="blk")(body)(x, w, save_tail)
+            self.assertIn(
+                "blk: 0 B resident in 0 storage(s)",
+                remat.format_saved_tensors_report(),
+            )
+            y.sum().backward()
+            self.assertEqual(expected_runs, tail_runs)
+            # pyrefly: ignore[bad-argument-type]
+            self.assertTrue(
+                torch.allclose(w.grad, x.detach().sin().T @ torch.ones(4, 4))
+            )
+
     def test_checkpoint_boundary_saves_zero_element_trigger(self) -> None:
         packed_numels: list[int] = []
         packed_nbytes: list[int] = []
