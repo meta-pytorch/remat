@@ -158,3 +158,18 @@ def block(x, w):
 This retains no extra memory in the case where early stop would have skipped
 the tail: the matmul's saved `h` comes from a RECOMPUTE producer, so it is
 rederived during replay (see the table above) rather than kept resident.
+
+## Code that needs no gradient
+
+`torch_remat` only acts on code that autograd records.  If the whole checkpoint
+runs under `torch.no_grad()` or `torch.inference_mode()`, the function runs once
+as a plain call: regions are ordinary calls, nothing is saved, and nothing is
+ever recomputed.
+
+Inside a checkpoint that does record, grad-free code (a `torch.no_grad()`
+block, or ops on tensors that don't require grad, like a mask or a statistic)
+saves nothing for backward.  If it runs in a RECOMPUTE region, though, replay
+still reruns it: `torch_remat` cannot tell whether a bare op later in the replay
+reads its result.  Put such code in a SAVE region instead and replay skips it.
+Since it saved nothing, it costs nothing, unless a recompute needs its output,
+which is then persisted as described above.
