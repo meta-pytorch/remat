@@ -82,4 +82,9 @@ def _trigger_boundary(leaf: object) -> object:
             "torch_remat checkpoint function must return a Tensor, or one hop of "
             "tuple/list of Tensors"
         )
+    if not torch.is_grad_enabled():
+        # With grad disabled apply() records no node, so the trigger could never fire in
+        # backward. It would only return an untracked view -- requires_grad but no
+        # grad_fn -- severing the graph of a body that re-enabled grad inside.
+        return leaf
     return _TriggerCheckpointRecompute.apply(leaf)
