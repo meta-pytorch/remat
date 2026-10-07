@@ -95,8 +95,9 @@ pretty complicated, so we think this explicit API call is a good trade-off).
 The description above technically tells you everything you need to know to
 figure out if a tensor will be saved for backwards or not, but it's helpful to
 work through some examples to get some intuition.  Consider three regions
-inside one checkpoint (the third region ensures `z` is an interior value
-rather than the checkpoint output, which is treated specially):
+inside one checkpoint, where region C is RECOMPUTE (the third region ensures
+`z` is an interior value rather than the checkpoint output, which is treated
+specially):
 
 ```text
 checkpoint input
@@ -115,10 +116,16 @@ out exactly what tensors are saved for backwards versus recomputed.
 
 | A policy | B policy | Resident for these regions | Recreated |
 | --- | --- | --- | --- |
-| SAVE | SAVE | `y`, `z`, `p`, `q` | none |
+| SAVE | SAVE | `z`, `p`, `q` | none |
 | SAVE | RECOMPUTE | `y`, `p` | `z`, `q` |
 | RECOMPUTE | SAVE | checkpoint anchor `x`, `z`, `q` | `y`, `p` |
 | RECOMPUTE | RECOMPUTE | checkpoint anchor `x` | `y`, `z`, `p`, `q` |
+
+When both A and B are SAVE, `y` is neither resident nor recreated: neither
+backward needs it, and B is skipped during replay, so B only sees a
+placeholder for it.  Likewise, `z` is resident whenever B is SAVE only because
+region C recomputes and reads it; if C were also SAVE (and its backward did not
+need `z`), `z` would not be kept either.
 
 In general, the producer and consumer policies determine how an intermediate
 reaches replay:
