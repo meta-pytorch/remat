@@ -877,6 +877,13 @@ class _SaveRecord:
         default_factory=WeakTensorKeyDictionary
     )
 
+    # The subset of `saved_tensor_names` keys that are parameters or views of one
+    # (see :func:`_is_parameter_save`). Their storage is resident whether or not this op
+    # saves them, so reports do not bill them as this op's memory.
+    parameter_saves: MutableMapping[torch.Tensor, None] = field(
+        default_factory=WeakTensorKeyDictionary
+    )
+
     # --- Metadata about save_for_backward tensors that are aliases of RECOMPUTE inputs
     # See _SavedInputRecipe for details.  The order of this list doesn't
     # matter (it's populated in the order inputs are saved for backwards.)
@@ -1217,6 +1224,18 @@ def _resolve_save_name(scratch: _SaveOpForwardScratch, tensor: torch.Tensor) -> 
     return name
 
 
+def _is_parameter_save(tensor: torch.Tensor) -> bool:
+    """Whether a saved tensor is a grad-requiring leaf (a parameter or graph input) or a
+    view of one -- resident regardless of the save, so not activation memory.
+
+    The view case is the tied-weight one: ``h @ w.t()`` saves ``w.t()``, not ``w``. Must be
+    called on the tensor as saved, not a ``detach()`` of it, which drops ``_base``.
+    """
+
+    base = tensor._base if tensor._base is not None else tensor
+    return base.is_leaf and base.requires_grad
+
+
 def _default_pack(
     record: _SaveRecord,
     scratch: _SaveOpForwardScratch,
@@ -1240,6 +1259,8 @@ def _default_pack(
 
     saved = tensor.detach()
     record.saved_tensor_names[saved] = name
+    if _is_parameter_save(tensor):
+        record.parameter_saves[saved] = None
     # Note this tensor's storage (shared with the original) as resident, so an output
     # sharing it can be eagerly persisted (see :func:`_prepare_outputs`).
     scratch.saved_identity_storages.add(StorageWeakRef(saved.untyped_storage()))

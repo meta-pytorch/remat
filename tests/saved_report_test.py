@@ -478,6 +478,22 @@ outside regions: 24 B in 1 storage
         )
         loss.backward()
 
+    def test_graph_walk_skips_parameter_views(self) -> None:
+        # A tied unembedding saves ``w.t()``, a view of the parameter rather than the
+        # parameter itself; like the parameter, it is not an activation.
+        w = torch.randn(4, 4, requires_grad=True)
+        x = torch.randn(2, 4, requires_grad=True)
+        loss = (torch.tanh(x @ w) @ w.t()).sum()
+        self.assertExpectedInline(
+            remat.format_saved_tensors_report(loss),
+            """\
+saved for backward: 32 B resident -- 0 region(s) 0 B, outside regions 32 B
+
+outside regions: 32 B in 1 storage
+       32 B  MmBackward0 / TanhBackward0 (x1)""",
+        )
+        loss.backward()
+
     def test_graph_walk_does_not_trigger_unpack_hooks(self) -> None:
         # The graph walk must read saves WITHOUT unpacking them: firing a save's unpack hook
         # on a remat/checkpoint save would trigger a recompute mid-report and corrupt the real

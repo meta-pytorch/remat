@@ -233,18 +233,18 @@ def _format_memory_report(
     lines.extend(footer)
 
     # SAVE saves vanish from the weak index once the region output's grad graph is
-    # released, so a completed SAVE op (``output_schema`` set) with nothing resident
-    # and nothing deferred means the graph is gone -- flag it rather than let a bare
-    # 0 B read as "nothing was retained".
-    completed = any(
-        record.output_schema is not None for record in region_state.records.values()
-    )
+    # released, so a completed SAVE op (``output_schema`` set) with nothing resident,
+    # nothing deferred, and no live (parameter) save means the graph is gone -- flag it
+    # rather than let a bare 0 B read as "nothing was retained".
+    records = region_state.records.values()
+    completed = any(record.output_schema is not None for record in records)
+    live_saves = any(record.saved_tensor_names for record in records)
     if completed and total_bytes == 0 and not footer:
         if excluded_any:
             lines.append(
                 "  (resident storages all billed to an earlier region -- counted there)"
             )
-        else:
+        elif not live_saves:
             lines.append(
                 "  ! region output no longer alive -- saved tensors already released; "
                 "report reflects that"
@@ -256,15 +256,18 @@ def _collect_storages(record: _SaveRecord) -> dict[tuple[torch.device, int], _St
     """Group a SAVE op's resident tensors by storage, folding exact aliases into one value.
 
     Sources, all resident and real: the weak ``saved_tensor_names`` index (autograd-owned
-    saves, live ones only) and the non-offloaded durable ``output_slots``. Tensors sharing
-    a storage land in the same :class:`_Storage`; within it, tensors sharing an exact
-    ``(shape, stride, offset)`` fold into one :class:`_Value` wearing all their names.
+    saves, live ones only, minus ``parameter_saves``) and the non-offloaded durable
+    ``output_slots``. Tensors sharing a storage land in the same :class:`_Storage`; within
+    it, tensors sharing an exact ``(shape, stride, offset)`` fold into one :class:`_Value`
+    wearing all their names.
     """
 
     storages: dict[tuple[torch.device, int], _Storage] = {}
     # (name, tensor) in a stable order: save names first (pack order), then durable slots.
     entries: list[tuple[str, torch.Tensor]] = [
-        (name, tensor) for tensor, name in record.saved_tensor_names.items()
+        (name, tensor)
+        for tensor, name in record.saved_tensor_names.items()
+        if tensor not in record.parameter_saves
     ]
     for index, slot in record.output_slots.items():
         if isinstance(slot.tensor, torch.Tensor):

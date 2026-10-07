@@ -9,8 +9,8 @@
 """Tests for ``remat.format_current_memory_report``: how it names a producer's durable
 output, folds exact save/output aliases, flags view-pinned storage, names a single
 saved view, footnotes rebuilt saves, refuses to fold different shapes on one storage,
-flags a released graph, groups by region/op/tensor, and keeps its byte column summing
-to the header total."""
+flags a released graph, leaves parameters unbilled, groups by region/op/tensor, and keeps
+its byte column summing to the header total."""
 
 from __future__ import annotations
 
@@ -292,6 +292,32 @@ blk::op: 16 B
 blk: 0 B resident in 0 storage(s)
   ! region output no longer alive -- saved tensors already released; report reflects that""",
             )
+
+    def test_memory_report_does_not_bill_parameters(self) -> None:
+        # A closed-over weight is saved by identity -- directly, or as the tied
+        # unembedding's ``w.t()`` view -- but is resident regardless, so it is not the
+        # region's memory. A region saving nothing else must not read as released.
+        w = torch.ones(4, 4, requires_grad=True)
+        forward_context, _ = _checkpoint_context_fn("blk")
+        with forward_context:
+            h = remat.region(lambda a: a + torch.sin(w)[0], "embed", recompute=False)(
+                torch.ones(2, 4, requires_grad=True)
+            )
+            self.assertExpectedInline(
+                remat.format_current_memory_report(),
+                """blk: 0 B resident in 0 storage(s)""",
+            )
+            out = remat.region(
+                lambda a: torch.tanh(a) @ w.t(), "unembed", recompute=False
+            )(h)
+            self.assertExpectedInline(
+                remat.format_current_memory_report(),
+                """\
+blk: 32 B resident in 1 storage(s)
+blk::unembed: 32 B
+  32 B  saved.0 = saved.2  (2, 4)  float32""",
+            )
+            del h, out
 
     def test_memory_report_byte_column_sums_to_header(self) -> None:
         # Fable's invariant as executable code: the header total is the literal sum of the

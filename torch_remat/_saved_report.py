@@ -69,6 +69,7 @@ from dataclasses import dataclass, field
 from typing import Iterable, TextIO
 
 import torch
+from torch_remat._api import _is_parameter_save
 from torch_remat._region import _CheckpointRegionState, _iter_live_regions
 from torch_remat._reporting import (
     _collect_storages,
@@ -300,10 +301,11 @@ def _is_activation_save(tensor: torch.Tensor) -> bool:
     """A saved tensor worth reporting: has bytes and is not a parameter/graph input.
 
     Leaf tensors that require grad are parameters or user inputs -- saved by ops like
-    matmul, but not activations -- so they are excluded to keep the signal readable.
+    matmul, but not activations -- so they, and views of them, are excluded to keep the
+    signal readable.
     """
 
-    return tensor.numel() > 0 and not (tensor.is_leaf and tensor.requires_grad)
+    return tensor.numel() > 0 and not _is_parameter_save(tensor)
 
 
 def _node_saved_tensors(node: torch.autograd.graph.Node) -> list[torch.Tensor]:
