@@ -24,7 +24,8 @@ still apply.
 | `remat.save_for_backward` | Supported, names ignored | Forwards directly to `ctx.save_for_backward`; mapping keys only feed eager memory reports. |
 | `checkpoint(determinism_check=...)` | Supported | Forwarded to the underlying non-reentrant checkpoint. |
 | `region_name` and region `name` | Accepted, diagnostics unavailable | Names do not affect the compiled policy because there is no eager tape or region report. |
-| `remat.is_recomputing()` | Always `False` | Python executes once during tracing; rematerialization happens in the partitioned backward graph, not by replaying the Python body. |
+| `remat.is_recomputing()` | `False` inside a compiled `checkpoint` | Python executes once during tracing; rematerialization happens in the partitioned backward graph, not by replaying the Python body. |
+| A compiled function inside an eager `checkpoint` | Supported, `region` is a no-op | The eager checkpoint replays the function on recompute, so `recompute=False` region bodies rerun. Guard forward-only side effects with `remat.is_recomputing()`, which reports the eager phase. |
 | Eager checkpoint output validation | Not applied | Compiled outputs follow Dynamo's pytree and aliasing rules rather than the eager tape's one-hop Tensor container validation. |
 | `checkpoint(saved_tensors_hooks=...)` | Unsupported | Rejected during compilation with `NotImplementedError`. |
 | `recompute_state_hooks` | Unsupported | Rejected during compilation with `NotImplementedError`. |

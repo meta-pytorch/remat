@@ -232,11 +232,16 @@ def is_recomputing() -> bool:
     """
 
     if torch.compiler.is_compiling():
-        # Under compile there is no eager recompute pass: the body is traced once and
-        # the partitioner rematerializes. Report ordinary forward so trace-time code
-        # takes the same path it would in a plain forward.
-        return False
+        from torch_remat._compile import in_compiled_checkpoint
 
+        if in_compiled_checkpoint():
+            # A compiled checkpoint has no eager recompute pass: the body is traced once
+            # and the partitioner rematerializes. Report ordinary forward so trace-time
+            # code takes the same path it would in a plain forward.
+            return False
+
+    # An eager checkpoint replays a compiled function on recompute; Dynamo guards on
+    # this phase, so forward and recompute compile separate graphs.
     state = _state.get()
     return state is not None and state.phase is _Phase.RECOMPUTE
 
