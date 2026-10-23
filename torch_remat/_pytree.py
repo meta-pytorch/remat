@@ -45,7 +45,7 @@ from typing import TypeAlias
 # (``int`` -> ``args[i]``, ``str`` -> ``kwargs["k"]``); any tail entry indexes one
 # hop into a container argument (``int`` -> sequence index).
 # It doubles as a stable, hashable identity for a leaf position across a forward
-# and its recompute, and renders to a human path via :func:`path_str`.
+# and its recompute.
 PathToken: TypeAlias = tuple[int | str, ...]
 
 
@@ -118,37 +118,6 @@ def iter_arg_leaves(
         yield from _iter_arg(value, (key,))
 
 
-def map_arg_leaves(
-    fn: Callable[[PathToken, object], object],
-    args: Sequence[object],
-    kwargs: Mapping[str, object],
-) -> tuple[tuple[object, ...], dict[str, object]]:
-    """Map ``fn`` over a call's argument leaves, rebuilding ``args`` and ``kwargs``.
-
-    ``fn`` receives ``(path, leaf)`` and returns the replacement leaf. Each container
-    is rebuilt with its own type preserved (see :func:`container_type`), matching
-    :func:`map_value`.
-    """
-
-    new_args = tuple(_map_arg(fn, arg, (index,)) for index, arg in enumerate(args))
-    new_kwargs = {key: _map_arg(fn, value, (key,)) for key, value in kwargs.items()}
-    return new_args, new_kwargs
-
-
-def path_str(token: PathToken) -> str:
-    """Render a :data:`PathToken` as ``args[0]`` / ``args[1][0]`` / ``kwargs["k"]``.
-
-    Cold path only (memory reports, slot error messages); never call it on the
-    per-op hot path -- pass the token around and render once, at display time.
-    """
-
-    head, *rest = token
-    parts = [f"args[{head}]" if isinstance(head, int) else f'kwargs["{head}"]']
-    for entry in rest:
-        parts.append(f"[{entry}]")
-    return "".join(parts)
-
-
 def _iter_arg(
     value: object,
     prefix: PathToken,
@@ -160,19 +129,3 @@ def _iter_arg(
             yield (*prefix, index), item
     else:
         yield prefix, value
-
-
-def _map_arg(
-    fn: Callable[[PathToken, object], object],
-    value: object,
-    prefix: PathToken,
-) -> object:
-    """Map ``fn`` over one argument's leaves, rebuilding the container."""
-
-    container = container_type(value)
-    if container is None:
-        return fn(prefix, value)
-    items = [
-        fn((*prefix, index), leaf) for index, leaf in enumerate(value_leaves(value))
-    ]
-    return rebuild_container(container, items)

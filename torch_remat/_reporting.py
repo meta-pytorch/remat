@@ -229,7 +229,7 @@ def _format_memory_report(
         for row in rows:
             lines.extend(_render_storage_row(row, widths))
 
-    footer = _format_not_resident(region_state)
+    footer = _not_resident_lines(region_state.records.values())
     lines.extend(footer)
 
     # SAVE saves vanish from the weak index once the region output's grad graph is
@@ -418,7 +418,7 @@ def _render_storage_row(
     return lines
 
 
-def _format_not_resident(region_state: _CheckpointRegionState) -> list[str]:
+def _not_resident_lines(records: Iterable[_SaveRecord]) -> list[str]:
     """Non-additive footer: saves rebuilt on recompute, and outputs offloaded off-device.
 
     Kept out of the byte column on purpose -- these bytes are not resident, so counting them
@@ -429,7 +429,7 @@ def _format_not_resident(region_state: _CheckpointRegionState) -> list[str]:
 
     rebuilt = 0
     offloaded = 0
-    for record in region_state.records.values():
+    for record in records:
         rebuilt += len(record.saved_input_recipes)
         offloaded += sum(
             1 for slot in record.output_slots.values() if slot.tensor is None

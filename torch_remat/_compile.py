@@ -41,7 +41,6 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-import torch
 from torch._higher_order_ops.wrap import dynamo_bypassing_wrapper
 from torch.utils.checkpoint import checkpoint as _torch_checkpoint, CheckpointPolicy
 

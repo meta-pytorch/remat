@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from functools import wraps
 from typing import Callable, Iterator, ParamSpec, TypeVar
 
-from torch_remat._region import is_recomputing
+from torch_remat._region import _validate_scope_text, is_recomputing
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -129,9 +129,9 @@ def trace_scope(
 
     if not callable(function):
         raise RuntimeError("trace_scope expects a function as its first argument")
-    _validate_trace_scope_text(name, what="trace scope name")
+    _validate_scope_text(name, what="trace scope name")
     if metadata is not None:
-        _validate_trace_scope_text(metadata, what="trace scope metadata")
+        _validate_scope_text(metadata, what="trace scope metadata")
 
     @wraps(function)
     def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
@@ -181,12 +181,3 @@ def _append_trace_entry(
 
     details = "recompute" if entry.recompute else "save"
     lines.append(f"{prefix}{entry.name}: {details}")
-
-
-def _validate_trace_scope_text(text: str, *, what: str) -> None:
-    """Validate user-facing trace scope text."""
-
-    if not isinstance(text, str):
-        raise RuntimeError(f"torch_remat {what} must be a string")
-    if not text:
-        raise ValueError(f"torch_remat {what} must be non-empty")

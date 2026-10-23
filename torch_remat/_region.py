@@ -155,6 +155,15 @@ _name_scope: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
 )
 
 
+def _validate_scope_text(text: str, *, what: str) -> None:
+    """Validate user-facing scope text."""
+
+    if not isinstance(text, str):
+        raise RuntimeError(f"torch_remat {what} must be a string")
+    if not text:
+        raise ValueError(f"torch_remat {what} must be non-empty")
+
+
 @contextlib.contextmanager
 def name_scope(prefix: str) -> Iterator[None]:
     """Prefix region names invoked within this context with ``prefix/``.
@@ -176,10 +185,7 @@ def name_scope(prefix: str) -> Iterator[None]:
     eager diagnostic names.
     """
 
-    if not isinstance(prefix, str):
-        raise RuntimeError("torch_remat name scope prefix must be a string")
-    if not prefix:
-        raise ValueError("torch_remat name scope prefix must be non-empty")
+    _validate_scope_text(prefix, what="name scope prefix")
     if torch.compiler.is_compiling():
         yield
         return

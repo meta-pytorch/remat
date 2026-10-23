@@ -75,6 +75,7 @@ from torch_remat._reporting import (
     _collect_storages,
     _format_bytes,
     _format_memory_report,
+    _not_resident_lines,
     _Storage,
     _storage_key,
     Annotate,
@@ -408,29 +409,8 @@ def _format_region_summary(
             f"  {_format_bytes(group_bytes(group)):>{byte_w}}  "
             f"{count_col}{names}  ({len(rep_owned)} {noun}{each})"
         )
-    lines.extend(_aggregate_footer([v.region for v in region_views]))
-    return lines
-
-
-def _aggregate_footer(regions: list[_CheckpointRegionState]) -> list[str]:
-    """Non-resident totals across all regions: rebuilt-on-recompute and offloaded."""
-
-    rebuilt = 0
-    offloaded = 0
-    for region in regions:
-        for record in region.records.values():
-            rebuilt += len(record.saved_input_recipes)
-            offloaded += sum(
-                1 for slot in record.output_slots.values() if slot.tensor is None
-            )
-
-    lines: list[str] = []
-    if rebuilt:
-        noun = "save" if rebuilt == 1 else "saves"
-        lines.append(f"  + {rebuilt} {noun} rebuilt on recompute, not resident")
-    if offloaded:
-        noun = "output" if offloaded == 1 else "outputs"
-        lines.append(f"  + {offloaded} {noun} offloaded, not resident on device")
+    records = [record for v in region_views for record in v.region.records.values()]
+    lines.extend(_not_resident_lines(records))
     return lines
 
 
