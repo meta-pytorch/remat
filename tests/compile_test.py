@@ -249,6 +249,27 @@ class CompileTest(expecttest.TestCase):
         x = torch.randn(4, requires_grad=True)
         self.assertTrue(torch.equal(compiled(x), x))
 
+    def test_is_recomputing_inside_eager_checkpoint(self) -> None:
+        if torch.__version__ < (2, 14):
+            self.skipTest("Dynamo traces ContextVar.get() from torch 2.14")
+        # The eager checkpoint replays `compiled` on recompute; is_recomputing() must
+        # say so, or the forward-only count.add_ runs twice.
+        count = torch.zeros((), dtype=torch.int64)
+
+        def body(x: torch.Tensor) -> torch.Tensor:
+            if not remat.is_recomputing():
+                count.add_(1)
+            return x.sin()
+
+        compiled = torch.compile(body, backend="aot_eager", fullgraph=True)
+        x = torch.randn(4, requires_grad=True)
+        y = remat.checkpoint()(compiled)(x)
+        self.assertEqual(count.item(), 1)
+        y.sum().backward()
+        self.assertEqual(count.item(), 1)
+        # pyrefly: ignore[bad-argument-type]
+        self.assertTrue(torch.equal(x.grad, x.detach().cos()))
+
     def test_determinism_check_is_forwarded(self) -> None:
         compiled = torch.compile(
             lambda x: remat.checkpoint(determinism_check="default")(torch.exp)(x),
