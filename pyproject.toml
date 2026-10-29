@@ -32,3 +32,12 @@ quote-style = "double"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["*_test.py"]
+
+[dependency-groups]
+# Build backend of this package, locked: in the mslsrc/tbd_training export the
+# members build against the venv (the root's `no-build-isolation-package`), so
+# the backend has to be in a default group for `uv sync` to install it first.
+build = ["setuptools", "wheel"]
+
+[tool.uv]
+default-groups = ["build"]
