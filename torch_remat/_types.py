@@ -259,6 +259,12 @@ class _OutputSpec:
 
 
 @dataclass(frozen=True)
+class _BoxOutputSpec:
+    """A :class:`~torch_remat.Box` output, served from its persisted value or as a
+    placeholder box."""
+
+
+@dataclass(frozen=True)
 class _OutputSchema:
     """A skipped SAVE op's observed output schema, replayed as placeholders.
 
@@ -274,5 +280,5 @@ class _OutputSchema:
     container: type | None
 
     # Per-output entries in return-schema order. None reproduces a static None;
-    # every tensor has a spec describing its replay value or placeholder.
-    specs: tuple[_OutputSpec | None, ...]
+    # every tensor or box has a spec describing its replay value or placeholder.
+    specs: tuple[_OutputSpec | _BoxOutputSpec | None, ...]

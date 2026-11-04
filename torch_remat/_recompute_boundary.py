@@ -33,6 +33,7 @@ from typing import Any
 
 import torch
 from torch_remat._pytree import map_value
+from torch_remat._region import Box
 
 
 class _TriggerCheckpointRecompute(torch.autograd.Function):
@@ -77,10 +78,13 @@ def _trigger_boundary(leaf: object) -> object:
     trigger; on recompute the return value is discarded, so a placeholder here is fine.
     """
 
+    if isinstance(leaf, Box):
+        # A box has no autograd edge to trigger on.
+        return leaf
     if not isinstance(leaf, torch.Tensor):
         raise RuntimeError(
             "torch_remat checkpoint function must return a Tensor, or one hop of "
-            "tuple/list of Tensors"
+            "tuple/list of Tensors and remat.Box values"
         )
     if not torch.is_grad_enabled():
         # With grad disabled apply() records no node, so the trigger could never fire in

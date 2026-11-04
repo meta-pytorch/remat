@@ -419,7 +419,8 @@ def _render_storage_row(
 
 
 def _not_resident_lines(records: Iterable[_SaveRecord]) -> list[str]:
-    """Non-additive footer: saves rebuilt on recompute, and outputs offloaded off-device.
+    """Non-additive footer: saves rebuilt on recompute, outputs offloaded off-device, and
+    boxed outputs kept for recompute (opaque, so they cannot be sized).
 
     Kept out of the byte column on purpose -- these bytes are not resident, so counting them
     would break the "rows sum to the total" invariant. Offloaded is distinct from rebuilt:
@@ -429,10 +430,16 @@ def _not_resident_lines(records: Iterable[_SaveRecord]) -> list[str]:
 
     rebuilt = 0
     offloaded = 0
+    boxed = 0
     for record in records:
         rebuilt += len(record.saved_input_recipes)
         offloaded += sum(
             1 for slot in record.output_slots.values() if slot.tensor is None
+        )
+        # Mid-forward, a read box is still pending; the forward's exit moves it into
+        # box_slots.
+        boxed += len(record.box_slots) + sum(
+            1 for flag, _ in record.pending_boxes.values() if flag.read
         )
 
     lines: list[str] = []
@@ -442,6 +449,9 @@ def _not_resident_lines(records: Iterable[_SaveRecord]) -> list[str]:
     if offloaded:
         noun = "output" if offloaded == 1 else "outputs"
         lines.append(f"  + {offloaded} {noun} offloaded, not resident on device")
+    if boxed:
+        noun = "output" if boxed == 1 else "outputs"
+        lines.append(f"  + {boxed} boxed {noun} kept for recompute, size not tracked")
     return lines
 
 

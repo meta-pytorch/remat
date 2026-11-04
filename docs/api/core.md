@@ -19,3 +19,12 @@
 
 .. autofunction:: torch_remat.is_recomputing
 ```
+
+## Non-tensor outputs
+
+```{eval-rst}
+.. autoclass:: torch_remat.Box
+   :members: value
+
+.. autofunction:: torch_remat.is_placeholder
+```

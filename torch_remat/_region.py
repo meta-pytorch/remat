@@ -13,7 +13,8 @@ diagnostic tracing (:mod:`torch_remat._trace`) both depend on. It holds the
 context-local phase/region state and the helpers that read it, so ``_trace`` can
 ask whether a forward is being recomputed without importing ``_api`` at runtime --
 ``_api`` calls into ``_trace`` (to record ops), so the reverse runtime edge would
-form an import cycle.
+form an import cycle. :class:`Box` lives here too, since reading its value consults the
+same phase state.
 
 References to ``_SaveRecord`` (from ``_api``) appear only in annotations, kept
 under ``TYPE_CHECKING`` so it is never imported at runtime.
@@ -27,13 +28,24 @@ import weakref
 from dataclasses import dataclass, field
 from enum import Enum
 from types import TracebackType
-from typing import Any, Callable, Iterator, Protocol, runtime_checkable, TYPE_CHECKING
+from typing import (
+    Any,
+    Callable,
+    Generic,
+    Iterator,
+    Protocol,
+    runtime_checkable,
+    TYPE_CHECKING,
+    TypeVar,
+)
 
 import torch
 from torch.multiprocessing.reductions import StorageWeakRef
 
 if TYPE_CHECKING:
     from torch_remat._api import _SaveOpForwardScratch, _SaveRecord
+
+_T = TypeVar("_T")
 
 # A thunk that records one SAVE output's value on the remat tape so recompute can
 # reproduce it. Idempotent per output slot: the first consumer fires it, later ones
@@ -325,7 +337,9 @@ class _CheckpointPhaseContext(contextlib.AbstractContextManager[None]):
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        if self._phase is _Phase.RECOMPUTE:
+        if self._phase is _Phase.FORWARD:
+            _keep_read_boxes(self._region_state)
+        else:  # _Phase.RECOMPUTE
             # Reinstate the outer state captured on entry, completing the fork so the
             # replay's redraws don't perturb the surrounding stream.
             for hook, snapshot in zip(
@@ -369,6 +383,95 @@ def _display_name(region_state: _CheckpointRegionState, op_name: str) -> str:
     return f"{region_state.region_name}::{op_name}"
 
 
+class _BoxReadFlag:
+    """Set by a forward use of a SAVE region's :class:`Box` from code that reruns.
+
+    Callable as the box's persist thunk. Setting it is a plain attribute write, so
+    Dynamo replays it on every call of a compiled function inside an eager checkpoint
+    (which the checkpoint replays on recompute); the forward's exit then keeps the
+    contents in eager code (:func:`_keep_read_boxes`).
+    """
+
+    __slots__ = ("read",)
+
+    def __init__(self) -> None:
+        self.read = False
+
+    def __call__(self) -> None:
+        self.read = True
+
+
+# eq=False: boxes compare and hash by identity, like tensors (their contents may not
+# define equality).
+@dataclass(eq=False)
+class Box(Generic[_T]):
+    """A container for a non-tensor value returned from a :func:`region`.
+
+    ``remat.region`` outputs must be tensors (or ``None``); wrap any other value, such
+    as an opaque communication handle, in a ``Box`` to return it. ``torch.utils._pytree``
+    treats a box as a leaf, and remat does not look inside it: its contents get no
+    tensor metadata, saved-tensor hooks, or placeholders.
+
+    A box returned by a ``recompute=False`` region is handled like that region's output
+    tensors, with one addition: reading :attr:`value` on the forward from code that
+    reruns during recompute keeps the contents (by reference) for recompute, just as
+    passing the box to a ``recompute=True`` region or to :func:`recompute_needs_tensor`
+    does. Otherwise recompute returns a placeholder box whose :attr:`value` raises. See
+    the "Non-tensor outputs" section of the mental model docs for an example.
+
+    Don't box a tensor that has autograd history; return it as an ordinary output. A
+    kept box referencing such a tensor can keep the checkpoint's autograd graph alive.
+
+    Example:
+        ```python
+        def dispatch(x):
+            y, handle = dispatch_kernel(x)
+            return y, remat.Box(handle)
+
+        y, handle = remat.region(dispatch, "dispatch", recompute=False)(x)
+        z = remat.region(expert, "expert", recompute=True)(y)
+        # combine reruns during recompute and reads the handle, so it is kept.
+        out = remat.region(combine, "combine", recompute=True)(z, handle)
+        ```
+    """
+
+    _value: _T
+    # Set while the box is a SAVE region's output in a checkpoint forward that has not
+    # exited yet; None otherwise (including every box in a compiled checkpoint).
+    _read_flag: _BoxReadFlag | None = field(default=None, init=False, repr=False)
+
+    @property
+    def value(self) -> _T:
+        """The boxed value; a read from code that reruns keeps it for recompute."""
+
+        flag = self._read_flag
+        if flag is not None:
+            # A forward read outside every SAVE region body is code that reruns during
+            # recompute; a SAVE consumer is skipped along with the producer. This also
+            # runs in a compiled function inside an eager checkpoint; before torch 2.14
+            # Dynamo can't trace these reads and graph-breaks.
+            state = _state.get()
+            if (
+                state is not None
+                and state.phase is _Phase.FORWARD
+                and _active_save_op.get() is None
+            ):
+                flag()
+        return self._value
+
+
+def _keep_read_boxes(region_state: _CheckpointRegionState) -> None:
+    """At forward exit, keep the contents of each SAVE :class:`Box` output whose flag
+    was set, and detach every flag so a later checkpoint registers the box afresh."""
+
+    for record in region_state.records.values():
+        for index, (flag, box) in record.pending_boxes.items():
+            if flag.read:
+                record.box_slots[index] = box._value
+            box._read_flag = None
+        record.pending_boxes.clear()
+
+
 def _save_output_persist(
     region_state: _CheckpointRegionState, leaf: object
 ) -> PersistOutputThunk | None:
@@ -376,14 +479,17 @@ def _save_output_persist(
 
     The single "is this (a view of) a SAVE output" test: a tensor leaf is looked up
     in the region's persist index by its storage, so both the SAVE output itself and
-    any bare view sharing its storage resolve to the producer. A non-tensor leaf, or a
-    tensor whose storage is not a SAVE output's, returns None.
+    any bare view sharing its storage resolve to the producer. A :class:`Box` returns
+    its read flag, set only while it is a SAVE output of the current forward. Any other
+    leaf, or one not output by a SAVE region, returns None.
     """
 
     if isinstance(leaf, torch.Tensor):
         return region_state.save_output_persist_index.get(
             StorageWeakRef(leaf.untyped_storage())
         )
+    if isinstance(leaf, Box):
+        return leaf._read_flag
     return None
 
 

@@ -49,9 +49,11 @@ from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils.weak import WeakTensorKeyDictionary
 from torch_remat._compat import _torch_checkpoint_with_forward_exception_cleanup
 from torch_remat._placeholder import (
+    _box_placeholder_message_text,
     _is_placeholder,
     _make_placeholder_tensor,
     _placeholder_message_text,
+    _PlaceholderBox,
     _TensorMetadata,
 )
 from torch_remat._pytree import (
@@ -65,6 +67,7 @@ from torch_remat._region import (
     _active_save_op,
     _ActiveCheckpointRegion,
     _assert_phase,
+    _BoxReadFlag,
     _checkpoint_context_fn,
     _CheckpointRegionState,
     _display_name,
@@ -72,11 +75,13 @@ from torch_remat._region import (
     _qualified_name,
     _save_output_persist,
     _state,
+    Box,
     PersistOutputThunk,
     RecomputeStateHook,
 )
 from torch_remat._trace import _record_trace_op
 from torch_remat._types import (
+    _BoxOutputSpec,
     _InputInfo,
     _OutputSchema,
     _OutputSlot,
@@ -107,12 +112,12 @@ if importlib.util.find_spec("spmd_types") is not None:
 else:
     _no_spmd_typecheck = contextlib.nullcontext
 
-# A remat-aware op call returns a tensor, or a flat tuple or list whose leaves are
-# tensors or None -- the shapes autograd.Function.apply and native ops commonly
-# produce. We only need to locate the tensors; the container type is preserved for
+# A remat-aware op call returns a tensor or box, or a flat tuple or list whose leaves
+# are tensors, boxes, or None -- the shapes autograd.Function.apply and native ops
+# commonly produce, plus boxed non-tensor values. The container type is preserved for
 # the caller, and static None leaves are rebuilt in their original positions.
-OutputLeaf: TypeAlias = torch.Tensor | None
-Output: TypeAlias = torch.Tensor | tuple[OutputLeaf, ...] | list[OutputLeaf]
+OutputLeaf: TypeAlias = torch.Tensor | Box[Any] | None
+Output: TypeAlias = torch.Tensor | Box[Any] | tuple[OutputLeaf, ...] | list[OutputLeaf]
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -148,7 +153,8 @@ def checkpoint(
 
     Region arguments are forwarded unchanged (``torch.utils.checkpoint`` handles
     them), but the region *output* must be a Tensor or a one-hop ``tuple`` /
-    ``list`` of Tensors; anything else raises at the region boundary.
+    ``list`` of Tensors and :class:`Box` values; anything else raises at the
+    region boundary.
 
     Args:
         region_name (str, optional): Label for the region, shown in memory
@@ -319,7 +325,8 @@ def region(
     ``function`` is used unmodified -- it may be a custom ``autograd.Function``'s
     ``.apply``, a bare native op, or any callable taking a flat list of
     Tensor/non-Tensor arguments and returning a Tensor or a tuple/list whose leaves
-    are Tensors or ``None``.
+    are Tensors or ``None``. To return any other value, wrap it in a :class:`Box`; a
+    box may appear wherever a Tensor may.
 
         ```python
         y = remat.region(MyOp.apply, "my.op", recompute=False)(x)
@@ -358,8 +365,8 @@ def region(
     consumer of that output then gets the skipped producer's stand-in placeholder
     instead of real data, which raises -- but only during recompute (inside
     backward), not at this call, so keep saved outputs at the top level or one hop
-    deep. The *return* is validated strictly: a leaf other than a Tensor or ``None``,
-    or a nested return, raises ``RuntimeError``.
+    deep. The *return* is validated strictly: a leaf other than a Tensor, a
+    :class:`Box`, or ``None``, or a nested return, raises ``RuntimeError``.
 
     NB: if you smuggle an input into the callable (e.g., via a global or via a
     closure), you had better ensure that it is available/recomputed in
@@ -376,8 +383,8 @@ def region(
         function (Callable): The callable to annotate, used unmodified. It may be
             a custom ``autograd.Function``'s ``.apply``, a bare native op, or any
             callable taking a flat list of Tensor/non-Tensor arguments and returning
-            a Tensor or a one-hop ``tuple`` / ``list`` whose leaves are Tensors or
-            ``None``.
+            a Tensor or a one-hop ``tuple`` / ``list`` whose leaves are Tensors,
+            :class:`Box` values, or ``None``.
         name (str): Region-relative name for this call, shown in memory reports,
             traces, and error messages. Must be non-empty and unique among the
             names reached in a single phase.
@@ -393,7 +400,8 @@ def region(
     saved for backward is persisted for free. A **bare** (un-``remat.region``-wrapped)
     consumer cannot be detected, so during recompute it reads the skipped op's
     placeholder and raises; make one work by calling :func:`recompute_needs_tensor` on
-    the output right before it, or by wrapping the consumer in a ``remat.region``.
+    the output right before it, or by wrapping the consumer in a ``remat.region``. A
+    :class:`Box` output is kept when code that reruns reads its ``value`` on the forward.
 
     Returns:
         Callable: A wrapper with the same signature as ``function``. Called
@@ -489,7 +497,7 @@ def region(
     return wrapper
 
 
-def recompute_needs_tensor(*tensors: torch.Tensor) -> None:
+def recompute_needs_tensor(*tensors: torch.Tensor | Box[Any]) -> None:
     """Force a SAVE region's output(s) to be durably saved for recompute.
 
     Call this on a SAVE region's output tensor -- placed right before the *bare*
@@ -504,24 +512,34 @@ def recompute_needs_tensor(*tensors: torch.Tensor) -> None:
     consumer is absent). Each tensor is resolved to its producer by storage, so passing
     the output itself or any bare view of it works.
 
+    A :class:`Box` returned by a SAVE region is kept the same way, as if code that reruns
+    had read its ``value``. Use it when code that reruns gets the contents some other
+    way than reading ``value``; call it from eager code, since it does nothing while
+    being compiled.
+
     Safe to call anywhere: outside a checkpoint forward, or on a tensor that is not a
     SAVE region's output (an ordinary recomputed tensor, a region input), it is a no-op
     -- so model code that calls it works whether or not it is being checkpointed, and
     whether or not the producer happens to be a SAVE region this run.
 
     Args:
-        *tensors (Tensor): SAVE region outputs (or tensors sharing an output's storage)
-            to persist. Non-tensor arguments raise.
+        *tensors (Tensor or Box): SAVE region outputs (or tensors sharing an output's
+            storage) to persist. Other arguments raise.
     """
 
+    # TODO: this is right for a compiled checkpoint, which has no eager tape, but not
+    # for a compiled function inside an eager checkpoint: the tape is live and the
+    # checkpoint replays the function, so the call should persist. Persisting per call
+    # from traced code needs a graph break (tensors have no flag Dynamo can replay, unlike
+    # Box), which would also hit fullgraph model code calling this outside any checkpoint.
     if torch.compiler.is_compiling():
         return
 
     state = _state.get()
     for tensor in tensors:
-        if not isinstance(tensor, torch.Tensor):
+        if not isinstance(tensor, (torch.Tensor, Box)):
             raise RuntimeError(
-                "remat.recompute_needs_tensor() expects Tensor arguments"
+                "remat.recompute_needs_tensor() expects Tensor or remat.Box arguments"
             )
         # Only the original forward populates the tape; on recompute the producer has
         # already persisted (or not), and outside a region there is nothing to persist.
@@ -532,8 +550,8 @@ def recompute_needs_tensor(*tensors: torch.Tensor) -> None:
             persist()
 
 
-def is_placeholder(tensor: torch.Tensor) -> bool:
-    """Return whether ``tensor`` is (a view of) a recompute placeholder.
+def is_placeholder(tensor: torch.Tensor | Box[Any]) -> bool:
+    """Return whether a tensor (or a view of one) or a box is a recompute placeholder.
 
     During recompute a ``recompute=False`` (SAVE) region is skipped, so torch_remat returns
     a placeholder for its output whenever that output has no real value on the replay -- it
@@ -543,15 +561,21 @@ def is_placeholder(tensor: torch.Tensor) -> bool:
     access, so metadata/view ops pass through while a real read raises; a (bare) view of a
     placeholder is itself a placeholder.
 
-    Use this to check whether a tensor is a placeholder before reading its data.
+    Use this to check whether a tensor is a placeholder before reading its data. It also
+    accepts a :class:`Box`: a skipped region's box whose contents were not kept for
+    recompute is a placeholder box, whose ``value`` raises.
 
     Args:
-        tensor (Tensor): The tensor to test. A view of a placeholder tests ``True`` too,
-            since the check probes the shared storage rather than the tensor object.
+        tensor (Tensor or Box): The tensor or box to test. A view of a placeholder tests
+            ``True`` too, since the check probes the shared storage rather than the
+            tensor object.
 
     Returns:
-        bool: ``True`` if ``tensor`` is (a view of) a placeholder, else ``False``.
+        bool: ``True`` if ``tensor`` is (a view of) a placeholder or a placeholder box,
+        else ``False``.
     """
+    if isinstance(tensor, Box):
+        return isinstance(tensor, _PlaceholderBox)
     return _is_placeholder(tensor)
 
 
@@ -903,6 +927,18 @@ class _SaveRecord:
     # Note that outputs saved for recompute DO trigger saved tensor hooks, see
     # :func:`saved_tensors_hooks` for more details.
     output_slots: dict[int, _OutputSlot] = field(default_factory=dict)
+
+    # Contents of :class:`Box` outputs needed by recompute, by output position: the box
+    # counterpart of ``output_slots``. Held by reference; saved-tensor hooks do not
+    # apply.
+    box_slots: dict[int, object] = field(default_factory=dict)
+
+    # Box outputs awaiting the end of the forward, by output position, with each box's
+    # read flag. Held until then, so a box dropped before the forward ends can still be
+    # kept. See :func:`_keep_read_boxes`.
+    pending_boxes: dict[int, tuple[_BoxReadFlag, Box[Any]]] = field(
+        default_factory=dict
+    )
 
     # --- External-state snapshots taken at this op's exit on the forward
     # One opaque snapshot per registered ``region_state.state_hooks`` entry (same
@@ -1274,13 +1310,14 @@ def _prepare_outputs(
     output: Output,
     hooks: _SavedTensorsHooks | None,
 ) -> Output:
-    """Register a SAVE op's outputs in the region's storage-keyed persist index.
+    """Register a SAVE op's outputs in the region's persist indexes.
 
-    Every output is registered under a persist thunk keyed by storage, so a downstream
-    consumer -- a ``remat.region`` (or a bare view of the output, resolved by storage),
-    or an explicit :func:`recompute_needs_tensor` call -- can trigger the durable save on
-    demand. ``None`` leaves need no registration; the output container is returned
-    unchanged.
+    Every tensor output is registered under a persist thunk keyed by storage, and every
+    :class:`Box` output gets a read flag that the forward's exit resolves, so a
+    downstream consumer -- a ``remat.region`` (or a bare view of the output, resolved by
+    storage), an explicit :func:`recompute_needs_tensor` call, or a read of
+    :attr:`Box.value` -- can trigger the durable save on demand. ``None`` leaves need
+    no registration; the output container is returned unchanged.
 
     An output that is *itself* saved for backward (its storage is in
     ``scratch.saved_identity_storages``) is persisted eagerly at region exit: it is
@@ -1293,9 +1330,16 @@ def _prepare_outputs(
     offloader still route a deferred SAVE output to the chunk it captured here.
     """
 
-    tensors = _indexed_output_tensors(output)
     context = _capture_context(hooks) if hooks is not None else None
-    for index, real in tensors:
+    for index, real in enumerate(value_leaves(output)):
+        if isinstance(real, Box):
+            # A box two SAVE regions return shares one flag, so a read keeps both.
+            if real._read_flag is None:
+                real._read_flag = _BoxReadFlag()
+            record.pending_boxes[index] = (real._read_flag, real)
+            continue
+        if not isinstance(real, torch.Tensor):
+            continue
         storage = StorageWeakRef(real.untyped_storage())
         # Weak ref + lazy snapshot (see _PersistOutputThunk), so a SAVE output nothing
         # consumes is never pinned alive by its own persist-output thunk.
@@ -1441,6 +1485,8 @@ def _record_output_schema(record: _SaveRecord, output: Output) -> None:
                     requires_grad=leaf.requires_grad,
                 )
                 if isinstance(leaf, torch.Tensor)
+                else _BoxOutputSpec()
+                if isinstance(leaf, Box)
                 else None
             )
             for leaf in value_leaves(output)
@@ -1525,10 +1571,27 @@ def _load_saved_outputs(
     # accessor returns True (conservative "keep"), so no extra guard is needed.
     pop = not torch._C._autograd._get_current_graph_task_keep_graph()  # type: ignore[attr-defined]
     display_name = _display_name(region_state, record.op_name)
+
+    def placeholder_source(index: int) -> str:
+        return f"{display_name}.{_output_name(index, container=schema.container)}"
+
     outputs: list[OutputLeaf] = []
     for index, spec in enumerate(schema.specs):
         if spec is None:
             outputs.append(None)
+            continue
+
+        if isinstance(spec, _BoxOutputSpec):
+            if index in record.box_slots:
+                contents = (
+                    record.box_slots.pop(index) if pop else record.box_slots[index]
+                )
+                outputs.append(Box(contents))
+            else:
+                message = _box_placeholder_message_text(
+                    placeholder_source(index), display_name
+                )
+                outputs.append(_PlaceholderBox(message))
             continue
 
         slot = record.output_slots.get(index)
@@ -1547,10 +1610,9 @@ def _load_saved_outputs(
             )
             continue
 
-        source = f"{display_name}.{_output_name(index, container=schema.container)}"
         placeholder = _make_placeholder_tensor(
             spec.metadata,
-            _placeholder_message_text(source, display_name),
+            _placeholder_message_text(placeholder_source(index), display_name),
             requires_grad=spec.requires_grad,
         )
         if spec.requires_grad:
@@ -1561,7 +1623,7 @@ def _load_saved_outputs(
         outputs.append(placeholder)
 
     if schema.container is None:
-        return cast(torch.Tensor, outputs[0])
+        return cast(Output, outputs[0])
     return cast(Output, rebuild_container(schema.container, outputs))
 
 
@@ -1723,8 +1785,9 @@ class _MakeNonLeaf(torch.autograd.Function):
 
 
 _OP_OUTPUT_TYPE_MESSAGE = (
-    "remat.region function must return a Tensor, or a tuple or list whose leaves "
-    "are Tensors or None"
+    "remat.region function must return a Tensor or remat.Box, or a tuple or list "
+    "whose leaves are Tensors, remat.Box values, or None; wrap any other value in "
+    "remat.Box"
 )
 
 
@@ -1732,7 +1795,8 @@ def _validate_output(
     output: Any,
     reject_leaves_for: tuple[_CheckpointRegionState, str] | None = None,
 ) -> Output:
-    """Check a remat op returned a Tensor, or a one-hop tuple/list of Tensor/None.
+    """Check a remat op returned a Tensor or Box, or a one-hop tuple/list of
+    Tensor/Box/None.
 
     Returns the output unchanged. When ``reject_leaves_for`` (the ``(region_state,
     op_name)`` of an eager forward op) is given, the same walk also rejects a
@@ -1740,13 +1804,15 @@ def _validate_output(
     passes ``None`` since leaf rejection already ran on the forward.
     """
 
+    if isinstance(output, Box):
+        return output
     if isinstance(output, torch.Tensor):
         if reject_leaves_for is not None:
             _reject_grad_leaf(output, reject_leaves_for)
         return output
     if isinstance(output, (tuple, list)):
         for leaf in output:
-            if leaf is None:
+            if leaf is None or isinstance(leaf, Box):
                 continue
             if not isinstance(leaf, torch.Tensor):
                 raise RuntimeError(_OP_OUTPUT_TYPE_MESSAGE)
@@ -1779,16 +1845,6 @@ def _reject_grad_leaf(
             "Move the allocation outside the checkpoint region (or do not wrap it "
             "in remat.region)."
         )
-
-
-def _indexed_output_tensors(output: Output) -> tuple[tuple[int, torch.Tensor], ...]:
-    """Return ``(schema position, tensor)`` pairs for an output."""
-
-    return tuple(
-        (index, leaf)
-        for index, leaf in enumerate(value_leaves(output))
-        if isinstance(leaf, torch.Tensor)
-    )
 
 
 def _output_name(index: int, *, container: type | None) -> str:

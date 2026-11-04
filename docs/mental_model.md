@@ -144,6 +144,49 @@ SAVE regions save tensors, and also implies that if an output is needed for
 any recompute, it *always* is available in all code in the recompute that has
 a reference to it.
 
+## Non-tensor outputs: `remat.Box`
+
+A region can only return tensors (and `None`), but sometimes it's convenient
+to have a region that returns a non-tensor output.  The motivating use case
+from torchtitan was an opaque handle from HybridEP dispatch that is used in
+the combine call.  In general, we cannot prevent handles like these from being
+saved when it is unnecessary (e.g., because you are recomputing the dispatch),
+since they are not tensors and we have no way of clearing them in-place for
+the recompute.  So `remat.Box` offers an escape hatch to say it is safe to
+hold onto this so that recompute of downstream calls is possible.  Concretely:
+
+- If it is needed for recompute, we will drop it promptly once all userland
+  references to it drop after recompute.
+- If it is not needed for recompute, we will drop it promptly once all
+  userland references to it drop after forwards.
+
+Note that if your user code (e.g., autograd function) saves the quantity
+inside the box for backwards, we will always save it for backwards (even if
+it is returned from a recompute region).
+
+It is possible we could extend this to support a custom user protocol for
+clearing and restoring the boxed value at recompute time; if this is of
+interest please file an issue request.
+
+The general recipe looks like this:
+
+```python
+def dispatch(x):
+    y, handle = dispatch_kernel(x)
+    return y, remat.Box(handle)
+
+def combine(z, box_handle):
+    return combine_kernel(z, box_handle.value)
+
+y, box_handle = remat.region(dispatch, "dispatch", recompute=False)(x)
+z = expert(y)
+out = remat.region(combine, "combine", recompute=True)(z, box_handle)
+```
+
+To track uses of handle, you should pass box into downstream regions that
+use it, and only unwrap the box inside regions.  If that region is recomputed,
+this will ensure that the handle is kept for recompute.
+
 ## No early stop: wrap the tail in a SAVE region
 
 `torch.utils.checkpoint` stops replay early, as soon as every tensor saved

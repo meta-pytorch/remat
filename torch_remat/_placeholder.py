@@ -55,8 +55,10 @@ the start, with a placeholder only where we legitimately have no data at all.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
+from torch_remat._region import Box
 
 
 @dataclass(frozen=True)
@@ -172,6 +174,38 @@ def _placeholder_message_text(
         "path actually runs, so you can never over-save.",
     ]
     return "\n".join(lines)
+
+
+class _PlaceholderBox(Box[Any]):
+    """A skipped SAVE region's boxed output that was not kept for recompute."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(None)
+        self._message = message
+
+    @property
+    def value(self) -> Any:
+        raise RuntimeError(self._message)
+
+
+def _box_placeholder_message_text(source: str, op_display_name: str) -> str:
+    """Build the diagnostic raised by reading a placeholder box during recompute."""
+
+    return "\n".join(
+        [
+            f"{source} is a placeholder for a remat.Box returned by remat.region "
+            f"'{op_display_name}' (recompute=False): a saved region is skipped during "
+            "recompute, and this box's contents were not kept for it.",
+            "A box's contents are kept for recompute only if code that reruns during "
+            "recompute (a recompute=True region or bare code in the checkpoint) reads "
+            "Box.value on the forward. Reads inside a recompute=False region do not "
+            "count, and neither does a use of the contents through another reference.",
+            "To fix it, call remat.recompute_needs_tensor(box) in eager code (outside any "
+            "compiled function) right before the code that uses it, to force the "
+            "producer to keep the box's contents. Placing the call at the consumer means "
+            "the contents are kept only when that code path actually runs.",
+        ]
+    )
 
 
 def _null_storage(nbytes: int, device: torch.device) -> torch.UntypedStorage:

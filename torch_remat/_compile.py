@@ -54,7 +54,12 @@ _in_compiled_checkpoint: bool = False
 
 
 def in_compiled_checkpoint() -> bool:
-    """Whether a compiled ``remat.checkpoint`` region is currently being traced."""
+    """Whether a compiled ``remat.checkpoint`` region is currently being traced.
+
+    Unlike ``torch.compiler.is_compiling()``, this is False in a compiled function
+    called from an eager checkpoint, where the eager tape is live and the checkpoint
+    replays the function on recompute.
+    """
 
     return _in_compiled_checkpoint
 

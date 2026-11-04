@@ -12,6 +12,17 @@ the compiled graph receive the policy; ordinary `torch.compile` restrictions
 on graph breaks, Python side effects, and data-dependent Python control flow
 still apply.
 
+There are two ways to combine them, and features can behave differently in each:
+
+- **A compiled checkpoint**: `torch.compile` traces a `remat.checkpoint` call.
+  There is no eager tape, and the body is never replayed; the partitioner
+  decides what to recompute.
+- **A compiled function inside an eager checkpoint**: an eager
+  `remat.checkpoint` calls a `torch.compile`'d function. The eager tape is live,
+  and the checkpoint replays the compiled function on recompute.
+
+Rows describe a compiled checkpoint unless they say otherwise.
+
 | Feature | Status under `torch.compile` | Behavior |
 |---|---|---|
 | `remat.checkpoint()(fn)(...)` | Supported | Runs as a non-reentrant PyTorch checkpoint. Captured operations recompute by default. |
@@ -20,7 +31,8 @@ still apply.
 | `remat.region(..., recompute=False)` | Supported | Tags every decomposed compute node in the region `MUST_SAVE`, so the partitioner keeps it in the forward graph instead of recomputing it. Native and composite callables and custom `autograd.Function.apply` bodies are supported. |
 | A `region` constructed before compilation | Supported | Both eagerly constructed wrappers and `region(...)` calls made while Dynamo traces are supported. |
 | `region` outside `checkpoint` | Supported, as a no-op | Calls the wrapped function without adding a partitioner policy, matching eager behavior. |
-| `remat.recompute_needs_tensor(...)` | Supported, as a no-op | Compiled graphs carry values directly, so there is no eager placeholder to persist. |
+| `remat.recompute_needs_tensor(...)` | Supported, as a no-op | Compiled graphs carry values directly, so there is no eager placeholder to persist. It is also a no-op in a compiled function inside an eager checkpoint, where the tape is live; call it from eager code before the compiled call. |
+| `remat.Box` | Supported | Boxes pass through the compiled graph like any other Python object, with no eager tape to keep them on. In a compiled function inside an eager checkpoint, reading a SAVE region's box keeps its contents as in eager; before torch 2.14 the read graph-breaks (raises under `fullgraph=True`). |
 | `remat.save_for_backward` | Supported, names ignored | Forwards directly to `ctx.save_for_backward`; mapping keys only feed eager memory reports. |
 | `checkpoint(determinism_check=...)` | Supported | Forwarded to the underlying non-reentrant checkpoint. |
 | `region_name` and region `name` | Accepted, diagnostics unavailable | Names do not affect the compiled policy because there is no eager tape or region report. |

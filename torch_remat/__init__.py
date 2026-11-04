@@ -25,6 +25,7 @@ from torch_remat._oom import (  # noqa: F401
     oom_observer,
 )
 from torch_remat._region import (  # noqa: F401
+    Box,
     is_recomputing,
     name_scope,
     RecomputeStateHook,
