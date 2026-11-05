@@ -54,6 +54,7 @@ the start, with a placeholder only where we legitimately have no data at all.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -108,6 +109,25 @@ def _make_placeholder_tensor(
         # autograd metadata, so it does not trip the poisoned data pointer.
         placeholder.requires_grad_(True)
     return placeholder
+
+
+# Under torch_cudagraph_fx tracing, record placeholder creation as one opaque
+# node: the poisoned null storage cannot be rebuilt by replaying aten ops. This
+# runs before other modules import ``_make_placeholder_tensor`` by name.
+if os.environ.get("CGFX_TRACING") == "1":
+    try:
+        from torch_cudagraph_fx import (  # pyrefly: ignore[missing-import]
+            trace_dataclass,
+            trace_leaf,
+        )
+    except ModuleNotFoundError as error:
+        if error.name != "torch_cudagraph_fx":
+            raise
+    else:
+        trace_dataclass(_TensorMetadata)
+        _make_placeholder_tensor = trace_leaf("torch_remat::make_placeholder")(
+            _make_placeholder_tensor
+        )
 
 
 def _is_placeholder(tensor: torch.Tensor) -> bool:
