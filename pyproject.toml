@@ -38,6 +38,7 @@ python_files = ["*_test.py"]
 # members build against the venv (the root's `no-build-isolation-package`), so
 # the backend has to be in a default group for `uv sync` to install it first.
 build = ["setuptools", "wheel"]
+dev = ["pytest", "expecttest"]
 
 [tool.uv]
-default-groups = ["build"]
+default-groups = ["build", "dev"]
