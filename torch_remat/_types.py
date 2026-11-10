@@ -65,10 +65,16 @@ class SavedTensorInfo:
             context even if a later consumer triggers the pack after the producer's
             hook scope has exited. Native saves outside a checkpoint always receive
             ``None`` because ``capture_context`` is remat-specific.
+        region: Qualified name of the :func:`region` call that produced the tensor:
+            the ``recompute=False`` region whose op saved it (``BACKWARD``) or whose
+            output it is (``SAVE_OUTPUT``). Includes any :func:`name_scope` prefix
+            active at the call. ``None`` for checkpoint inputs and for native saves
+            outside a region.
     """
 
     kind: SavedTensorKind
     context: object = None
+    region: str | None = None
 
 
 @dataclass

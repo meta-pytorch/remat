@@ -687,6 +687,46 @@ compute block.0.mid [recompute] (recompute)
     @pytest.mark.compile_xfail(
         "remat saved-tensor hooks are unsupported under torch.compile"
     )
+    def test_pack_info_names_the_producing_region(self) -> None:
+        # A policy hook can select saves by region name. A SAVE region's backward
+        # saves and its persisted output report the region's qualified name,
+        # including the name_scope prefix and even when the output pack is
+        # deferred past the scope; the checkpoint input reports no region.
+        packed: list[tuple[remat.SavedTensorKind, str | None]] = []
+
+        def pack(tensor: torch.Tensor) -> object:
+            info = remat.current_saved_tensor_info()
+            packed.append((info.kind, info.region))
+            return tensor.detach()
+
+        def unpack(payload: object) -> torch.Tensor:
+            return cast(torch.Tensor, payload)
+
+        def body(x: torch.Tensor) -> torch.Tensor:
+            with remat.name_scope("block"):
+                # sin saves its input, which is the recomputed x * 3.
+                y = remat.region(lambda t: torch.sin(t * 3), "sin", recompute=False)(x)
+                # mul saves nothing, so its output is persisted only on demand.
+                z = remat.region(lambda t: t * 2, "mul", recompute=False)(y)
+            remat.recompute_needs_tensor(z)
+            return torch.relu(z)
+
+        x = torch.tensor([1.0, -1.0], requires_grad=True)
+        with remat.saved_tensors_hooks(pack, unpack):
+            checkpoint_for_test()(body)(x).sum().backward()
+
+        self.assertEqual(
+            [
+                (remat.SavedTensorKind.CHECKPOINT_INPUT, None),
+                (remat.SavedTensorKind.BACKWARD, "block/sin"),
+                (remat.SavedTensorKind.SAVE_OUTPUT, "block/mul"),
+            ],
+            packed,
+        )
+
+    @pytest.mark.compile_xfail(
+        "remat saved-tensor hooks are unsupported under torch.compile"
+    )
     def test_capture_context_binds_producer_context_for_deferred_output_save(
         self,
     ) -> None:

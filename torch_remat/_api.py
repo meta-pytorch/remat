@@ -721,10 +721,13 @@ def _run_pack(
     tensor: torch.Tensor,
     context: object,
     kind: SavedTensorKind,
+    region: str | None = None,
 ) -> object:
     """Invoke an upstream-shaped pack hook under remat-specific metadata."""
 
-    token = _active_saved_tensor_info.set(SavedTensorInfo(kind=kind, context=context))
+    token = _active_saved_tensor_info.set(
+        SavedTensorInfo(kind=kind, context=context, region=region)
+    )
     try:
         return hooks.pack(tensor)
     finally:
@@ -1116,6 +1119,7 @@ def _run_save_op(
                 _detach_for_user_hook(tensor),
                 _capture_context(hooks),
                 SavedTensorKind.BACKWARD,
+                record.op_name,
             )
             return _SavedHookData(packed, hooks.unpack)
 
@@ -1450,6 +1454,7 @@ class _PersistOutputThunk:
                     detached,
                     self.context,
                     SavedTensorKind.SAVE_OUTPUT,
+                    self.record.op_name,
                 ),
                 unpack_hook=self.hooks.unpack,
                 requires_grad=self.requires_grad,
