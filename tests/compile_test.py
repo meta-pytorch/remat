@@ -270,6 +270,67 @@ class CompileTest(expecttest.TestCase):
         # pyrefly: ignore[bad-argument-type]
         self.assertTrue(torch.equal(x.grad, x.detach().cos()))
 
+    def test_saves_discarded_is_false(self) -> None:
+        def body(y: torch.Tensor) -> torch.Tensor:
+            return y + int(remat.saves_discarded())
+
+        compiled = torch.compile(
+            lambda x: remat.checkpoint()(body)(x), backend="aot_eager", fullgraph=True
+        )
+        x = torch.randn(4, requires_grad=True)
+        self.assertTrue(torch.equal(compiled(x), x))
+
+    def test_saves_discarded_is_false_in_compiled_function_inside_eager_checkpoint(
+        self,
+    ) -> None:
+        # The docstring's pattern in a compiled function that the eager checkpoint
+        # runs on its forward (where eager code sees True), in a SAVE region body
+        # (never replayed) and on recompute. The checkpoint pairs what the graph
+        # compiled for its forward saves with what the graph compiled for recompute
+        # saves. Were the predicate True in the forward's trace, that graph would
+        # save a stand-in and a different set of tensors than the recompute graph.
+        # It is False in every trace, so every call saves the real tensor.
+        eager_discards: list[bool] = []
+        counts = torch.zeros(2, dtype=torch.int64)
+
+        class Fused(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx: Any, x: torch.Tensor, keep_h: bool) -> torch.Tensor:
+                h = x * 2 if keep_h else x.new_empty(()).expand(x.shape)
+                ctx.save_for_backward(h)
+                return x * x
+
+            @staticmethod
+            def backward(  # pyrefly: ignore[bad-override]
+                ctx: Any, grad: torch.Tensor
+            ) -> tuple[torch.Tensor, None]:
+                (h,) = ctx.saved_tensors
+                return grad * h, None
+
+        def fused(x: torch.Tensor) -> torch.Tensor:
+            keep_h = not remat.saves_discarded()
+            counts[int(keep_h)].add_(1)
+            return Fused.apply(x, keep_h).sin()
+
+        compiled = torch.compile(fused, backend="aot_eager", fullgraph=True)
+
+        def body(x: torch.Tensor) -> torch.Tensor:
+            eager_discards.append(remat.saves_discarded())
+            saved = remat.region(compiled, "saved", recompute=False)(x)
+            remat.recompute_needs_tensor(saved)
+            return compiled(saved)
+
+        x = torch.randn(4, requires_grad=True)
+        y = remat.checkpoint()(body)(x)
+        y.sum().backward()
+        self.assertEqual([True, False], eager_discards)
+        # Two compiled calls on the forward and one on recompute, each keeping h.
+        self.assertEqual([0, 3], counts.tolist())
+        reference = x.detach().clone().requires_grad_()
+        fused(fused(reference)).sum().backward()
+        # pyrefly: ignore[bad-argument-type]
+        self.assertTrue(torch.equal(x.grad, reference.grad))
+
     def test_determinism_check_is_forwarded(self) -> None:
         compiled = torch.compile(
             lambda x: remat.checkpoint(determinism_check="default")(torch.exp)(x),

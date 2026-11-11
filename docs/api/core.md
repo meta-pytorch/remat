@@ -18,6 +18,8 @@
 .. autofunction:: torch_remat.save_for_backward
 
 .. autofunction:: torch_remat.is_recomputing
+
+.. autofunction:: torch_remat.saves_discarded
 ```
 
 ## Non-tensor outputs

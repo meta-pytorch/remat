@@ -8,7 +8,9 @@
 .. autofunction:: torch_remat.trace_scope
 
 .. autoclass:: torch_remat._trace.RematTrace
-   :members: format
+   :members: format, ops
+
+.. autoclass:: torch_remat._trace.OpTrace
 ```
 
 ## Memory reports

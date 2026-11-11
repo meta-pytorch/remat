@@ -271,11 +271,12 @@ op: recompute""",
             )(y)
 
         def checkpoint_body(x: torch.Tensor) -> torch.Tensor:
-            return remat.trace_scope(
+            y = remat.trace_scope(
                 scope_body,
                 "scope",
                 metadata="test_flag",
             )(x)
+            return remat.region(torch.exp, "exp", recompute=True)(y)
 
         x = torch.tensor([1.0, 2.0], requires_grad=True)
         with remat.collect_trace() as trace:
@@ -288,7 +289,12 @@ op: recompute""",
 torch_remat trace
 scope [test_flag]
   sin: save
-  cos: recompute""",
+  cos: recompute
+exp: recompute""",
+        )
+        self.assertEqual(
+            [("sin", False), ("cos", True), ("exp", True)],
+            [(op.name, op.recompute) for op in trace.ops()],
         )
 
     @pytest.mark.compile_xfail("compile has no Python forward replay to order")
@@ -471,11 +477,81 @@ inner_backward_after_unpack""",
     def test_phase_helpers_report_forward_and_recompute(self) -> None:
         forward_context, recompute_context = _checkpoint_context_fn()
 
+        self.assertFalse(remat.saves_discarded())
         with forward_context:
             self.assertFalse(remat.is_recomputing())
+            self.assertTrue(remat.saves_discarded())
 
         with recompute_context:
             self.assertTrue(remat.is_recomputing())
+            self.assertFalse(remat.saves_discarded())
+
+    @pytest.mark.compile_xfail("compile has no Python forward replay to count")
+    def test_saves_discarded_lets_the_forward_skip_a_saved_tensor(self) -> None:
+        # A saved tensor computed only where saves_discarded() is False, with a
+        # stand-in saved in its place otherwise: a bare op or a RECOMPUTE region
+        # skips it on the forward and computes it on recompute, a SAVE region
+        # (never replayed) computes it on the forward, and the gradients match an
+        # unchecked run. The stand-in keeps the saved tensors' positions and passes
+        # the metadata determinism check. torch_remat's saved_tensors_hooks entered
+        # in the body leave the checkpoint's hook in place, so a bare op under them
+        # skips it too.
+        computed: list[str] = []
+
+        class SquareSavingTwice(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx: Any, x: torch.Tensor, keep: bool) -> torch.Tensor:
+                if keep:
+                    computed.append("replay" if remat.is_recomputing() else "forward")
+                    twice = x * 2
+                else:
+                    twice = x.new_empty(()).expand(x.shape)
+                ctx.save_for_backward(twice)
+                return x * x
+
+            @staticmethod
+            def backward(  # pyrefly: ignore[bad-override]
+                ctx: Any, grad: torch.Tensor
+            ) -> tuple[torch.Tensor, None]:
+                (twice,) = ctx.saved_tensors
+                return grad * twice, None
+
+        def square(x: torch.Tensor) -> torch.Tensor:
+            return SquareSavingTwice.apply(x, not remat.saves_discarded())
+
+        def body(
+            x: torch.Tensor, recompute: bool | None, hooks: bool = False
+        ) -> torch.Tensor:
+            h = x.sin()
+            if hooks:
+                with remat.saved_tensors_hooks(lambda t: t, lambda t: t):
+                    y = square(h)
+            elif recompute is None:
+                y = square(h)
+            else:
+                y = remat.region(square, "square", recompute=recompute)(h)
+                remat.recompute_needs_tensor(y)
+            return y.cos()
+
+        x = torch.randn(4, 3)
+        reference = x.clone().requires_grad_()
+        body(reference, recompute=None).sum().backward()
+        for recompute, hooks, expected in (
+            (None, False, ["replay"]),
+            (True, False, ["replay"]),
+            (False, False, ["forward"]),
+            (None, True, ["replay"]),
+        ):
+            case = (recompute, hooks)
+            computed.clear()
+            leaf = x.clone().requires_grad_()
+            y = checkpoint_for_test(determinism_check="default")(body)(
+                leaf, recompute, hooks
+            )
+            y.sum().backward()
+            self.assertEqual(expected, computed, case)
+            # pyrefly: ignore[bad-argument-type]
+            self.assertTrue(torch.equal(leaf.grad, reference.grad), case)
 
     @pytest.mark.compile_xfail("compiled regions do not use the eager tape lifetime")
     def test_save_policy_checkpoint_releases_saved_tensors_by_default(self) -> None:

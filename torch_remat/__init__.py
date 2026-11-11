@@ -29,6 +29,7 @@ from torch_remat._region import (  # noqa: F401
     is_recomputing,
     name_scope,
     RecomputeStateHook,
+    saves_discarded,
 )
 from torch_remat._reporting import (  # noqa: F401
     format_current_memory_report,

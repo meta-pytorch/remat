@@ -63,10 +63,31 @@ class RematTrace:
             _append_trace_entry(lines, entry, indent=0)
         return "\n".join(lines)
 
+    def ops(self) -> Iterator[OpTrace]:
+        """Iterate over the recorded regions in the order they ran.
+
+        Regions nested in :func:`trace_scope` scopes are included; the scopes
+        themselves are not.
+
+        Returns:
+            Iterator[OpTrace]: One :class:`OpTrace` per recorded :func:`region`
+            call, with its qualified ``name`` and its ``recompute`` flag.
+        """
+
+        return _iter_ops(self.entries)
+
     def _current_entries(self) -> list[OpTrace | ScopeTrace]:
         if self._scope_stack:
             return self._scope_stack[-1].entries
         return self.entries
+
+
+def _iter_ops(entries: list[OpTrace | ScopeTrace]) -> Iterator[OpTrace]:
+    for entry in entries:
+        if isinstance(entry, ScopeTrace):
+            yield from _iter_ops(entry.entries)
+        else:
+            yield entry
 
 
 _active_trace: contextvars.ContextVar[RematTrace | None] = contextvars.ContextVar(
@@ -86,7 +107,8 @@ def collect_trace() -> Iterator[RematTrace]:
     Yields:
         RematTrace: The trace being collected. It is populated with the ops and
         scopes seen within the ``with`` block; call :meth:`RematTrace.format` on
-        it afterward to render the hierarchy.
+        it afterward to render the hierarchy, or :meth:`RematTrace.ops` to
+        iterate over its regions.
     """
 
     trace = RematTrace()

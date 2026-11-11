@@ -276,6 +276,74 @@ _active_save_op: contextvars.ContextVar[_SaveOpForwardScratch | None] = (
 )
 
 
+def saves_discarded() -> bool:
+    """Return whether tensors saved for backward here are discarded until recompute.
+
+    On a checkpoint's original forward, outside every ``recompute=False`` (SAVE)
+    region body, the checkpoint drops each tensor an autograd node saves and
+    recompute rebuilds it before backward reads it. Code there can skip work whose
+    only use is such a tensor, for example an optional extra output of a fused
+    kernel that the forward would only save for backward.
+
+    The checkpoint pairs the tensors saved on the forward with those saved on
+    recompute by position, and recompute, where this returns ``False``, must
+    reproduce the forward's outputs. So code that branches on it must save the
+    same number of tensors either way and return the same values. To skip
+    computing a saved tensor, save a stand-in in its place; one with the same
+    shape, dtype and device, such as ``torch.empty((), dtype=dtype,
+    device=device).expand(shape)``, also passes ``determinism_check="default"``.
+
+    Only torch_remat's own hooks are accounted for. A raw
+    :class:`torch.autograd.graph.saved_tensors_hooks` pair entered inside the
+    checkpoint body (or a context manager built on it, such as
+    :class:`torch.autograd.graph.save_on_cpu`) shadows the checkpoint's hook, so
+    autograd keeps what is saved under it while this still returns ``True``: a
+    stand-in saved there reaches backward in place of the real tensor, with no
+    error. Don't skip a saved tensor under such a pair. :func:`saved_tensors_hooks`
+    entered inside a checkpoint leaves the checkpoint's hook in place and is safe.
+
+    While ``torch.compile`` traces, this returns ``False``: inside a compiled
+    checkpoint and also in a compiled function called from an eager checkpoint.
+    AOTAutograd's partitioner, not the traced Python, decides which tensors a
+    compiled graph saves. An eager checkpoint pairs what the graph compiled for
+    its forward saves with what the graph compiled for recompute saves, so the
+    two traces must take the same branch; a compiled function therefore always
+    computes the tensor.
+
+    Returns:
+        bool: ``True`` on a checkpoint's original forward outside every SAVE region
+        body; ``False`` during recompute, inside a SAVE region body, outside any
+        checkpoint region, and while ``torch.compile`` traces. Grad mode is not
+        consulted: under ``torch.no_grad()`` nothing is saved either way.
+
+    Example:
+        ```python
+        class Fused(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, x, keep_h):
+                y, h = fused_kernel(x, return_h=keep_h)
+                if h is None:
+                    # Recompute saves the real h in this position.
+                    h = x.new_empty(()).expand(x.shape)
+                ctx.save_for_backward(h)
+                return y
+
+
+        y = Fused.apply(x, not remat.saves_discarded())
+        ```
+    """
+
+    if torch.compiler.is_compiling():
+        return False
+
+    state = _state.get()
+    return (
+        state is not None
+        and state.phase is _Phase.FORWARD
+        and _active_save_op.get() is None
+    )
+
+
 class _CheckpointPhaseContext(contextlib.AbstractContextManager[None]):
     """Reusable context manager for one checkpoint phase.
 

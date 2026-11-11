@@ -122,6 +122,18 @@ if not remat.is_recomputing():
     record_metric(value)
 ```
 
+`remat.saves_discarded()` tells whether tensors saved for backward at this point
+are dropped until recompute rebuilds them: true on the checkpoint's forward
+outside every `recompute=False` region body. A fused kernel can skip writing an
+extra output there that the forward would only save for backward. Recompute
+pairs saved tensors with the forward's by position, so save a stand-in in the
+skipped tensor's place (see the function's docstring). The predicate cannot see
+a raw `torch.autograd.graph.saved_tensors_hooks` pair entered inside the
+checkpoint body, under which autograd keeps the saves: don't skip a saved tensor
+under one (`remat.saved_tensors_hooks` is safe). It is `False` while
+`torch.compile` traces, so compiled code always computes the tensor (see
+`docs/compilation.md`).
+
 TODO: We should offer a simple way of checking that the replay is bitwise
 equivalent to the original.
 
@@ -144,6 +156,10 @@ scope [test_flag]
   sin: save
   cos: recompute
 ```
+
+`trace.ops()` iterates over the recorded regions in the order they ran, through
+nested scopes, for assertions such as
+`{op.name: op.recompute for op in trace.ops()}`.
 
 **Inspect retained activations from inside a checkpoint forward:**
 

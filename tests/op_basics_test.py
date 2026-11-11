@@ -380,11 +380,8 @@ class OpBasicsTest(expecttest.TestCase):
         # SAVE regions are skipped on recompute: each square ran exactly once.
         if not IS_COMPILE_TEST:
             self.assertEqual(len(square_calls), 2)
-            names = [
-                entry.name for entry in trace.entries if hasattr(entry, "recompute")
-            ]
             self.assertEqual(
-                names,
+                [op.name for op in trace.ops()],
                 ["block.0/square", "block.0/sin", "block.1/square", "block.1/sin"],
             )
 
